@@ -14,7 +14,10 @@
       "Bash(npm test)",
       "Bash(dir:*)",
       "Bash(npm config:*)",
-      "Bash(timeout 5 node:*)"
+      "Bash(timeout 5 node:*)",
+      "Bash(npm run build:swift:*)",
+      "Bash(timeout 15 node:*)",
+      "Bash(swift:*)"
     ],
     "deny": [],
     "ask": []

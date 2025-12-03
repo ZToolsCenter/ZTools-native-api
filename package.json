@@ -7,7 +7,7 @@
     "build": "node scripts/build.js",
     "build:swift": "sh scripts/build-swift.sh",
     "clean": "node-gyp clean && node scripts/clean.js",
-    "test": "node test/test.js",
+    "test": "node test/test-all.js",
     "install": "npm run build"
   },
   "keywords": [

@@ -14,7 +14,10 @@ private var isClipboardMonitoring = false
 
 // 窗口监控状态
 private var windowMonitorObserver: NSObjectProtocol?
+private var windowMonitorQueue: DispatchQueue?
 private var isWindowMonitoring = false
+private var lastBundleId: String = ""
+private var lastProcessId: pid_t = 0
 
 // MARK: - Clipboard Monitor
 
@@ -111,7 +114,40 @@ public func activateWindow(_ bundleId: UnsafePointer<CChar>?) -> Int32 {
 
 // MARK: - Window Monitor
 
-/// 启动窗口激活监控
+/// 使用 Core Graphics API 获取当前激活的应用（最可靠）
+private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName: String)? {
+    // 获取所有窗口列表，按层级排序
+    let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
+    guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return nil
+    }
+
+    // 找到最前面的窗口（layer 最小）
+    for window in windowList {
+        // 跳过没有 owner PID 的窗口
+        guard let pid = window[kCGWindowOwnerPID as String] as? pid_t,
+              pid > 0 else {
+            continue
+        }
+
+        // 跳过窗口层级为 0 的（通常是系统 UI）
+        if let layer = window[kCGWindowLayer as String] as? Int, layer == 0 {
+            // 获取该窗口所属的应用信息
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                // 只返回有UI的普通应用
+                if app.activationPolicy == .regular {
+                    let bundleId = app.bundleIdentifier ?? "unknown.bundle.id"
+                    let appName = app.localizedName ?? "Unknown"
+                    return (pid: pid, bundleId: bundleId, appName: appName)
+                }
+            }
+        }
+    }
+
+    return nil
+}
+
+/// 启动窗口激活监控（使用 Core Graphics API + 轮询）
 /// - Parameter callback: 窗口切换时调用的回调，传递JSON字符串
 @_cdecl("startWindowMonitor")
 public func startWindowMonitor(_ callback: WindowCallback?) {
@@ -128,32 +164,49 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
     isWindowMonitoring = true
 
-    // 监听应用激活通知
-    windowMonitorObserver = NSWorkspace.shared.notificationCenter.addObserver(
-        forName: NSWorkspace.didActivateApplicationNotification,
-        object: nil,
-        queue: .main
-    ) { notification in
-        guard isWindowMonitoring else { return }
-
-        // 获取激活的应用
-        if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-            let appName = app.localizedName ?? "Unknown"
-            let bundleId = app.bundleIdentifier ?? "unknown.bundle.id"
-
-            // 构建JSON字符串
-            let jsonString = """
-            {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))"}
-            """
-
-            // 调用回调
-            jsonString.withCString { cString in
-                callback(cString)
-            }
-        }
+    // 获取初始窗口
+    if let appInfo = getFrontmostAppUsingCG() {
+        lastProcessId = appInfo.pid
+        lastBundleId = appInfo.bundleId
     }
 
-    print("Window monitor started")
+    // 创建专用队列进行轮询
+    windowMonitorQueue = DispatchQueue(label: "com.ztools.window.monitor", qos: .utility)
+
+    windowMonitorQueue?.async {
+        print("Window monitor started")
+
+        while isWindowMonitoring {
+            usleep(500_000) // 每 0.5 秒检查一次（性能优化：减少 CPU 占用）
+
+            // 使用 Core Graphics API 获取当前激活的应用
+            guard let appInfo = getFrontmostAppUsingCG() else {
+                continue
+            }
+
+            let currentPid = appInfo.pid
+            let currentBundleId = appInfo.bundleId
+            let appName = appInfo.appName
+
+            // 检测到窗口切换（使用 PID 比较更可靠）
+            if currentPid != lastProcessId {
+                lastProcessId = currentPid
+                lastBundleId = currentBundleId
+
+                // 构建JSON字符串
+                let jsonString = """
+                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))"}
+                """
+
+                // 调用回调
+                jsonString.withCString { cString in
+                    callback(cString)
+                }
+            }
+        }
+
+        print("Window monitor stopped")
+    }
 }
 
 /// 停止窗口激活监控
@@ -162,8 +215,11 @@ public func stopWindowMonitor() {
     guard isWindowMonitoring else { return }
 
     isWindowMonitoring = false
+    windowMonitorQueue = nil
+    lastBundleId = ""
+    lastProcessId = 0
 
-    // 移除观察者
+    // 清理观察者（如果有的话）
     if let observer = windowMonitorObserver {
         NSWorkspace.shared.notificationCenter.removeObserver(observer)
         windowMonitorObserver = nil
