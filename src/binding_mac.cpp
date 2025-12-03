@@ -1,6 +1,7 @@
 #include <napi.h>
 #include <dlfcn.h>
 #include <string>
+#include <vector>
 #include <cstdlib>
 
 // Swift 动态库函数类型定义
@@ -93,29 +94,61 @@ void OnWindowChanged(const char* jsonStr) {
     }
 }
 
+// 获取当前 .node 文件所在目录
+std::string GetModuleDirectory() {
+    Dl_info info;
+    // 获取当前函数的地址，从而定位到 .node 文件
+    if (dladdr((void*)GetModuleDirectory, &info) && info.dli_fname) {
+        std::string path(info.dli_fname);
+        size_t lastSlash = path.find_last_of('/');
+        if (lastSlash != std::string::npos) {
+            return path.substr(0, lastSlash);
+        }
+    }
+    return ".";
+}
+
 // 加载 Swift 动态库
 bool LoadSwiftLibrary(Napi::Env env) {
     if (swiftLibHandle != nullptr) {
         return true;  // 已加载
     }
 
-    // 尝试多个路径
-    const char* paths[] = {
+    std::string moduleDir = GetModuleDirectory();
+
+    // 尝试多个路径（优先级从高到低）
+    std::vector<std::string> paths = {
+        // 1. .node 文件同目录（最常见的部署方式）
+        moduleDir + "/libZToolsNative.dylib",
+        // 2. .node 文件的上级 lib 目录
+        moduleDir + "/../lib/libZToolsNative.dylib",
+        // 3. 当前工作目录的 lib 子目录（开发环境）
         "./lib/libZToolsNative.dylib",
+        // 4. 当前工作目录（开发环境备选）
         "./libZToolsNative.dylib",
+        // 5. 相对路径备选
         "../lib/libZToolsNative.dylib"
     };
 
-    for (const char* path : paths) {
-        swiftLibHandle = dlopen(path, RTLD_NOW);
+    std::string lastError;
+    for (const auto& path : paths) {
+        swiftLibHandle = dlopen(path.c_str(), RTLD_NOW);
         if (swiftLibHandle != nullptr) {
             break;
         }
+        lastError = dlerror();
     }
 
     if (swiftLibHandle == nullptr) {
-        Napi::Error::New(env, std::string("Failed to load Swift library: ") + dlerror())
-            .ThrowAsJavaScriptException();
+        std::string errorMsg = "Failed to load Swift library.\n";
+        errorMsg += "Module directory: " + moduleDir + "\n";
+        errorMsg += "Tried paths:\n";
+        for (const auto& path : paths) {
+            errorMsg += "  - " + path + "\n";
+        }
+        errorMsg += "Last error: " + lastError;
+
+        Napi::Error::New(env, errorMsg).ThrowAsJavaScriptException();
         return false;
     }
 
