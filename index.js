@@ -160,6 +160,31 @@ class WindowManager {
   static simulatePaste() {
     return addon.simulatePaste();
   }
+
+  /**
+   * 模拟键盘按键
+   * @param {string} key - 要模拟的按键
+   * @param {...string} modifiers - 修饰键（shift、ctrl、alt、meta）
+   * @returns {boolean} 是否成功
+   * @example
+   * // 模拟按下字母 'a'
+   * WindowManager.simulateKeyboardTap('a');
+   *
+   * // 模拟 Command+C (macOS) 或 Ctrl+C (Windows)
+   * WindowManager.simulateKeyboardTap('c', 'meta');
+   *
+   * // 模拟 Shift+Tab
+   * WindowManager.simulateKeyboardTap('tab', 'shift');
+   *
+   * // 模拟 Command+Shift+S (macOS)
+   * WindowManager.simulateKeyboardTap('s', 'meta', 'shift');
+   */
+  static simulateKeyboardTap(key, ...modifiers) {
+    if (typeof key !== 'string' || !key) {
+      throw new TypeError('key must be a non-empty string');
+    }
+    return addon.simulateKeyboardTap(key, ...modifiers);
+  }
 }
 
 // 区域截图类

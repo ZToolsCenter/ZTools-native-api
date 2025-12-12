@@ -284,6 +284,129 @@ public func simulatePaste() -> Int32 {
     return 1
 }
 
+/// 将键名转换为 macOS keyCode
+private func getKeyCode(for key: String) -> CGKeyCode? {
+    let keyMap: [String: CGKeyCode] = [
+        // 字母键
+        "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4,
+        "i": 34, "j": 38, "k": 40, "l": 37, "m": 46, "n": 45, "o": 31,
+        "p": 35, "q": 12, "r": 15, "s": 1, "t": 17, "u": 32, "v": 9,
+        "w": 13, "x": 7, "y": 16, "z": 6,
+
+        // 数字键
+        "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23,
+        "6": 22, "7": 26, "8": 28, "9": 25,
+
+        // 功能键
+        "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+        "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+
+        // 特殊键
+        "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51,
+        "escape": 53, "esc": 53, "backspace": 51,
+
+        // 方向键
+        "left": 123, "right": 124, "down": 125, "up": 126,
+
+        // 其他键
+        "minus": 27, "-": 27,
+        "equal": 24, "=": 24,
+        "leftbracket": 33, "[": 33,
+        "rightbracket": 30, "]": 30,
+        "backslash": 42, "\\": 42,
+        "semicolon": 41, ";": 41,
+        "quote": 39, "'": 39,
+        "comma": 43, ",": 43,
+        "period": 47, ".": 47,
+        "slash": 44, "/": 44,
+        "grave": 50, "`": 50
+    ]
+
+    return keyMap[key.lowercased()]
+}
+
+/// 模拟键盘按键
+/// - Parameters:
+///   - key: 要按的键
+///   - modifiers: 修饰键字符串（逗号分隔，如 "shift,ctrl" 或空字符串）
+/// - Returns: 是否成功 (1: 成功, 0: 失败)
+@_cdecl("simulateKeyboardTap")
+public func simulateKeyboardTap(_ key: UnsafePointer<CChar>?, _ modifiers: UnsafePointer<CChar>?) -> Int32 {
+    // 检查辅助功能权限
+    let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+    let accessEnabled = AXIsProcessTrustedWithOptions(options)
+
+    if !accessEnabled {
+        print("Error: Accessibility permission not granted")
+        return 0
+    }
+
+    guard let key = key else {
+        print("Error: key is nil")
+        return 0
+    }
+
+    let keyString = String(cString: key)
+
+    // 获取键码
+    guard let keyCode = getKeyCode(for: keyString) else {
+        print("Error: Unknown key '\(keyString)'")
+        return 0
+    }
+
+    // 解析修饰键
+    var flags = CGEventFlags()
+    if let modifiers = modifiers {
+        let modifiersString = String(cString: modifiers)
+        if !modifiersString.isEmpty {
+            let modifierList = modifiersString.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+
+            for modifier in modifierList {
+                switch modifier {
+                case "shift":
+                    flags.insert(.maskShift)
+                case "ctrl", "control":
+                    flags.insert(.maskControl)
+                case "alt", "option":
+                    flags.insert(.maskAlternate)
+                case "meta", "cmd", "command":
+                    flags.insert(.maskCommand)
+                default:
+                    print("Warning: Unknown modifier '\(modifier)'")
+                }
+            }
+        }
+    }
+
+    // 创建事件源
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        print("Error: Failed to create event source")
+        return 0
+    }
+
+    // 按下键
+    guard let keyDownEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: true) else {
+        print("Error: Failed to create key down event")
+        return 0
+    }
+    keyDownEvent.flags = flags
+
+    // 释放键
+    guard let keyUpEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: false) else {
+        print("Error: Failed to create key up event")
+        return 0
+    }
+    keyUpEvent.flags = flags
+
+    // 发送事件
+    keyDownEvent.post(tap: .cghidEventTap)
+    usleep(10_000) // 10ms 延迟
+    keyUpEvent.post(tap: .cghidEventTap)
+
+    print("Keyboard tap simulation executed: \(keyString) with modifiers: \(modifiers != nil ? String(cString: modifiers!) : "none")")
+    return 1
+}
+
 // MARK: - Helper Functions
 
 /// 辅助函数：转义 JSON 字符串

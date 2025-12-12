@@ -8,7 +8,9 @@ macOS 和 Windows 原生 API 的 Node.js 封装，使用 Swift + Win32 API + Nod
 2. **窗口激活监控** - 实时监听窗口切换事件
 3. **获取当前窗口** - 获取当前激活窗口的应用名和标识符
 4. **设置激活窗口** - 根据标识符激活指定应用
-5. **区域截图** - 选区截图并自动保存到剪贴板（Windows）
+5. **键盘模拟** - 模拟键盘按键和快捷键（支持修饰键）
+6. **粘贴模拟** - 模拟 Cmd+V (macOS) / Ctrl+V (Windows)
+7. **区域截图** - 选区截图并自动保存到剪贴板（Windows）
 
 ## 🔧 系统要求
 
@@ -70,7 +72,29 @@ WindowManager.activateWindow('com.apple.Safari');
 // Windows: 使用 processId (number)
 WindowManager.activateWindow(12345);
 
-// 4. 区域截图（仅 Windows）
+// 5. 模拟键盘按键
+// 基本用法：输入单个字母
+WindowManager.simulateKeyboardTap('a');
+
+// 使用修饰键：输入大写字母
+WindowManager.simulateKeyboardTap('a', 'shift');
+
+// 模拟快捷键：Cmd+C (macOS) / Ctrl+C (Windows)
+const modifier = process.platform === 'darwin' ? 'meta' : 'ctrl';
+WindowManager.simulateKeyboardTap('c', modifier);
+
+// 使用多个修饰键：Cmd+Shift+S (macOS) / Ctrl+Shift+S (Windows)
+WindowManager.simulateKeyboardTap('s', modifier, 'shift');
+
+// 特殊键：Enter、Tab、方向键等
+WindowManager.simulateKeyboardTap('return');
+WindowManager.simulateKeyboardTap('tab');
+WindowManager.simulateKeyboardTap('left');
+
+// 6. 模拟粘贴操作
+WindowManager.simulatePaste();
+
+// 7. 区域截图（仅 Windows）
 const { ScreenCapture } = require('ztools-native-api');
 
 ScreenCapture.start((result) => {
@@ -177,6 +201,64 @@ WindowManager.activateWindow(12345);
 获取当前平台
 - **返回**: `'darwin' | 'win32'`
 
+#### `WindowManager.simulateKeyboardTap(key, ...modifiers)`
+模拟键盘按键
+- **参数**:
+  - `key` (string) - 要按的键（如 'a', 'return', 'tab', 'left' 等）
+  - `...modifiers` (string[]) - 修饰键（可选），支持 'shift', 'ctrl', 'alt', 'meta'
+- **返回**: `boolean` - 是否成功
+- **跨平台**: ✅ 一致（'meta' 在 macOS 上是 Command，在 Windows 上是 Win 键）
+
+**支持的按键**:
+- 字母: `a-z`
+- 数字: `0-9`
+- 功能键: `f1-f12`
+- 特殊键: `return/enter`, `tab`, `space`, `backspace`, `delete`, `escape/esc`
+- 方向键: `left`, `right`, `up`, `down`
+- 符号键: `-`, `=`, `[`, `]`, `\`, `;`, `'`, `,`, `.`, `/`, `` ` ``
+
+**支持的修饰键**:
+- `shift` - Shift 键
+- `ctrl/control` - Control 键
+- `alt` - Alt 键（macOS 上是 Option）
+- `meta` - Command 键（macOS）/ Windows 键（Windows）
+
+**示例**:
+```javascript
+// 输入字母
+WindowManager.simulateKeyboardTap('a');
+
+// 输入大写字母（Shift + A）
+WindowManager.simulateKeyboardTap('a', 'shift');
+
+// 复制（Cmd+C / Ctrl+C）
+const mod = process.platform === 'darwin' ? 'meta' : 'ctrl';
+WindowManager.simulateKeyboardTap('c', mod);
+
+// 多个修饰键（Cmd+Shift+S）
+WindowManager.simulateKeyboardTap('s', mod, 'shift');
+
+// 特殊键
+WindowManager.simulateKeyboardTap('return');  // Enter
+WindowManager.simulateKeyboardTap('tab');     // Tab
+WindowManager.simulateKeyboardTap('left');    // 左方向键
+```
+
+**注意事项**:
+- **macOS**: 需要授予"辅助功能"权限（首次调用时会提示）
+- **Windows**: 无需特殊权限
+- 建议在调用前确保目标窗口已激活
+
+#### `WindowManager.simulatePaste()`
+模拟粘贴操作（Cmd+V / Ctrl+V）
+- **返回**: `boolean` - 是否成功
+- **跨平台**: ✅ 一致
+
+**示例**:
+```javascript
+WindowManager.simulatePaste();
+```
+
 ---
 
 ### `ScreenCapture`
@@ -213,6 +295,10 @@ ScreenCapture.start((result) => {
 
 ```bash
 npm test
+
+# 或运行特定测试
+node test/test-keyboard.js         # 完整键盘测试
+node test/test-keyboard-simple.js  # 简单键盘测试
 ```
 
 ## ⚠️ 平台差异
@@ -222,14 +308,19 @@ npm test
 | **窗口标识符** | Bundle ID (稳定，如 `com.apple.Safari`) | Process ID (动态变化，如 `12345`) |
 | **激活限制** | 较宽松 | 严格（需要线程附加 hack） |
 | **剪贴板监控** | 轮询 `changeCount` | 消息循环 + `WM_CLIPBOARDUPDATE` |
+| **键盘模拟** | ✅ 需要辅助功能权限 | ✅ 无需特殊权限 |
 | **区域截图** | ❌ 暂不支持 | ✅ 支持（分层窗口 + GDI） |
-| **权限要求** | 辅助功能权限（可选） | 无特殊要求 |
+| **权限要求** | 辅助功能权限（键盘模拟） | 无特殊要求 |
 
 ## 📝 注意事项
 
 ### macOS
 - Bundle ID 是稳定的，应用重启后不变
 - 推荐使用 Bundle ID 作为窗口标识
+- **键盘模拟需要辅助功能权限**：
+  - 系统偏好设置 → 隐私与安全性 → 辅助功能
+  - 将你的应用或终端添加到允许列表
+  - 首次调用会自动提示授权
 
 ### Windows
 - Process ID 每次启动都会变化，不适合持久化存储

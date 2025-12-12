@@ -14,6 +14,7 @@ typedef void (*StopWindowMonitorFunc)();
 typedef char* (*GetActiveWindowFunc)();
 typedef int (*ActivateWindowFunc)(const char*);
 typedef int (*SimulatePasteFunc)();  // 模拟粘贴功能
+typedef int (*SimulateKeyboardTapFunc)(const char*, const char*);  // 模拟键盘按键功能
 
 // 全局变量
 static void* swiftLibHandle = nullptr;
@@ -26,6 +27,7 @@ static StopWindowMonitorFunc stopWindowMonitorFunc = nullptr;
 static GetActiveWindowFunc getActiveWindowFunc = nullptr;
 static ActivateWindowFunc activateWindowFunc = nullptr;
 static SimulatePasteFunc simulatePasteFunc = nullptr;  // 模拟粘贴函数
+static SimulateKeyboardTapFunc simulateKeyboardTapFunc = nullptr;  // 模拟键盘按键函数
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void* context, void* data) {
@@ -162,9 +164,11 @@ bool LoadSwiftLibrary(Napi::Env env) {
     getActiveWindowFunc = (GetActiveWindowFunc)dlsym(swiftLibHandle, "getActiveWindow");
     activateWindowFunc = (ActivateWindowFunc)dlsym(swiftLibHandle, "activateWindow");
     simulatePasteFunc = (SimulatePasteFunc)dlsym(swiftLibHandle, "simulatePaste");
+    simulateKeyboardTapFunc = (SimulateKeyboardTapFunc)dlsym(swiftLibHandle, "simulateKeyboardTap");
 
     if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
-        !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc || !simulatePasteFunc) {
+        !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
+        !simulatePasteFunc || !simulateKeyboardTapFunc) {
         Napi::Error::New(env, "Failed to load Swift functions").ThrowAsJavaScriptException();
         dlclose(swiftLibHandle);
         swiftLibHandle = nullptr;
@@ -378,6 +382,47 @@ Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, success == 1);
 }
 
+// 模拟键盘按键
+Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (!LoadSwiftLibrary(env)) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 参数1：key（必需）
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected key as first argument (string)").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    std::string key = info[0].As<Napi::String>().Utf8Value();
+
+    // 参数2+：modifiers（可选）
+    std::string modifiers = "";
+    if (info.Length() > 1) {
+        // 收集所有修饰键参数
+        std::vector<std::string> modifierList;
+        for (size_t i = 1; i < info.Length(); i++) {
+            if (info[i].IsString()) {
+                modifierList.push_back(info[i].As<Napi::String>().Utf8Value());
+            }
+        }
+
+        // 用逗号连接
+        if (!modifierList.empty()) {
+            for (size_t i = 0; i < modifierList.size(); i++) {
+                if (i > 0) modifiers += ",";
+                modifiers += modifierList[i];
+            }
+        }
+    }
+
+    const char* modifiersPtr = modifiers.empty() ? nullptr : modifiers.c_str();
+    int success = simulateKeyboardTapFunc(key.c_str(), modifiersPtr);
+    return Napi::Boolean::New(env, success == 1);
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -387,6 +432,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getActiveWindow", Napi::Function::New(env, GetActiveWindow));
     exports.Set("activateWindow", Napi::Function::New(env, ActivateWindow));
     exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
+    exports.Set("simulateKeyboardTap", Napi::Function::New(env, SimulateKeyboardTap));
     return exports;
 }
 

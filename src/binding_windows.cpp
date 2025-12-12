@@ -8,6 +8,8 @@
 #include <string>
 #include <atomic>
 #include <algorithm>   // For std::min, std::max
+#include <map>         // For key mapping
+#include <vector>      // For input events
 
 // 取消与自定义函数名冲突的Windows宏
 #ifdef GetActiveWindow
@@ -940,6 +942,59 @@ Napi::Value StartRegionCapture(const Napi::CallbackInfo& info) {
 
 // ==================== 键盘模拟功能 ====================
 
+// 将键名映射为 Windows Virtual Key Code
+WORD GetVirtualKeyCode(const std::string& key) {
+    static std::map<std::string, WORD> keyMap = {
+        // 字母键
+        {"a", 'A'}, {"b", 'B'}, {"c", 'C'}, {"d", 'D'}, {"e", 'E'}, {"f", 'F'},
+        {"g", 'G'}, {"h", 'H'}, {"i", 'I'}, {"j", 'J'}, {"k", 'K'}, {"l", 'L'},
+        {"m", 'M'}, {"n", 'N'}, {"o", 'O'}, {"p", 'P'}, {"q", 'Q'}, {"r", 'R'},
+        {"s", 'S'}, {"t", 'T'}, {"u", 'U'}, {"v", 'V'}, {"w", 'W'}, {"x", 'X'},
+        {"y", 'Y'}, {"z", 'Z'},
+
+        // 数字键
+        {"0", '0'}, {"1", '1'}, {"2", '2'}, {"3", '3'}, {"4", '4'},
+        {"5", '5'}, {"6", '6'}, {"7", '7'}, {"8", '8'}, {"9", '9'},
+
+        // 功能键
+        {"f1", VK_F1}, {"f2", VK_F2}, {"f3", VK_F3}, {"f4", VK_F4},
+        {"f5", VK_F5}, {"f6", VK_F6}, {"f7", VK_F7}, {"f8", VK_F8},
+        {"f9", VK_F9}, {"f10", VK_F10}, {"f11", VK_F11}, {"f12", VK_F12},
+
+        // 特殊键
+        {"return", VK_RETURN}, {"enter", VK_RETURN}, {"tab", VK_TAB},
+        {"space", VK_SPACE}, {"backspace", VK_BACK}, {"delete", VK_DELETE},
+        {"escape", VK_ESCAPE}, {"esc", VK_ESCAPE},
+
+        // 方向键
+        {"left", VK_LEFT}, {"right", VK_RIGHT}, {"up", VK_UP}, {"down", VK_DOWN},
+
+        // 其他键
+        {"minus", VK_OEM_MINUS}, {"-", VK_OEM_MINUS},
+        {"equal", VK_OEM_PLUS}, {"=", VK_OEM_PLUS},
+        {"leftbracket", VK_OEM_4}, {"[", VK_OEM_4},
+        {"rightbracket", VK_OEM_6}, {"]", VK_OEM_6},
+        {"backslash", VK_OEM_5}, {"\\", VK_OEM_5},
+        {"semicolon", VK_OEM_1}, {";", VK_OEM_1},
+        {"quote", VK_OEM_7}, {"'", VK_OEM_7},
+        {"comma", VK_OEM_COMMA}, {",", VK_OEM_COMMA},
+        {"period", VK_OEM_PERIOD}, {".", VK_OEM_PERIOD},
+        {"slash", VK_OEM_2}, {"/", VK_OEM_2},
+        {"grave", VK_OEM_3}, {"`", VK_OEM_3}
+    };
+
+    // 转换为小写
+    std::string lowerKey = key;
+    std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), ::tolower);
+
+    auto it = keyMap.find(lowerKey);
+    if (it != keyMap.end()) {
+        return it->second;
+    }
+
+    return 0;  // 未知键
+}
+
 // 模拟粘贴操作（Ctrl + V）
 Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -974,6 +1029,84 @@ Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, result == 4);
 }
 
+// 模拟键盘按键
+Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 参数1：key（必需）
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected key as first argument (string)").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    std::string key = info[0].As<Napi::String>().Utf8Value();
+
+    // 获取虚拟键码
+    WORD vkCode = GetVirtualKeyCode(key);
+    if (vkCode == 0) {
+        Napi::Error::New(env, "Unknown key: " + key).ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 解析修饰键（可选参数）
+    std::vector<WORD> modifierKeys;
+    for (size_t i = 1; i < info.Length(); i++) {
+        if (info[i].IsString()) {
+            std::string modifier = info[i].As<Napi::String>().Utf8Value();
+            std::transform(modifier.begin(), modifier.end(), modifier.begin(), ::tolower);
+
+            if (modifier == "shift") {
+                modifierKeys.push_back(VK_SHIFT);
+            } else if (modifier == "ctrl" || modifier == "control") {
+                modifierKeys.push_back(VK_CONTROL);
+            } else if (modifier == "alt") {
+                modifierKeys.push_back(VK_MENU);
+            } else if (modifier == "meta" || modifier == "win" || modifier == "windows") {
+                modifierKeys.push_back(VK_LWIN);
+            }
+        }
+    }
+
+    // 计算需要的输入事件数量
+    size_t eventCount = modifierKeys.size() * 2 + 2;  // 每个修饰键按下+释放，主键按下+释放
+    std::vector<INPUT> inputs(eventCount);
+    size_t idx = 0;
+
+    // 1. 按下所有修饰键
+    for (WORD modKey : modifierKeys) {
+        inputs[idx].type = INPUT_KEYBOARD;
+        inputs[idx].ki.wVk = modKey;
+        inputs[idx].ki.dwFlags = 0;
+        idx++;
+    }
+
+    // 2. 按下主键
+    inputs[idx].type = INPUT_KEYBOARD;
+    inputs[idx].ki.wVk = vkCode;
+    inputs[idx].ki.dwFlags = 0;
+    idx++;
+
+    // 3. 释放主键
+    inputs[idx].type = INPUT_KEYBOARD;
+    inputs[idx].ki.wVk = vkCode;
+    inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP;
+    idx++;
+
+    // 4. 释放所有修饰键（逆序）
+    for (auto it = modifierKeys.rbegin(); it != modifierKeys.rend(); ++it) {
+        inputs[idx].type = INPUT_KEYBOARD;
+        inputs[idx].ki.wVk = *it;
+        inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP;
+        idx++;
+    }
+
+    // 发送输入事件
+    UINT result = SendInput(static_cast<UINT>(eventCount), inputs.data(), sizeof(INPUT));
+
+    // 返回是否成功
+    return Napi::Boolean::New(env, result == eventCount);
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -983,6 +1116,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getActiveWindow", Napi::Function::New(env, GetActiveWindowInfo));
     exports.Set("activateWindow", Napi::Function::New(env, ActivateWindow));
     exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
+    exports.Set("simulateKeyboardTap", Napi::Function::New(env, SimulateKeyboardTap));
     exports.Set("startRegionCapture", Napi::Function::New(env, StartRegionCapture));
     return exports;
 }
