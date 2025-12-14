@@ -1,0 +1,36 @@
+{
+  "name": "ztools-event-hook",
+  "version": "1.0.0",
+  "description": "Cross-platform global mouse and keyboard event hook for Node.js",
+  "main": "index.js",
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "clean": "node-gyp clean && node scripts/clean.js",
+    "test": "node test/test-hook-event.js",
+    "test:compile": "node test/test-compile.js",
+    "install": "npm run build"
+  },
+  "keywords": [
+    "macos",
+    "windows",
+    "native",
+    "event-hook",
+    "keyboard",
+    "mouse",
+    "global-hook",
+    "win32",
+    "napi"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
+
