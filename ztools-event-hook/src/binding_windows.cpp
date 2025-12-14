@@ -18,11 +18,12 @@ static int g_eventHookEffect = 0;  // 1=鼠标, 2=键盘, 3=两者
 
 // ==================== 事件钩子功能 ====================
 
+// 函数前向声明
+std::string GetKeyNameFromVK(WORD vkCode);
+
 // 事件数据结构
 struct MouseEventData {
     int eventCode;
-    int x;
-    int y;
 };
 
 struct KeyboardEventData {
@@ -68,9 +69,7 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 EventData* eventData = new EventData();
                 eventData->type = 1;  // 鼠标事件
                 eventData->data.mouse.eventCode = eventCode;
-                eventData->data.mouse.x = pMouseStruct->pt.x;
-                eventData->data.mouse.y = pMouseStruct->pt.y;
-                
+
                 napi_call_threadsafe_function(g_eventHookTsfn, eventData, napi_tsfn_nonblocking);
             }
         }
@@ -94,8 +93,8 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (g_eventHookTsfn != nullptr) {
             KBDLLHOOKSTRUCT* pKeyboardStruct = (KBDLLHOOKSTRUCT*)lParam;
             WORD vkCode = pKeyboardStruct->vkCode;
-            bool isKeyUp = (lParam & 0x80000000) != 0;  // 检查是否是按键弹起
-            
+            bool isKeyUp = (pKeyboardStruct->flags & LLKHF_UP) != 0;  // 检查是否是按键弹起
+
             // 如果不是修饰键的弹起事件，只处理按下事件
             if (isKeyUp && !IsModifierKey(vkCode)) {
                 return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
@@ -194,8 +193,8 @@ std::string GetKeyNameFromVK(WORD vkCode) {
         {VK_OEM_7, "'"},          // Quote
         {VK_OEM_COMMA, ","},      // Comma
         {VK_OEM_PERIOD, "."},     // Period
-        {VK_OEM_2, "/"}           // Slash
-        
+        {VK_OEM_2, "/"},          // Slash
+
         // 方向键
         {VK_LEFT, "Left"}, {VK_RIGHT, "Right"}, {VK_UP, "Up"}, {VK_DOWN, "Down"},
         
@@ -242,12 +241,10 @@ void CallEventHookJs(napi_env env, napi_value js_callback, void* context, void* 
         napi_get_global(env, &global);
         
         if (eventData->type == 1) {
-            // 鼠标事件：eventCode, x, y
-            napi_value args[3];
+            // 鼠标事件：eventCode
+            napi_value args[1];
             args[0] = Napi::Number::New(env, eventData->data.mouse.eventCode);
-            args[1] = Napi::Number::New(env, eventData->data.mouse.x);
-            args[2] = Napi::Number::New(env, eventData->data.mouse.y);
-            napi_call_function(env, global, js_callback, 3, args, nullptr);
+            napi_call_function(env, global, js_callback, 1, args, nullptr);
         } else if (eventData->type == 2) {
             // 键盘事件：keyName, shiftKey, ctrlKey, altKey, metaKey, flagsChange
             napi_value args[6];
