@@ -957,8 +957,29 @@ Napi::Value GetClipboardFiles(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Array result = Napi::Array::New(env);
 
-    // 打开剪贴板
-    if (!OpenClipboard(NULL)) {
+    // 尝试打开剪贴板（带重试机制，解决 Windows 11 剪贴板占用问题）
+    const int maxRetries = 5;
+    const int retryDelayMs = 50;
+    BOOL clipboardOpened = FALSE;
+
+    for (int i = 0; i < maxRetries; i++) {
+        // 尝试使用消息窗口句柄或NULL
+        HWND hwndOwner = g_hwnd != NULL ? g_hwnd : NULL;
+        clipboardOpened = OpenClipboard(hwndOwner);
+
+        if (clipboardOpened) {
+            break;  // 成功打开
+        }
+
+        // 如果不是最后一次重试，等待后重试
+        if (i < maxRetries - 1) {
+            Sleep(retryDelayMs);
+        }
+    }
+
+    // 打开剪贴板失败
+    if (!clipboardOpened) {
+        // Windows 11: 剪贴板可能被系统或其他程序占用
         return result;  // 返回空数组
     }
 
@@ -1123,10 +1144,30 @@ Napi::Value SetClipboardFiles(const Napi::CallbackInfo& info) {
     // 解锁内存
     GlobalUnlock(hGlobal);
 
-    // 打开剪贴板
-    if (!OpenClipboard(NULL)) {
+    // 尝试打开剪贴板（带重试机制，解决 Windows 11 剪贴板占用问题）
+    const int maxRetries = 5;
+    const int retryDelayMs = 50;
+    BOOL clipboardOpened = FALSE;
+
+    for (int i = 0; i < maxRetries; i++) {
+        // 尝试使用消息窗口句柄或NULL
+        HWND hwndOwner = g_hwnd != NULL ? g_hwnd : NULL;
+        clipboardOpened = OpenClipboard(hwndOwner);
+
+        if (clipboardOpened) {
+            break;  // 成功打开
+        }
+
+        // 如果不是最后一次重试，等待后重试
+        if (i < maxRetries - 1) {
+            Sleep(retryDelayMs);
+        }
+    }
+
+    // 打开剪贴板失败
+    if (!clipboardOpened) {
         GlobalFree(hGlobal);
-        Napi::Error::New(env, "Failed to open clipboard").ThrowAsJavaScriptException();
+        Napi::Error::New(env, "Failed to open clipboard after retries").ThrowAsJavaScriptException();
         return Napi::Boolean::New(env, false);
     }
 
