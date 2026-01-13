@@ -1,0 +1,188 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build macOS Universal Binary (x86_64 + arm64)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Verify architecture
+        run: |
+          echo "Current architecture: $(uname -m)"
+          echo "Building Universal Binary (x86_64 + arm64)"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build C++ binding (Universal Binary)
+        run: node-gyp rebuild
+
+      - name: Build Swift library (Universal Binary)
+        run: |
+          mkdir -p lib
+
+          # 分别编译两个架构
+          echo "Building arm64 version..."
+          swiftc -emit-library \
+            -o lib/libZToolsNative_arm64.dylib \
+            src/ZToolsNative.swift \
+            -framework Cocoa \
+            -target arm64-apple-macosx11.0 \
+            -Osize
+
+          echo "Building x86_64 version..."
+          swiftc -emit-library \
+            -o lib/libZToolsNative_x86_64.dylib \
+            src/ZToolsNative.swift \
+            -framework Cocoa \
+            -target x86_64-apple-macosx10.15 \
+            -Osize
+
+          # 合并成 Universal Binary
+          echo "Creating Universal Binary..."
+          lipo -create \
+            lib/libZToolsNative_arm64.dylib \
+            lib/libZToolsNative_x86_64.dylib \
+            -output lib/libZToolsNative.dylib
+
+          # 清理临时文件
+          rm lib/libZToolsNative_arm64.dylib lib/libZToolsNative_x86_64.dylib
+
+      - name: Verify build outputs
+        run: |
+          echo "Checking build outputs..."
+
+          # 检查 .node 文件
+          if [ -f "build/Release/ztools_native.node" ]; then
+            echo "✅ .node file built successfully"
+            file build/Release/ztools_native.node
+            lipo -info build/Release/ztools_native.node
+            otool -L build/Release/ztools_native.node
+          else
+            echo "❌ .node file not found"
+            exit 1
+          fi
+
+          # 检查 .dylib 文件
+          if [ -f "lib/libZToolsNative.dylib" ]; then
+            echo "✅ .dylib file built successfully"
+            file lib/libZToolsNative.dylib
+            lipo -info lib/libZToolsNative.dylib
+            otool -L lib/libZToolsNative.dylib
+          else
+            echo "❌ .dylib file not found"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: npm test
+        continue-on-error: true
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp build/Release/ztools_native.node artifacts/ztools_native-macos-universal.node
+          cp lib/libZToolsNative.dylib artifacts/libZToolsNative-macos-universal.dylib
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztools-native-macos
+          path: artifacts/
+          retention-days: 30
+
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build native module
+        run: npm run build
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          Write-Host "Checking build output..."
+
+          if (Test-Path "build/Release/ztools_native.node") {
+            Write-Host "✅ .node file built successfully"
+            Get-Item "build/Release/ztools_native.node" | Format-List
+          } else {
+            Write-Host "❌ .node file not found"
+            exit 1
+          }
+
+      - name: Run tests
+        run: npm test
+        continue-on-error: true
+
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          Copy-Item "build/Release/ztools_native.node" "artifacts/ztools_native-win-x64.node"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztools-native-windows
+          path: artifacts/
+          retention-days: 30
+
+  create-release:
+    name: Create Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ztools-native-macos
+          path: macos-artifacts
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ztools-native-windows
+          path: windows-artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            macos-artifacts/ztools_native-macos-universal.node
+            macos-artifacts/libZToolsNative-macos-universal.dylib
+            windows-artifacts/ztools_native-win-x64.node
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
