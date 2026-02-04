@@ -190,6 +190,8 @@ Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
 struct WindowInfo {
     DWORD processId;
     std::string appName;
+    std::string windowTitle;
+    std::string app;
 };
 
 // 获取窗口信息的辅助函数
@@ -203,6 +205,21 @@ WindowInfo* GetWindowInfo(HWND hwnd) {
     // 获取进程 ID
     GetWindowThreadProcessId(hwnd, &info->processId);
 
+    // 获取窗口标题
+    int titleLength = GetWindowTextLengthW(hwnd);
+    if (titleLength > 0) {
+        std::wstring wTitle(titleLength + 1, L'\0');
+        GetWindowTextW(hwnd, &wTitle[0], titleLength + 1);
+        wTitle.resize(titleLength);
+
+        // 转换为 UTF-8
+        int size = WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, NULL, 0, NULL, NULL);
+        if (size > 0) {
+            info->windowTitle.resize(size - 1);
+            WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, &info->windowTitle[0], size, NULL, NULL);
+        }
+    }
+
     // 获取进程句柄
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, info->processId);
     if (hProcess) {
@@ -212,11 +229,19 @@ WindowInfo* GetWindowInfo(HWND hwnd) {
             // 提取文件名（去掉路径）
             std::wstring fullPath(path);
             size_t lastSlash = fullPath.find_last_of(L"\\");
-            std::wstring fileName = (lastSlash != std::wstring::npos)
+            std::wstring fileNameWithExt = (lastSlash != std::wstring::npos)
                 ? fullPath.substr(lastSlash + 1)
                 : fullPath;
 
-            // 去掉 .exe 扩展名
+            // 保存完整程序名（包括 .exe）到 app 字段
+            int appSize = WideCharToMultiByte(CP_UTF8, 0, fileNameWithExt.c_str(), -1, NULL, 0, NULL, NULL);
+            if (appSize > 0) {
+                info->app.resize(appSize - 1);
+                WideCharToMultiByte(CP_UTF8, 0, fileNameWithExt.c_str(), -1, &info->app[0], appSize, NULL, NULL);
+            }
+
+            // 去掉 .exe 扩展名用于 appName
+            std::wstring fileName = fileNameWithExt;
             size_t lastDot = fileName.find_last_of(L".");
             if (lastDot != std::wstring::npos) {
                 fileName = fileName.substr(0, lastDot);
@@ -251,6 +276,14 @@ void CallWindowJs(napi_env env, napi_value js_callback, void* context, void* dat
         napi_value appName;
         napi_create_string_utf8(env, info->appName.c_str(), NAPI_AUTO_LENGTH, &appName);
         napi_set_named_property(env, result, "appName", appName);
+
+        napi_value windowTitle;
+        napi_create_string_utf8(env, info->windowTitle.c_str(), NAPI_AUTO_LENGTH, &windowTitle);
+        napi_set_named_property(env, result, "windowTitle", windowTitle);
+
+        napi_value app;
+        napi_create_string_utf8(env, info->app.c_str(), NAPI_AUTO_LENGTH, &app);
+        napi_set_named_property(env, result, "app", app);
 
         // 调用回调
         napi_value global;
@@ -428,6 +461,22 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
     GetWindowThreadProcessId(hwnd, &processId);
     result.Set("processId", Napi::Number::New(env, processId));
 
+    // 获取窗口标题
+    int titleLength = GetWindowTextLengthW(hwnd);
+    if (titleLength > 0) {
+        std::wstring wTitle(titleLength + 1, L'\0');
+        GetWindowTextW(hwnd, &wTitle[0], titleLength + 1);
+        wTitle.resize(titleLength);
+
+        // 转换为 UTF-8
+        int size = WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, NULL, 0, NULL, NULL);
+        if (size > 0) {
+            std::string titleUtf8(size - 1, 0);
+            WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, &titleUtf8[0], size, NULL, NULL);
+            result.Set("windowTitle", Napi::String::New(env, titleUtf8));
+        }
+    }
+
     // 获取进程句柄
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
     if (hProcess) {
@@ -437,11 +486,20 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
             // 提取文件名（去掉路径）
             std::wstring fullPath(path);
             size_t lastSlash = fullPath.find_last_of(L"\\");
-            std::wstring fileName = (lastSlash != std::wstring::npos)
+            std::wstring fileNameWithExt = (lastSlash != std::wstring::npos)
                 ? fullPath.substr(lastSlash + 1)
                 : fullPath;
 
-            // 去掉 .exe 扩展名
+            // 保存完整程序名（包括 .exe）到 app 字段
+            int appSize = WideCharToMultiByte(CP_UTF8, 0, fileNameWithExt.c_str(), -1, NULL, 0, NULL, NULL);
+            if (appSize > 0) {
+                std::string appUtf8(appSize - 1, 0);
+                WideCharToMultiByte(CP_UTF8, 0, fileNameWithExt.c_str(), -1, &appUtf8[0], appSize, NULL, NULL);
+                result.Set("app", Napi::String::New(env, appUtf8));
+            }
+
+            // 去掉 .exe 扩展名用于 appName
+            std::wstring fileName = fileNameWithExt;
             size_t lastDot = fileName.find_last_of(L".");
             if (lastDot != std::wstring::npos) {
                 fileName = fileName.substr(0, lastDot);

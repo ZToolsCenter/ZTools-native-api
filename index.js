@@ -113,7 +113,7 @@ class WindowMonitor {
    * 启动窗口监控
    * @param {Function} callback - 窗口切换时的回调函数
    * - macOS: { appName: string, bundleId: string, windowTitle: string, app: string }
-   * - Windows: { appName: string, processId: number }
+   * - Windows: { appName: string, processId: number, windowTitle: string, app: string }
    */
   start(callback) {
     if (this._isMonitoring) {
@@ -162,7 +162,7 @@ class WindowManager {
    * 获取当前激活的窗口信息
    * @returns {{appName: string, bundleId?: string, windowTitle?: string, app?: string, processId?: number}|null} 窗口信息对象
    * - macOS: { appName, bundleId, windowTitle, app }
-   * - Windows: { appName, processId }
+   * - Windows: { appName, processId, windowTitle, app }
    */
   static getActiveWindow() {
     const result = addon.getActiveWindow();
