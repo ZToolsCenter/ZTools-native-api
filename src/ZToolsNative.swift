@@ -146,7 +146,7 @@ private func getAppName(from app: NSRunningApplication) -> String {
 }
 
 /// 获取当前激活窗口的信息（JSON 格式）
-/// - Returns: JSON 字符串包含 appName、bundleId、windowTitle、app、x、y、width、height、appPath 和 pid，需要调用者 free
+/// - Returns: JSON 字符串包含 appName、bundleId、title、app、x、y、width、height、appPath 和 pid，需要调用者 free
 @_cdecl("getActiveWindow")
 public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
     // 获取当前激活的应用
@@ -164,7 +164,7 @@ public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
 
     // 构建 JSON 字符串
     let jsonString = """
-    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(pid)}
+    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))","title":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(pid)}
     """
 
     return strdup(jsonString)
@@ -254,7 +254,7 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
         // 立即回调初始窗口状态
         let jsonString = """
-        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))","windowTitle":"\(escapeJSON(appInfo.windowTitle))","app":"\(escapeJSON(appInfo.app))","x":\(Int(appInfo.bounds.origin.x)),"y":\(Int(appInfo.bounds.origin.y)),"width":\(Int(appInfo.bounds.size.width)),"height":\(Int(appInfo.bounds.size.height)),"appPath":"\(escapeJSON(appInfo.appPath))","pid":\(appInfo.pid)}
+        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))","title":"\(escapeJSON(appInfo.windowTitle))","app":"\(escapeJSON(appInfo.app))","x":\(Int(appInfo.bounds.origin.x)),"y":\(Int(appInfo.bounds.origin.y)),"width":\(Int(appInfo.bounds.size.width)),"height":\(Int(appInfo.bounds.size.height)),"appPath":"\(escapeJSON(appInfo.appPath))","pid":\(appInfo.pid)}
         """
         jsonString.withCString { cString in
             callback(cString)
@@ -290,7 +290,7 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
                 // 构建JSON字符串
                 let jsonString = """
-                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(currentPid)}
+                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))","title":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(currentPid)}
                 """
 
                 // 调用回调

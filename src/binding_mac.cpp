@@ -107,14 +107,14 @@ void CallWindowJs(napi_env env, napi_value js_callback, void *context,
       }
     }
 
-    // 查找 "windowTitle":"xxx"
-    size_t windowTitlePos = jsonString.find("\"windowTitle\":\"");
-    if (windowTitlePos != std::string::npos) {
-      size_t start = windowTitlePos + 15;
+    // 查找 "title":"xxx"
+    size_t titlePos = jsonString.find("\"title\":\"");
+    if (titlePos != std::string::npos) {
+      size_t start = titlePos + 9;
       size_t end = jsonString.find("\"", start);
       if (end != std::string::npos) {
-        std::string windowTitle = jsonString.substr(start, end - start);
-        result.Set("windowTitle", Napi::String::New(napiEnv, windowTitle));
+        std::string title = jsonString.substr(start, end - start);
+        result.Set("title", Napi::String::New(napiEnv, title));
       }
     }
 
@@ -348,14 +348,14 @@ Napi::Value GetActiveWindow(const Napi::CallbackInfo &info) {
     }
   }
 
-  // 查找 "windowTitle":"xxx"
-  size_t windowTitlePos = jsonString.find("\"windowTitle\":\"");
-  if (windowTitlePos != std::string::npos) {
-    size_t start = windowTitlePos + 15; // 跳过 "windowTitle":"
+  // 查找 "title":"xxx"
+  size_t titlePos = jsonString.find("\"title\":\"");
+  if (titlePos != std::string::npos) {
+    size_t start = titlePos + 9; // 跳过 "title":"
     size_t end = jsonString.find("\"", start);
     if (end != std::string::npos) {
-      std::string windowTitle = jsonString.substr(start, end - start);
-      result.Set("windowTitle", Napi::String::New(env, windowTitle));
+      std::string title = jsonString.substr(start, end - start);
+      result.Set("title", Napi::String::New(env, title));
     }
   }
 

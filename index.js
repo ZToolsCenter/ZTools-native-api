@@ -115,7 +115,7 @@ class WindowMonitor {
    * - macOS: {
    *     appName: string,
    *     bundleId: string,
-   *     windowTitle: string,
+   *     title: string,
    *     app: string,
    *     x: number,
    *     y: number,
@@ -128,7 +128,7 @@ class WindowMonitor {
    *     appName: string,
    *     processId: number,
    *     pid: number,
-   *     windowTitle: string,
+   *     title: string,
    *     app: string,
    *     x: number,
    *     y: number,
@@ -182,9 +182,9 @@ class WindowMonitor {
 class WindowManager {
   /**
    * 获取当前激活的窗口信息
-   * @returns {{appName: string, bundleId?: string, windowTitle?: string, app?: string, x?: number, y?: number, width?: number, height?: number, appPath?: string, pid?: number, processId?: number}|null} 窗口信息对象
-   * - macOS: { appName, bundleId, windowTitle, app, x, y, width, height, appPath, pid }
-   * - Windows: { appName, processId, pid, windowTitle, app, x, y, width, height, appPath }
+   * @returns {{appName: string, bundleId?: string, title?: string, app?: string, x?: number, y?: number, width?: number, height?: number, appPath?: string, pid?: number, processId?: number}|null} 窗口信息对象
+   * - macOS: { appName, bundleId, title, app, x, y, width, height, appPath, pid }
+   * - Windows: { appName, processId, pid, title, app, x, y, width, height, appPath }
    */
   static getActiveWindow() {
     const result = addon.getActiveWindow();

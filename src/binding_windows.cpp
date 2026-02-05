@@ -190,7 +190,7 @@ Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
 struct WindowInfo {
     DWORD processId;
     std::string appName;
-    std::string windowTitle;
+    std::string title;
     std::string app;
     std::string appPath;
     int x;
@@ -234,8 +234,8 @@ WindowInfo* GetWindowInfo(HWND hwnd) {
         // 转换为 UTF-8
         int size = WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, NULL, 0, NULL, NULL);
         if (size > 0) {
-            info->windowTitle.resize(size - 1);
-            WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, &info->windowTitle[0], size, NULL, NULL);
+            info->title.resize(size - 1);
+            WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, &info->title[0], size, NULL, NULL);
         }
     }
 
@@ -307,9 +307,9 @@ void CallWindowJs(napi_env env, napi_value js_callback, void* context, void* dat
         napi_create_string_utf8(env, info->appName.c_str(), NAPI_AUTO_LENGTH, &appName);
         napi_set_named_property(env, result, "appName", appName);
 
-        napi_value windowTitle;
-        napi_create_string_utf8(env, info->windowTitle.c_str(), NAPI_AUTO_LENGTH, &windowTitle);
-        napi_set_named_property(env, result, "windowTitle", windowTitle);
+        napi_value title;
+        napi_create_string_utf8(env, info->title.c_str(), NAPI_AUTO_LENGTH, &title);
+        napi_set_named_property(env, result, "title", title);
 
         napi_value app;
         napi_create_string_utf8(env, info->app.c_str(), NAPI_AUTO_LENGTH, &app);
@@ -538,7 +538,7 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
         if (size > 0) {
             std::string titleUtf8(size - 1, 0);
             WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, &titleUtf8[0], size, NULL, NULL);
-            result.Set("windowTitle", Napi::String::New(env, titleUtf8));
+            result.Set("title", Napi::String::New(env, titleUtf8));
         }
     }
 
