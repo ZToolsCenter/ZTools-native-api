@@ -91,6 +91,39 @@ private func getWindowTitle(for pid: pid_t) -> String {
     return ""
 }
 
+/// 获取窗口边界（位置和尺寸）
+private func getWindowBounds(for pid: pid_t) -> CGRect {
+    let app = AXUIElementCreateApplication(pid)
+    var windowValue: AnyObject?
+    
+    // 获取应用的焦点窗口
+    let result = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowValue)
+    
+    if result == .success, let window = windowValue {
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+        
+        // 获取位置
+        let posResult = AXUIElementCopyAttributeValue(window as! AXUIElement, kAXPositionAttribute as CFString, &positionValue)
+        // 获取尺寸
+        let sizeResult = AXUIElementCopyAttributeValue(window as! AXUIElement, kAXSizeAttribute as CFString, &sizeValue)
+        
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        
+        if posResult == .success, let posValue = positionValue {
+            AXValueGetValue(posValue as! AXValue, .cgPoint, &position)
+        }
+        if sizeResult == .success, let szValue = sizeValue {
+            AXValueGetValue(szValue as! AXValue, .cgSize, &size)
+        }
+        
+        return CGRect(origin: position, size: size)
+    }
+    
+    return .zero
+}
+
 /// 获取应用的.app格式名称
 private func getAppName(from app: NSRunningApplication) -> String {
     // 优先使用应用名称
@@ -113,7 +146,7 @@ private func getAppName(from app: NSRunningApplication) -> String {
 }
 
 /// 获取当前激活窗口的信息（JSON 格式）
-/// - Returns: JSON 字符串包含 appName、bundleId、windowTitle 和 app，需要调用者 free
+/// - Returns: JSON 字符串包含 appName、bundleId、windowTitle、app、x、y、width、height、appPath 和 pid，需要调用者 free
 @_cdecl("getActiveWindow")
 public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
     // 获取当前激活的应用
@@ -123,12 +156,15 @@ public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
 
     let appName = frontmostApp.localizedName ?? "Unknown"
     let bundleId = frontmostApp.bundleIdentifier ?? "unknown.bundle.id"
-    let windowTitle = getWindowTitle(for: frontmostApp.processIdentifier)
+    let pid = frontmostApp.processIdentifier
+    let windowTitle = getWindowTitle(for: pid)
     let app = getAppName(from: frontmostApp)
+    let appPath = frontmostApp.bundleURL?.path ?? ""
+    let bounds = getWindowBounds(for: pid)
 
     // 构建 JSON 字符串
     let jsonString = """
-    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))"}
+    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(pid)}
     """
 
     return strdup(jsonString)
@@ -158,7 +194,7 @@ public func activateWindow(_ bundleId: UnsafePointer<CChar>?) -> Int32 {
 // MARK: - Window Monitor
 
 /// 使用 Core Graphics API 获取当前激活的应用（最可靠）
-private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName: String, windowTitle: String, app: String)? {
+private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName: String, windowTitle: String, app: String, appPath: String, bounds: CGRect)? {
     // 获取所有窗口列表，按层级排序
     let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
     guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
@@ -183,7 +219,9 @@ private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName:
                     let appName = runningApp.localizedName ?? "Unknown"
                     let windowTitle = getWindowTitle(for: pid)
                     let app = getAppName(from: runningApp)
-                    return (pid: pid, bundleId: bundleId, appName: appName, windowTitle: windowTitle, app: app)
+                    let appPath = runningApp.bundleURL?.path ?? ""
+                    let bounds = getWindowBounds(for: pid)
+                    return (pid: pid, bundleId: bundleId, appName: appName, windowTitle: windowTitle, app: app, appPath: appPath, bounds: bounds)
                 }
             }
         }
@@ -216,7 +254,7 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
         // 立即回调初始窗口状态
         let jsonString = """
-        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))","windowTitle":"\(escapeJSON(appInfo.windowTitle))","app":"\(escapeJSON(appInfo.app))"}
+        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))","windowTitle":"\(escapeJSON(appInfo.windowTitle))","app":"\(escapeJSON(appInfo.app))","x":\(Int(appInfo.bounds.origin.x)),"y":\(Int(appInfo.bounds.origin.y)),"width":\(Int(appInfo.bounds.size.width)),"height":\(Int(appInfo.bounds.size.height)),"appPath":"\(escapeJSON(appInfo.appPath))","pid":\(appInfo.pid)}
         """
         jsonString.withCString { cString in
             callback(cString)
@@ -242,6 +280,8 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
             let appName = appInfo.appName
             let windowTitle = appInfo.windowTitle
             let app = appInfo.app
+            let appPath = appInfo.appPath
+            let bounds = appInfo.bounds
 
             // 检测到窗口切换（使用 PID 比较更可靠）
             if currentPid != lastProcessId {
@@ -250,7 +290,7 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
                 // 构建JSON字符串
                 let jsonString = """
-                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))"}
+                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(currentPid)}
                 """
 
                 // 调用回调
