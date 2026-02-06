@@ -34,9 +34,12 @@ static napi_threadsafe_function g_tsfn = nullptr;
 
 // 全局变量 - 窗口监控
 static HWINEVENTHOOK g_winEventHook = NULL;
+static HWINEVENTHOOK g_winEventHookTitle = NULL;
 static std::atomic<bool> g_isWindowMonitoring(false);
 static napi_threadsafe_function g_windowTsfn = nullptr;
 static std::thread g_windowMessageThread;
+static HWND g_lastMonitoredWindow = NULL;
+static std::string g_lastMonitoredTitle;
 
 // 全局变量 - 区域截图
 static HWND g_screenshotOverlayWindow = NULL;
@@ -354,20 +357,48 @@ void CALLBACK WinEventProc(
     DWORD dwEventThread,
     DWORD dwmsEventTime
 ) {
-    // 只处理前台窗口切换事件
-    if (event == EVENT_SYSTEM_FOREGROUND && g_windowTsfn != nullptr) {
+    if (g_windowTsfn == nullptr) {
+        return;
+    }
+
+    // 处理前台窗口切换事件
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        // 更新当前监控的窗口
+        g_lastMonitoredWindow = hwnd;
+
         // 获取窗口信息
         WindowInfo* info = GetWindowInfo(hwnd);
         if (info != nullptr) {
+            g_lastMonitoredTitle = info->title;
             // 通过线程安全函数传递到 JS
             napi_call_threadsafe_function(g_windowTsfn, info, napi_tsfn_nonblocking);
+        }
+    }
+    // 处理窗口标题变化事件
+    else if (event == EVENT_OBJECT_NAMECHANGE && idObject == OBJID_WINDOW) {
+        // 只处理当前前台窗口的标题变化
+        HWND foregroundWindow = GetForegroundWindow();
+        if (hwnd == foregroundWindow && hwnd == g_lastMonitoredWindow) {
+            // 获取新的窗口信息
+            WindowInfo* info = GetWindowInfo(hwnd);
+            if (info != nullptr) {
+                // 检查标题是否真的变化了
+                if (info->title != g_lastMonitoredTitle) {
+                    g_lastMonitoredTitle = info->title;
+                    // 通过线程安全函数传递到 JS
+                    napi_call_threadsafe_function(g_windowTsfn, info, napi_tsfn_nonblocking);
+                } else {
+                    // 标题没变化，释放内存
+                    delete info;
+                }
+            }
         }
     }
 }
 
 // 窗口监控消息循环线程
 void WindowMonitorThread() {
-    // 在此线程中设置窗口事件钩子
+    // 设置前台窗口切换事件钩子
     g_winEventHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND,
         EVENT_SYSTEM_FOREGROUND,
@@ -383,6 +414,25 @@ void WindowMonitorThread() {
         return;
     }
 
+    // 设置窗口标题变化事件钩子
+    g_winEventHookTitle = SetWinEventHook(
+        EVENT_OBJECT_NAMECHANGE,
+        EVENT_OBJECT_NAMECHANGE,
+        NULL,
+        WinEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+
+    if (g_winEventHookTitle == NULL) {
+        // 如果标题钩子设置失败，清理前台钩子
+        UnhookWinEvent(g_winEventHook);
+        g_winEventHook = NULL;
+        g_isWindowMonitoring = false;
+        return;
+    }
+
     // 运行消息循环
     MSG msg;
     while (g_isWindowMonitoring && GetMessage(&msg, NULL, 0, 0)) {
@@ -394,6 +444,10 @@ void WindowMonitorThread() {
     if (g_winEventHook != NULL) {
         UnhookWinEvent(g_winEventHook);
         g_winEventHook = NULL;
+    }
+    if (g_winEventHookTitle != NULL) {
+        UnhookWinEvent(g_winEventHookTitle);
+        g_winEventHookTitle = NULL;
     }
 }
 
@@ -457,8 +511,10 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo& info) {
     // 立即回调当前激活的窗口
     HWND currentWindow = GetForegroundWindow();
     if (currentWindow != NULL) {
+        g_lastMonitoredWindow = currentWindow;
         WindowInfo* info = GetWindowInfo(currentWindow);
         if (info != nullptr) {
+            g_lastMonitoredTitle = info->title;
             napi_call_threadsafe_function(g_windowTsfn, info, napi_tsfn_nonblocking);
         }
     }
@@ -487,6 +543,10 @@ Napi::Value StopWindowMonitor(const Napi::CallbackInfo& info) {
         napi_release_threadsafe_function(g_windowTsfn, napi_tsfn_release);
         g_windowTsfn = nullptr;
     }
+
+    // 重置跟踪变量
+    g_lastMonitoredWindow = NULL;
+    g_lastMonitoredTitle.clear();
 
     return env.Undefined();
 }
