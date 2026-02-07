@@ -124,14 +124,9 @@ private func getWindowBounds(for pid: pid_t) -> CGRect {
     return .zero
 }
 
-/// 获取应用的.app格式名称
+/// 获取应用的.app格式名称（非本地化，英文名称）
 private func getAppName(from app: NSRunningApplication) -> String {
-    // 优先使用应用名称
-    if let localizedName = app.localizedName, !localizedName.isEmpty {
-        return "\(localizedName).app"
-    }
-    
-    // 如果没有本地化名称，尝试从 bundle URL 获取
+    // 优先使用 bundle URL 获取实际的 .app 文件夹名称（非本地化）
     if let bundleURL = app.bundleURL {
         let appFileName = bundleURL.lastPathComponent
         // 如果已经包含.app后缀，直接返回
@@ -139,6 +134,11 @@ private func getAppName(from app: NSRunningApplication) -> String {
             return appFileName
         }
         return "\(appFileName).app"
+    }
+    
+    // 如果无法获取 bundleURL，回退到使用本地化名称
+    if let localizedName = app.localizedName, !localizedName.isEmpty {
+        return "\(localizedName).app"
     }
     
     // 默认返回 Unknown.app
