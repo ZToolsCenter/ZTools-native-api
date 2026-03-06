@@ -19,6 +19,13 @@
 #include <shobjidl.h>  // For IApplicationActivationManager
 #include <appmodel.h>  // For package APIs
 #include <shlwapi.h>   // For PathCombineW
+#include <dwmapi.h>    // For DwmGetWindowAttribute
+#pragma comment(lib, "dwmapi.lib")
+
+// DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
 
 // GDI+ 需要 min/max
 namespace Gdiplus {
@@ -55,9 +62,6 @@ static HWND g_screenshotOverlayWindow = NULL;
 static std::atomic<bool> g_isCapturing(false);
 static napi_threadsafe_function g_screenshotTsfn = nullptr;
 static std::thread g_screenshotThread;
-static POINT g_selectionStart = {0, 0};
-static POINT g_selectionEnd = {0, 0};
-static bool g_isSelecting = false;
 
 // 全局变量 - 鼠标监控
 static HHOOK g_mouseHook = NULL;
@@ -768,351 +772,1121 @@ Napi::Value ActivateWindow(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, newForeground == hwnd);
 }
 
-// ==================== 区域截图功能 ====================
+// ==================== 区域截图功能（预截屏 + 双缓冲架构） ====================
+
+// 截图常量
+static const int SC_PANEL_WIDTH = 140;
+static const int SC_PANEL_HEIGHT = 140;
+static const int SC_MAGNIFIER_HEIGHT = 74;
+static const int SC_PANEL_MARGIN = 15;
+static const int SC_PANEL_CORNER_RADIUS = 8;
+static const int SC_ZOOM_FACTOR = 4;
+
+// 截图状态枚举
+enum CaptureState { CS_Idle, CS_Selecting, CS_Done, CS_Cancelled };
+
+// 窗口信息
+struct SCWindowInfo {
+    HWND hwnd;
+    RECT rect;
+    std::wstring title;
+};
 
 // 截图结果结构
 struct ScreenshotResult {
     bool success;
+    int x;
+    int y;
+    int x2;
+    int y2;
     int width;
     int height;
+    std::string base64;
 };
 
-// 保存截图到剪贴板
-bool SaveBitmapToClipboard(HBITMAP hBitmap) {
-    if (!OpenClipboard(NULL)) {
-        return false;
+// GDI 资源缓存
+struct SCGdiResources {
+    HBRUSH bgBrush;
+    HPEN borderPen;
+    HPEN crosshairPen;
+    HPEN selectionPen;
+    HPEN highlightPen;
+    HFONT smallFont;
+
+    void Init() {
+        bgBrush = CreateSolidBrush(RGB(52, 52, 53));
+        borderPen = CreatePen(PS_SOLID, 0, RGB(102, 102, 102));
+        crosshairPen = CreatePen(PS_SOLID, 1, RGB(0, 136, 255));
+        selectionPen = CreatePen(PS_SOLID, 1, RGB(0, 136, 255));
+        highlightPen = CreatePen(PS_SOLID, 3, RGB(0, 136, 255));
+        // 创建字体
+        LOGFONTW lf = {};
+        lf.lfHeight = -12;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, L"微软雅黑");
+        smallFont = CreateFontIndirectW(&lf);
     }
 
-    EmptyClipboard();
-    
-    // 复制 HBITMAP（剪贴板会负责释放）
-    BITMAP bm;
-    GetObject(hBitmap, sizeof(BITMAP), &bm);
-    
-    HBITMAP hBitmapCopy = (HBITMAP)CopyImage(hBitmap, IMAGE_BITMAP, bm.bmWidth, bm.bmHeight, LR_COPYRETURNORG);
-    
-    SetClipboardData(CF_BITMAP, hBitmapCopy);
-    CloseClipboard();
-    
-    return true;
-}
-
-// 截取屏幕区域并保存到剪贴板
-ScreenshotResult* CaptureScreenRegion(int x, int y, int width, int height) {
-    ScreenshotResult* result = new ScreenshotResult();
-    result->success = false;
-    result->width = width;
-    result->height = height;
-
-    if (width <= 0 || height <= 0) {
-        return result;
+    void Cleanup() {
+        if (bgBrush) { DeleteObject(bgBrush); bgBrush = NULL; }
+        if (borderPen) { DeleteObject(borderPen); borderPen = NULL; }
+        if (crosshairPen) { DeleteObject(crosshairPen); crosshairPen = NULL; }
+        if (selectionPen) { DeleteObject(selectionPen); selectionPen = NULL; }
+        if (highlightPen) { DeleteObject(highlightPen); highlightPen = NULL; }
+        if (smallFont) { DeleteObject(smallFont); smallFont = NULL; }
     }
+};
 
-    // 获取屏幕 DC
-    HDC screenDC = GetDC(NULL);
-    HDC memDC = CreateCompatibleDC(screenDC);
-    
-    // 创建位图
-    HBITMAP bitmap = CreateCompatibleBitmap(screenDC, width, height);
-    HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, bitmap);
-    
-    // 复制屏幕内容
-    BitBlt(memDC, 0, 0, width, height, screenDC, x, y, SRCCOPY);
-    
-    // 保存到剪贴板
-    result->success = SaveBitmapToClipboard(bitmap);
-    
-    // 清理
-    SelectObject(memDC, oldBitmap);
-    DeleteObject(bitmap);
-    DeleteDC(memDC);
-    ReleaseDC(NULL, screenDC);
-    
+// 截图上下文
+struct CaptureContext {
+    CaptureState state;
+    int virtualX, virtualY, virtualW, virtualH;
+    int startX, startY, endX, endY;
+    int mouseX, mouseY;
+    COLORREF currentColor;
+    std::vector<SCWindowInfo> windows;
+    int hoveredWindow; // -1 = none
+    // 预截屏
+    HBITMAP screenBitmap;
+    HDC memDC;
+    // 双缓冲
+    HDC backDC;
+    HBITMAP backBitmap;
+    // 脏区域追踪
+    RECT lastPanelRect;
+    RECT lastSelectionRect;
+    RECT lastLabelRect;
+    RECT lastHighlightRect;
+    bool needFullRedraw;
+    // DPI
+    double dpiScale;
+    // GDI 资源
+    SCGdiResources gdi;
+};
+
+// 截图上下文指针（窗口过程使用）
+static CaptureContext* g_captureCtx = nullptr;
+
+// 前向声明（定义在文件后面的应用图标提取部分）
+static int GetPngEncoderClsid(CLSID* pClsid);
+
+// Base64 编码表
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Base64 编码
+static std::string Base64Encode(const BYTE* data, size_t len) {
+    std::string result;
+    result.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned int b = (data[i] << 16) | ((i + 1 < len ? data[i + 1] : 0) << 8) | (i + 2 < len ? data[i + 2] : 0);
+        result.push_back(base64_chars[(b >> 18) & 0x3F]);
+        result.push_back(base64_chars[(b >> 12) & 0x3F]);
+        result.push_back(i + 1 < len ? base64_chars[(b >> 6) & 0x3F] : '=');
+        result.push_back(i + 2 < len ? base64_chars[b & 0x3F] : '=');
+    }
     return result;
 }
 
+// ---- 工具函数 ----
+
+// 获取 DPI 缩放因子
+static double GetDpiScaleFactor() {
+    typedef UINT (WINAPI *GetDpiForSystemProc)();
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        auto proc = (GetDpiForSystemProc)GetProcAddress(user32, "GetDpiForSystem");
+        if (proc) {
+            UINT dpi = proc();
+            double scale = dpi / 96.0;
+            if (scale < 0.5) scale = 0.5;
+            if (scale > 4.0) scale = 4.0;
+            return scale;
+        }
+    }
+    return 1.0;
+}
+
+// 显示器枚举回调数据
+struct MonitorEnumData {
+    LONG minLeft, minTop, maxRight, maxBottom;
+    double totalDpiScale;
+    int monitorCount;
+};
+
+// 显示器枚举回调
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData) {
+    MonitorEnumData* data = reinterpret_cast<MonitorEnumData*>(dwData);
+
+    // 获取显示器的物理尺寸
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(MONITORINFOEXW);
+    if (GetMonitorInfoW(hMonitor, &mi)) {
+        // 在 DPI 感知模式下，rcMonitor 已经是物理像素坐标
+        data->minLeft = (std::min)(data->minLeft, mi.rcMonitor.left);
+        data->minTop = (std::min)(data->minTop, mi.rcMonitor.top);
+        data->maxRight = (std::max)(data->maxRight, mi.rcMonitor.right);
+        data->maxBottom = (std::max)(data->maxBottom, mi.rcMonitor.bottom);
+        data->monitorCount++;
+
+        // 获取显示器 DPI
+        typedef HRESULT(WINAPI* GetDpiForMonitorProc)(HMONITOR, int, UINT*, UINT*);
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        if (shcore) {
+            auto getDpiForMonitor = (GetDpiForMonitorProc)GetProcAddress(shcore, "GetDpiForMonitor");
+            if (getDpiForMonitor) {
+                UINT dpiX, dpiY;
+                if (SUCCEEDED(getDpiForMonitor(hMonitor, 0/*MDT_EFFECTIVE_DPI*/, &dpiX, &dpiY))) {
+                    data->totalDpiScale = (std::max)(data->totalDpiScale, dpiX / 96.0);
+                }
+            }
+            FreeLibrary(shcore);
+        }
+    }
+    return TRUE;
+}
+
+// 截取整个虚拟屏幕到物理尺寸位图
+static bool CaptureVirtualScreen(HDC& outMemDC, HBITMAP& outBitmap,
+    int& vx, int& vy, int& vw, int& vh, double& dpiScale) {
+    // 获取逻辑坐标的虚拟屏幕尺寸
+    vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    // 枚举所有显示器获取物理像素边界
+    MonitorEnumData enumData = { INT_MAX, INT_MAX, INT_MIN, INT_MIN, 1.0, 0 };
+    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&enumData));
+
+    // 计算物理尺寸（使用枚举得到的实际物理像素边界）
+    int physVx = enumData.minLeft;
+    int physVy = enumData.minTop;
+    int physVw = enumData.maxRight - enumData.minLeft;
+    int physVh = enumData.maxBottom - enumData.minTop;
+
+    // 如果枚举失败，回退到 DPI 缩放计算
+    if (physVw <= 0 || physVh <= 0 || enumData.monitorCount == 0) {
+        physVx = (int)(vx * dpiScale);
+        physVy = (int)(vy * dpiScale);
+        physVw = (int)(vw * dpiScale + 0.5);
+        physVh = (int)(vh * dpiScale + 0.5);
+    }
+
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return false;
+
+    outMemDC = CreateCompatibleDC(screenDC);
+    if (!outMemDC) { ReleaseDC(NULL, screenDC); return false; }
+
+    outBitmap = CreateCompatibleBitmap(screenDC, physVw, physVh);
+    if (!outBitmap) { DeleteDC(outMemDC); ReleaseDC(NULL, screenDC); return false; }
+
+    SelectObject(outMemDC, outBitmap);
+
+    // 设置高质量拉伸模式
+    SetStretchBltMode(outMemDC, HALFTONE);
+    SetBrushOrgEx(outMemDC, 0, 0, NULL);
+
+    // 直接 BitBlt 物理像素（在 DPI 感知模式下，屏幕 DC 和坐标都是物理像素级别）
+    BitBlt(outMemDC, 0, 0, physVw, physVh, screenDC, physVx, physVy, SRCCOPY);
+
+    // 更新返回的 dpiScale 为实际的物理/逻辑比例
+    // 这样后续的坐标转换才能正确
+    if (vw > 0 && vh > 0) {
+        dpiScale = (double)physVw / vw;
+    }
+
+    ReleaseDC(NULL, screenDC);
+    return true;
+}
+
+// 创建双缓冲
+static bool CreateBackBuffer(HDC& outDC, HBITMAP& outBmp, int w, int h) {
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return false;
+    outDC = CreateCompatibleDC(screenDC);
+    if (!outDC) { ReleaseDC(NULL, screenDC); return false; }
+    outBmp = CreateCompatibleBitmap(screenDC, w, h);
+    if (!outBmp) { DeleteDC(outDC); ReleaseDC(NULL, screenDC); return false; }
+    SelectObject(outDC, outBmp);
+    ReleaseDC(NULL, screenDC);
+    return true;
+}
+
+// 从预截屏位图读取像素颜色（逻辑坐标）
+static COLORREF GetPixelColorFromBitmap(HDC memDC, int x, int y, int vx, int vy, double dpiScale) {
+    int lx = x - vx;
+    int ly = y - vy;
+    int px = (int)(lx * dpiScale + 0.5);
+    int py = (int)(ly * dpiScale + 0.5);
+    return GetPixel(memDC, px, py);
+}
+
+// COLORREF 转 HEX/RGB 字符串
+static void ColorrefToStrings(COLORREF color, char* hexBuf, char* rgbBuf) {
+    int r = color & 0xFF;
+    int g = (color >> 8) & 0xFF;
+    int b = (color >> 16) & 0xFF;
+    sprintf_s(hexBuf, 32, "#%02X%02X%02X", r, g, b);
+    sprintf_s(rgbBuf, 32, "%d, %d, %d", r, g, b);
+}
+
+// 枚举窗口回调
+static BOOL CALLBACK SCEnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    auto* windows = reinterpret_cast<std::vector<SCWindowInfo>*>(lParam);
+
+    if (!IsWindowVisible(hwnd)) return TRUE;
+
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if (style == 0) return TRUE;
+
+    // 检查是否为幽灵窗口（cloaked window）
+    // 幽灵窗口虽然 IsWindowVisible 返回 true，但实际上不可见
+    BOOL isCloaked = FALSE;
+    HRESULT hrCloaked = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked));
+    if (SUCCEEDED(hrCloaked) && isCloaked) {
+        return TRUE; // 跳过幽灵窗口
+    }
+
+    // 获取窗口类名以进行额外过滤
+    const int MAX_CLASS_NAME = 256;
+    WCHAR className[MAX_CLASS_NAME] = {0};
+    int classNameLen = GetClassNameW(hwnd, className, MAX_CLASS_NAME);
+
+    // 过滤某些特殊的系统窗口类
+    if (classNameLen > 0) {
+        // Windows 输入法相关窗口（如 Microsoft Text Input Application）
+        if (wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
+            // 对于 CoreWindow，再次确认是否真的可见（通过检查是否有有效的可视化区域）
+            RECT clientRect;
+            if (!GetClientRect(hwnd, &clientRect)) return TRUE;
+
+            // 如果客户区太小，很可能是输入法等后台窗口
+            int clientW = clientRect.right - clientRect.left;
+            int clientH = clientRect.bottom - clientRect.top;
+            if (clientW < 100 || clientH < 100) return TRUE;
+        }
+
+        // 过滤 ApplicationFrameWindow 的空壳窗口
+        // UWP 应用在未激活时可能留下空的 ApplicationFrameWindow
+        if (wcscmp(className, L"ApplicationFrameWindow") == 0) {
+            // 检查窗口是否被最小化或隐藏
+            if (IsIconic(hwnd)) return TRUE;
+
+            // 检查是否真的有内容（通过检查窗口透明度或其他属性）
+            BYTE opacity = 255;
+            DWORD cloakedReason = 0;
+            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloakedReason, sizeof(cloakedReason));
+            if (cloakedReason != 0) return TRUE;
+        }
+    }
+
+    int titleLen = GetWindowTextLengthW(hwnd);
+    if (titleLen == 0) return TRUE;
+
+    std::wstring title(titleLen + 1, L'\0');
+    GetWindowTextW(hwnd, &title[0], titleLen + 1);
+    title.resize(titleLen);
+
+    if (hwnd == GetDesktopWindow()) return TRUE;
+
+    // 使用 DWM 获取精确边界
+    RECT rect = {};
+    HRESULT hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect));
+    if (FAILED(hr)) {
+        if (!GetWindowRect(hwnd, &rect)) return TRUE;
+    }
+
+    int w = rect.right - rect.left;
+    int h = rect.bottom - rect.top;
+    if (w < 50 || h < 50) return TRUE;
+
+    SCWindowInfo info;
+    info.hwnd = hwnd;
+    info.rect = rect;
+    info.title = title;
+    windows->push_back(info);
+    return TRUE;
+}
+
+// 枚举窗口
+static std::vector<SCWindowInfo> EnumWindowsForCapture() {
+    std::vector<SCWindowInfo> windows;
+    EnumWindows(SCEnumWindowsProc, reinterpret_cast<LPARAM>(&windows));
+    return windows;
+}
+
+// 查找鼠标下方的窗口
+static int FindWindowAtPoint(const std::vector<SCWindowInfo>& windows, int x, int y) {
+    for (size_t i = 0; i < windows.size(); i++) {
+        const RECT& r = windows[i].rect;
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            return (int)i;
+    }
+    return -1;
+}
+
+// 计算浮窗位置（优先右下，超出则翻转）
+static void CalcPanelPosition(int mx, int my, int vx, int vy, int vw, int vh, int& px, int& py) {
+    int sr = vx + vw;
+    int sb = vy + vh;
+    px = mx + SC_PANEL_MARGIN;
+    py = my + SC_PANEL_MARGIN;
+    if (px + SC_PANEL_WIDTH > sr) px = mx - SC_PANEL_WIDTH - SC_PANEL_MARGIN;
+    if (py + SC_PANEL_HEIGHT > sb) py = my - SC_PANEL_HEIGHT - SC_PANEL_MARGIN;
+    if (px < vx) px = vx + SC_PANEL_MARGIN;
+    if (py < vy) py = vy + SC_PANEL_MARGIN;
+}
+
+// 从预截屏位图恢复脏区域到后台缓冲
+static void RestoreDirtyRegion(HDC backDC, HDC memDC, const RECT& dirty, double dpiScale) {
+    int w = dirty.right - dirty.left;
+    int h = dirty.bottom - dirty.top;
+    if (w <= 0 || h <= 0) return;
+    int x = (std::max)((int)dirty.left, 0);
+    int y = (std::max)((int)dirty.top, 0);
+    w = dirty.right - x;
+    h = dirty.bottom - y;
+    if (dpiScale > 1.01 || dpiScale < 0.99) {
+        int px = (int)(x * dpiScale + 0.5);
+        int py = (int)(y * dpiScale + 0.5);
+        int pw = (int)(w * dpiScale + 0.5);
+        int ph = (int)(h * dpiScale + 0.5);
+        StretchBlt(backDC, x, y, w, h, memDC, px, py, pw, ph, SRCCOPY);
+    } else {
+        BitBlt(backDC, x, y, w, h, memDC, x, y, SRCCOPY);
+    }
+}
+
+// 扩展矩形
+static RECT InflateRectBy(const RECT& r, int margin) {
+    return { r.left - margin, r.top - margin, r.right + margin, r.bottom + margin };
+}
+
+// ---- 绘制函数 ----
+
+// 绘制放大镜 + 鼠标信息面板
+static void DrawInfoPanel(HDC hdc, int panelX, int panelY, COLORREF color,
+    HDC memDC, int vx, int vy, int mx, int my, double dpiScale, const SCGdiResources& gdi) {
+    HGDIOBJ oldBrush = SelectObject(hdc, gdi.bgBrush);
+    HGDIOBJ oldPen = SelectObject(hdc, gdi.borderPen);
+
+    // 圆角矩形背景
+    RoundRect(hdc, panelX, panelY, panelX + SC_PANEL_WIDTH, panelY + SC_PANEL_HEIGHT,
+        SC_PANEL_CORNER_RADIUS, SC_PANEL_CORNER_RADIUS);
+
+    // 放大镜：从物理尺寸位图取像素
+    int srcW = SC_PANEL_WIDTH / SC_ZOOM_FACTOR;
+    int srcH = SC_MAGNIFIER_HEIGHT / SC_ZOOM_FACTOR;
+    int mxLogical = mx - vx;
+    int myLogical = my - vy;
+    int mxPhysical = (int)(mxLogical * dpiScale + 0.5);
+    int myPhysical = (int)(myLogical * dpiScale + 0.5);
+    int srcWPhysical = (int)(srcW * dpiScale + 0.5);
+    int srcHPhysical = (int)(srcH * dpiScale + 0.5);
+    int srcXPhysical = mxPhysical - srcWPhysical / 2;
+    int srcYPhysical = myPhysical - srcHPhysical / 2;
+
+    int magX = panelX + 2;
+    int magY = panelY + 2;
+    int magW = SC_PANEL_WIDTH - 4;
+    int magH = SC_MAGNIFIER_HEIGHT - 2;
+
+    StretchBlt(hdc, magX, magY, magW, magH, memDC,
+        (std::max)(srcXPhysical, 0), (std::max)(srcYPhysical, 0),
+        srcWPhysical, srcHPhysical, SRCCOPY);
+
+    // 十字准星
+    SelectObject(hdc, gdi.crosshairPen);
+    int cx = magX + magW / 2;
+    int cy = magY + magH / 2;
+    MoveToEx(hdc, magX, cy, NULL); LineTo(hdc, magX + magW, cy);
+    MoveToEx(hdc, cx, magY, NULL); LineTo(hdc, cx, magY + magH);
+
+    // 文字信息
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    HGDIOBJ oldFont = SelectObject(hdc, gdi.smallFont);
+
+    char hexBuf[32], rgbBuf[32];
+    ColorrefToStrings(color, hexBuf, rgbBuf);
+    char posBuf[64];
+    sprintf_s(posBuf, "%d, %d", mx, my);
+
+    const int LABEL_PAD = 6;
+    int labelX = panelX + LABEL_PAD;
+    int valueRightX = panelX + SC_PANEL_WIDTH - LABEL_PAD;
+
+    // 获取文字高度
+    SIZE textSize;
+    GetTextExtentPoint32W(hdc, L"测试", 2, &textSize);
+    int lineH = textSize.cy;
+    int infoY = panelY + SC_PANEL_HEIGHT - LABEL_PAD - lineH * 3;
+
+    // 辅助：右对齐绘制
+    auto drawRightAligned = [&](const wchar_t* text, int len, int rx, int ry) {
+        SIZE sz;
+        GetTextExtentPoint32W(hdc, text, len, &sz);
+        TextOutW(hdc, rx - sz.cx, ry, text, len);
+    };
+
+    // 坐标
+    TextOutW(hdc, labelX, infoY, L"坐标", 2);
+    std::wstring posW(posBuf, posBuf + strlen(posBuf));
+    drawRightAligned(posW.c_str(), (int)posW.size(), valueRightX, infoY);
+
+    // HEX
+    TextOutW(hdc, labelX, infoY + lineH, L"HEX", 3);
+    std::wstring hexW(hexBuf, hexBuf + strlen(hexBuf));
+    drawRightAligned(hexW.c_str(), (int)hexW.size(), valueRightX, infoY + lineH);
+
+    // RGB
+    TextOutW(hdc, labelX, infoY + lineH * 2, L"RGB", 3);
+    std::wstring rgbW(rgbBuf, rgbBuf + strlen(rgbBuf));
+    drawRightAligned(rgbW.c_str(), (int)rgbW.size(), valueRightX, infoY + lineH * 2);
+
+    SelectObject(hdc, oldFont);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+}
+
+// 绘制尺寸标签，返回标签矩形
+static RECT DrawSizeLabel(HDC hdc, int width, int height,
+    int refLeft, int refTop, int refRight, int refBottom,
+    int virtualW, int virtualH, const SCGdiResources& gdi) {
+    RECT empty = {0, 0, 0, 0};
+    if (width < 0 || height < 0) return empty;
+
+    wchar_t sizeBuf[64];
+    swprintf_s(sizeBuf, L"%d × %d", width, height);
+    int sizeLen = (int)wcslen(sizeBuf);
+
+    HGDIOBJ oldFont = SelectObject(hdc, gdi.smallFont);
+    SIZE textSize;
+    GetTextExtentPoint32W(hdc, sizeBuf, sizeLen, &textSize);
+
+    const int LP = 12, LS = 5;
+    int labelW = textSize.cx + LP * 2;
+    int labelH = textSize.cy + 4;
+
+    int lx = refLeft;
+    int ly = refTop - labelH - LS;
+    if (ly < 0) {
+        lx = refLeft + LS;
+        ly = refTop + LS;
+        if (lx + labelW > virtualW) lx = virtualW - labelW - LS;
+        if (ly + labelH > virtualH) ly = virtualH - labelH - LS;
+        if (lx + labelW > refRight) lx = refRight - labelW - LS;
+        if (ly + labelH > refBottom) ly = refBottom - labelH - LS;
+    }
+    if (lx < 0) lx = 0;
+    if (ly < 0) ly = 0;
+    if (lx + labelW > virtualW) lx = virtualW - labelW;
+    if (ly + labelH > virtualH) ly = virtualH - labelH;
+
+    HGDIOBJ oldBrush = SelectObject(hdc, gdi.bgBrush);
+    HGDIOBJ oldPen = SelectObject(hdc, gdi.borderPen);
+    RoundRect(hdc, lx, ly, lx + labelW, ly + labelH, SC_PANEL_CORNER_RADIUS, SC_PANEL_CORNER_RADIUS);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    TextOutW(hdc, lx + LP, ly + 2, sizeBuf, sizeLen);
+
+    SelectObject(hdc, oldFont);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+
+    RECT result = { lx, ly, lx + labelW, ly + labelH };
+    return result;
+}
+
+// 绘制选区矩形边框 + 尺寸标签
+static RECT DrawSelection(HDC hdc, int x1, int y1, int x2, int y2,
+    int vx, int vy, int vw, int vh, const SCGdiResources& gdi) {
+    int left = (std::min)(x1, x2) - vx;
+    int top = (std::min)(y1, y2) - vy;
+    int right = (std::max)(x1, x2) - vx;
+    int bottom = (std::max)(y1, y2) - vy;
+
+    HGDIOBJ oldPen = SelectObject(hdc, gdi.selectionPen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, left, top, right, bottom);
+
+    int sizeW = right - left;
+    int sizeH = bottom - top;
+    RECT labelRect = DrawSizeLabel(hdc, sizeW, sizeH, left, top, right, bottom, vw, vh, gdi);
+
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    return labelRect;
+}
+
+// 绘制窗口高亮边框
+static void DrawWindowHighlight(HDC hdc, const RECT& rect, int vx, int vy, const SCGdiResources& gdi) {
+    int left = rect.left - vx;
+    int top = rect.top - vy;
+    int right = rect.right - vx;
+    int bottom = rect.bottom - vy;
+
+    HGDIOBJ oldPen = SelectObject(hdc, gdi.highlightPen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, left, top, right, bottom);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+}
+
+// 将 HBITMAP 转换为 PNG base64 字符串
+static std::string BitmapToBase64Png(HBITMAP hBitmap) {
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
+    std::string result;
+    {
+        Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(hBitmap, NULL);
+        if (bmp) {
+            CLSID pngClsid;
+            if (GetPngEncoderClsid(&pngClsid) >= 0) {
+                IStream* stream = NULL;
+                CreateStreamOnHGlobal(NULL, TRUE, &stream);
+                if (stream && bmp->Save(stream, &pngClsid, NULL) == Gdiplus::Ok) {
+                    HGLOBAL hMem = NULL;
+                    GetHGlobalFromStream(stream, &hMem);
+                    size_t len = GlobalSize(hMem);
+                    BYTE* ptr = (BYTE*)GlobalLock(hMem);
+                    if (ptr && len > 0) {
+                        result = "data:image/png;base64," + Base64Encode(ptr, len);
+                    }
+                    GlobalUnlock(hMem);
+                }
+                if (stream) stream->Release();
+            }
+            delete bmp;
+        }
+    }
+    Gdiplus::GdiplusShutdown(gdiplusToken);
+    return result;
+}
+
+// 保存位图到剪贴板
+static bool SaveBitmapToClipboard(HBITMAP hBitmap) {
+    if (!OpenClipboard(NULL)) return false;
+    EmptyClipboard();
+    BITMAP bm;
+    GetObject(hBitmap, sizeof(BITMAP), &bm);
+    HBITMAP hCopy = (HBITMAP)CopyImage(hBitmap, IMAGE_BITMAP, bm.bmWidth, bm.bmHeight, LR_COPYRETURNORG);
+    SetClipboardData(CF_BITMAP, hCopy);
+    CloseClipboard();
+    return true;
+}
+
+// 从预截屏位图提取区域，生成 base64 并复制到剪贴板
+static ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
+    int vx, int vy, double dpiScale) {
+    ScreenshotResult* result = new ScreenshotResult();
+    result->success = false;
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    result->x = rect.left;
+    result->y = rect.top;
+    result->x2 = rect.right;
+    result->y2 = rect.bottom;
+    result->width = width;
+    result->height = height;
+
+    if (width <= 0 || height <= 0) return result;
+
+    // 从物理尺寸位图提取区域
+    int lx = rect.left - vx;
+    int ly = rect.top - vy;
+    int px = (int)(lx * dpiScale + 0.5);
+    int py = (int)(ly * dpiScale + 0.5);
+    int pw = (int)(width * dpiScale + 0.5);
+    int ph = (int)(height * dpiScale + 0.5);
+
+    HDC screenDC = GetDC(NULL);
+    HDC regionDC = CreateCompatibleDC(screenDC);
+    HBITMAP regionBmp = CreateCompatibleBitmap(screenDC, pw, ph);
+    SelectObject(regionDC, regionBmp);
+    BitBlt(regionDC, 0, 0, pw, ph, memDC, px, py, SRCCOPY);
+
+    // 如果有 DPI 缩放，缩放回逻辑尺寸
+    HBITMAP finalBmp = regionBmp;
+    HDC finalDC = regionDC;
+    if (dpiScale > 1.01 || dpiScale < 0.99) {
+        HDC scaledDC = CreateCompatibleDC(screenDC);
+        HBITMAP scaledBmp = CreateCompatibleBitmap(screenDC, width, height);
+        SelectObject(scaledDC, scaledBmp);
+        SetStretchBltMode(scaledDC, HALFTONE);
+        SetBrushOrgEx(scaledDC, 0, 0, NULL);
+        StretchBlt(scaledDC, 0, 0, width, height, regionDC, 0, 0, pw, ph, SRCCOPY);
+        DeleteDC(regionDC);
+        DeleteObject(regionBmp);
+        finalBmp = scaledBmp;
+        finalDC = scaledDC;
+    }
+
+    // 生成 base64
+    result->base64 = BitmapToBase64Png(finalBmp);
+    // 复制到剪贴板
+    result->success = SaveBitmapToClipboard(finalBmp);
+
+    DeleteDC(finalDC);
+    DeleteObject(finalBmp);
+    ReleaseDC(NULL, screenDC);
+
+    return result;
+}
+
+// ---- 窗口过程和线程 ----
+
 // 在主线程调用 JS 回调（截图完成）
-void CallScreenshotJs(napi_env env, napi_value js_callback, void* context, void* data) {
+static void CallScreenshotJs(napi_env env, napi_value js_callback, void* context, void* data) {
     if (env != nullptr && js_callback != nullptr && data != nullptr) {
         ScreenshotResult* result = static_cast<ScreenshotResult*>(data);
-        
-        // 创建返回对象
+
         napi_value resultObj;
         napi_create_object(env, &resultObj);
-        
+
         napi_value success;
         napi_get_boolean(env, result->success, &success);
         napi_set_named_property(env, resultObj, "success", success);
-        
+
         if (result->success) {
-            napi_value width;
+            napi_value x, y, x2, y2, width, height, base64;
+            napi_create_int32(env, result->x, &x);
+            napi_set_named_property(env, resultObj, "x", x);
+            napi_create_int32(env, result->y, &y);
+            napi_set_named_property(env, resultObj, "y", y);
+            napi_create_int32(env, result->x2, &x2);
+            napi_set_named_property(env, resultObj, "x2", x2);
+            napi_create_int32(env, result->y2, &y2);
+            napi_set_named_property(env, resultObj, "y2", y2);
             napi_create_int32(env, result->width, &width);
             napi_set_named_property(env, resultObj, "width", width);
-            
-            napi_value height;
             napi_create_int32(env, result->height, &height);
             napi_set_named_property(env, resultObj, "height", height);
+            napi_create_string_utf8(env, result->base64.c_str(), result->base64.size(), &base64);
+            napi_set_named_property(env, resultObj, "base64", base64);
         }
-        
-        // 调用回调
+
         napi_value global;
         napi_get_global(env, &global);
         napi_call_function(env, global, js_callback, 1, &resultObj, nullptr);
-        
         delete result;
     }
 }
 
-// 使用 UpdateLayeredWindow 绘制选区遮罩（支持像素级透明度）
-void DrawSelectionOverlay(HWND hwnd) {
-    // 获取窗口尺寸
-    RECT clientRect;
-    GetClientRect(hwnd, &clientRect);
-    int width = clientRect.right - clientRect.left;
-    int height = clientRect.bottom - clientRect.top;
-    
-    // 创建内存 DC 和位图
-    HDC screenDC = GetDC(NULL);
-    HDC memDC = CreateCompatibleDC(screenDC);
-    HBITMAP memBitmap = CreateCompatibleBitmap(screenDC, width, height);
-    HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
-    
-    // 创建 32 位 BGRA 位图用于 alpha 通道
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height;  // 负值表示自顶向下
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    
-    void* pvBits = nullptr;
-    HBITMAP hbmAlpha = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &pvBits, NULL, 0);
-    HBITMAP oldAlphaBitmap = (HBITMAP)SelectObject(memDC, hbmAlpha);
-    
-    // 填充位图数据
-    BYTE* pixels = (BYTE*)pvBits;
-    
-    if (g_isSelecting) {
-        // 计算选区矩形
-        int selLeft = (std::min)(g_selectionStart.x, g_selectionEnd.x);
-        int selTop = (std::min)(g_selectionStart.y, g_selectionEnd.y);
-        int selRight = (std::max)(g_selectionStart.x, g_selectionEnd.x);
-        int selBottom = (std::max)(g_selectionStart.y, g_selectionEnd.y);
-        
-        // 填充每个像素
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int offset = (y * width + x) * 4;
-                
-                // 判断是否在选区内
-                bool inSelection = (x >= selLeft && x < selRight && y >= selTop && y < selBottom);
-                
-                if (inSelection) {
-                    // 选区内：完全透明
-                    pixels[offset + 0] = 0;  // B
-                    pixels[offset + 1] = 0;  // G
-                    pixels[offset + 2] = 0;  // R
-                    pixels[offset + 3] = 0;  // A (完全透明)
-                } else {
-                    // 选区外：半透明黑色
-                    pixels[offset + 0] = 0;  // B
-                    pixels[offset + 1] = 0;  // G
-                    pixels[offset + 2] = 0;  // R
-                    pixels[offset + 3] = 128;  // A (50% 透明)
-                }
-            }
-        }
-        
-        // 绘制选区边框
-        HPEN borderPen = CreatePen(PS_SOLID, 2, RGB(0, 120, 215));
-        HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
-        HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
-        
-        Rectangle(memDC, selLeft, selTop, selRight, selBottom);
-        
-        SelectObject(memDC, oldPen);
-        SelectObject(memDC, oldBrush);
-        DeleteObject(borderPen);
-    } else {
-        // 没有选区时，整个屏幕半透明黑色
-        for (int i = 0; i < width * height * 4; i += 4) {
-            pixels[i + 0] = 0;    // B
-            pixels[i + 1] = 0;    // G
-            pixels[i + 2] = 0;    // R
-            pixels[i + 3] = 128;  // A
-        }
-    }
-    
-    // 使用 UpdateLayeredWindow 更新窗口
-    POINT ptSrc = {0, 0};
-    POINT ptDst = {0, 0};
-    SIZE sizeWnd = {width, height};
-    BLENDFUNCTION blend = {0};
-    blend.BlendOp = AC_SRC_OVER;
-    blend.BlendFlags = 0;
-    blend.SourceConstantAlpha = 255;
-    blend.AlphaFormat = AC_SRC_ALPHA;
-    
-    UpdateLayeredWindow(hwnd, screenDC, &ptDst, &sizeWnd, memDC, &ptSrc, 0, &blend, ULW_ALPHA);
-    
-    // 清理
-    SelectObject(memDC, oldAlphaBitmap);
-    DeleteObject(hbmAlpha);
-    SelectObject(memDC, oldBitmap);
-    DeleteObject(memBitmap);
-    DeleteDC(memDC);
-    ReleaseDC(NULL, screenDC);
-}
+// 截图覆盖层窗口过程（双缓冲渲染）
+static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    CaptureContext* ctx = g_captureCtx;
+    if (!ctx) return DefWindowProc(hwnd, msg, wParam, lParam);
 
-// 截图遮罩窗口过程
-LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_LBUTTONDOWN: {
-            // 记录起始点
-            g_selectionStart.x = GET_X_LPARAM(lParam);
-            g_selectionStart.y = GET_Y_LPARAM(lParam);
-            g_selectionEnd = g_selectionStart;
-            g_isSelecting = true;
-            SetCapture(hwnd);
-            DrawSelectionOverlay(hwnd);  // 立即更新显示
-            return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        HDC backDC = ctx->backDC;
+
+        // 计算浮窗位置
+        int panelX, panelY;
+        CalcPanelPosition(ctx->mouseX, ctx->mouseY,
+            ctx->virtualX, ctx->virtualY, ctx->virtualW, ctx->virtualH, panelX, panelY);
+        // 转为相对坐标
+        int panelXRel = panelX - ctx->virtualX;
+        int panelYRel = panelY - ctx->virtualY;
+
+        RECT curPanelRect = { panelXRel, panelYRel,
+            panelXRel + SC_PANEL_WIDTH, panelYRel + SC_PANEL_HEIGHT };
+
+        // 当前选区矩形
+        RECT curSelRect = {0,0,0,0};
+        if (ctx->state == CS_Selecting) {
+            curSelRect.left = (std::min)(ctx->startX, ctx->endX) - ctx->virtualX;
+            curSelRect.top = (std::min)(ctx->startY, ctx->endY) - ctx->virtualY;
+            curSelRect.right = (std::max)(ctx->startX, ctx->endX) - ctx->virtualX;
+            curSelRect.bottom = (std::max)(ctx->startY, ctx->endY) - ctx->virtualY;
         }
-        
-        case WM_MOUSEMOVE: {
-            if (g_isSelecting) {
-                // 更新终点
-                g_selectionEnd.x = GET_X_LPARAM(lParam);
-                g_selectionEnd.y = GET_Y_LPARAM(lParam);
-                DrawSelectionOverlay(hwnd);  // 立即更新显示
+
+        // 当前高亮窗口矩形
+        RECT curHlRect = {0,0,0,0};
+        if (ctx->state == CS_Idle && ctx->hoveredWindow >= 0 && ctx->hoveredWindow < (int)ctx->windows.size()) {
+            const RECT& wr = ctx->windows[ctx->hoveredWindow].rect;
+            curHlRect = { wr.left - ctx->virtualX, wr.top - ctx->virtualY,
+                wr.right - ctx->virtualX, wr.bottom - ctx->virtualY };
+        }
+
+        double ds = ctx->dpiScale;
+        int physW = (int)(ctx->virtualW * ds + 0.5);
+        int physH = (int)(ctx->virtualH * ds + 0.5);
+
+        // 恢复背景
+        if (ctx->needFullRedraw) {
+            if (ds > 1.01 || ds < 0.99) {
+                StretchBlt(backDC, 0, 0, ctx->virtualW, ctx->virtualH,
+                    ctx->memDC, 0, 0, physW, physH, SRCCOPY);
+            } else {
+                BitBlt(backDC, 0, 0, ctx->virtualW, ctx->virtualH,
+                    ctx->memDC, 0, 0, SRCCOPY);
             }
-            return 0;
+            ctx->needFullRedraw = false;
+        } else {
+            // 脏区域恢复
+            RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastPanelRect, 2), ds);
+            if (ctx->lastSelectionRect.right > ctx->lastSelectionRect.left)
+                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastSelectionRect, 5), ds);
+            if (ctx->lastLabelRect.right > ctx->lastLabelRect.left)
+                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastLabelRect, 2), ds);
+            if (ctx->lastHighlightRect.right > ctx->lastHighlightRect.left)
+                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastHighlightRect, 5), ds);
         }
-        
-        case WM_LBUTTONUP: {
-            if (g_isSelecting) {
-                g_isSelecting = false;
-                ReleaseCapture();
-                
-                // 计算选区
-                int x = (std::min)(g_selectionStart.x, g_selectionEnd.x);
-                int y = (std::min)(g_selectionStart.y, g_selectionEnd.y);
-                int width = abs(g_selectionEnd.x - g_selectionStart.x);
-                int height = abs(g_selectionEnd.y - g_selectionStart.y);
-                
-                // 隐藏窗口
-                ShowWindow(hwnd, SW_HIDE);
-                Sleep(100);  // 等待窗口完全隐藏
-                
-                // 执行截图
-                ScreenshotResult* result = CaptureScreenRegion(x, y, width, height);
-                
-                // 通过线程安全函数回调 JS
-                if (g_screenshotTsfn != nullptr) {
-                    napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+
+        // 绘制窗口高亮（Idle 状态）
+        if (ctx->state == CS_Idle) {
+            if (ctx->hoveredWindow >= 0 && ctx->hoveredWindow < (int)ctx->windows.size()) {
+                // 高亮悬停的窗口
+                DrawWindowHighlight(backDC, ctx->windows[ctx->hoveredWindow].rect,
+                    ctx->virtualX, ctx->virtualY, ctx->gdi);
+            } else {
+                // 没有匹配到窗口时，高亮鼠标所在的屏幕
+                POINT pt = { ctx->mouseX, ctx->mouseY };
+                HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (hMonitor) {
+                    MONITORINFO monitorInfo;
+                    monitorInfo.cbSize = sizeof(MONITORINFO);
+                    if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+                        DrawWindowHighlight(backDC, monitorInfo.rcMonitor,
+                            ctx->virtualX, ctx->virtualY, ctx->gdi);
+                    }
                 }
-                
-                // 关闭窗口
-                DestroyWindow(hwnd);
             }
-            return 0;
         }
-        
-        case WM_KEYDOWN: {
-            if (wParam == VK_ESCAPE) {
-                // ESC 取消截图
-                g_isSelecting = false;
-                
-                // 回调失败结果
-                if (g_screenshotTsfn != nullptr) {
-                    ScreenshotResult* result = new ScreenshotResult();
-                    result->success = false;
-                    result->width = 0;
-                    result->height = 0;
-                    napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+
+        // 绘制选区或窗口尺寸标签
+        RECT curLabelRect = {0,0,0,0};
+        if (ctx->state == CS_Selecting) {
+            curLabelRect = DrawSelection(backDC, ctx->startX, ctx->startY, ctx->endX, ctx->endY,
+                ctx->virtualX, ctx->virtualY, ctx->virtualW, ctx->virtualH, ctx->gdi);
+        } else if (ctx->state == CS_Idle) {
+            RECT screenRect;
+            int ww, wh;
+
+            if (ctx->hoveredWindow >= 0 && ctx->hoveredWindow < (int)ctx->windows.size()) {
+                // 显示悬停窗口的尺寸
+                const RECT& wr = ctx->windows[ctx->hoveredWindow].rect;
+                ww = wr.right - wr.left;
+                wh = wr.bottom - wr.top;
+                screenRect = wr;
+            } else {
+                // 没有匹配到窗口时，显示当前屏幕的尺寸
+                POINT pt = { ctx->mouseX, ctx->mouseY };
+                HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (hMonitor) {
+                    MONITORINFO monitorInfo;
+                    monitorInfo.cbSize = sizeof(MONITORINFO);
+                    if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+                        screenRect = monitorInfo.rcMonitor;
+                        ww = screenRect.right - screenRect.left;
+                        wh = screenRect.bottom - screenRect.top;
+                    }
                 }
-                
-                DestroyWindow(hwnd);
             }
-            return 0;
+
+            curLabelRect = DrawSizeLabel(backDC, ww, wh,
+                screenRect.left - ctx->virtualX, screenRect.top - ctx->virtualY,
+                screenRect.right - ctx->virtualX, screenRect.bottom - ctx->virtualY,
+                ctx->virtualW, ctx->virtualH, ctx->gdi);
         }
-        
-        case WM_DESTROY: {
-            g_screenshotOverlayWindow = NULL;
-            g_isCapturing = false;
-            PostQuitMessage(0);
-            return 0;
-        }
+
+        // 绘制放大镜信息面板
+        DrawInfoPanel(backDC, panelXRel, panelYRel, ctx->currentColor,
+            ctx->memDC, ctx->virtualX, ctx->virtualY,
+            ctx->mouseX, ctx->mouseY, ctx->dpiScale, ctx->gdi);
+
+        // 更新脏区域追踪
+        ctx->lastPanelRect = curPanelRect;
+        ctx->lastSelectionRect = curSelRect;
+        ctx->lastLabelRect = curLabelRect;
+        ctx->lastHighlightRect = curHlRect;
+
+        // 后台缓冲 -> 窗口
+        BitBlt(hdc, 0, 0, ctx->virtualW, ctx->virtualH, backDC, 0, 0, SRCCOPY);
+        EndPaint(hwnd, &ps);
+        return 0;
     }
-    
+
+    case WM_LBUTTONDOWN: {
+        if (ctx->state == CS_Idle) {
+            ctx->startX = ctx->mouseX;
+            ctx->startY = ctx->mouseY;
+            ctx->endX = ctx->mouseX;
+            ctx->endY = ctx->mouseY;
+            ctx->state = CS_Selecting;
+            ctx->needFullRedraw = true;
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt;
+        GetCursorPos(&pt);
+        if (pt.x != ctx->mouseX || pt.y != ctx->mouseY) {
+            ctx->mouseX = pt.x;
+            ctx->mouseY = pt.y;
+            ctx->currentColor = GetPixelColorFromBitmap(ctx->memDC,
+                ctx->mouseX, ctx->mouseY, ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+
+            if (ctx->state == CS_Selecting) {
+                ctx->endX = ctx->mouseX;
+                ctx->endY = ctx->mouseY;
+            } else if (ctx->state == CS_Idle) {
+                int newHovered = FindWindowAtPoint(ctx->windows, ctx->mouseX, ctx->mouseY);
+                if (newHovered != ctx->hoveredWindow) {
+                    ctx->hoveredWindow = newHovered;
+                }
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (ctx->state == CS_Selecting) {
+            int w = abs(ctx->endX - ctx->startX);
+            int h = abs(ctx->endY - ctx->startY);
+
+            RECT finalRect;
+            if (w <= 1 && h <= 1) {
+                // 点击 -> 使用悬停窗口矩形
+                int idx = FindWindowAtPoint(ctx->windows, ctx->mouseX, ctx->mouseY);
+                if (idx >= 0) {
+                    finalRect = ctx->windows[idx].rect;
+                } else {
+                    // 匹配不到窗口时，默认选区为鼠标所在的屏幕
+                    POINT pt = { ctx->mouseX, ctx->mouseY };
+                    HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                    if (hMonitor) {
+                        MONITORINFO monitorInfo;
+                        monitorInfo.cbSize = sizeof(MONITORINFO);
+                        if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+                            finalRect = monitorInfo.rcMonitor;
+                        } else {
+                            // 获取失败，降级为虚拟屏幕
+                            finalRect = { ctx->virtualX, ctx->virtualY,
+                                          ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH };
+                        }
+                    } else {
+                        // 获取显示器失败，降级为虚拟屏幕
+                        finalRect = { ctx->virtualX, ctx->virtualY,
+                                      ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH };
+                    }
+                }
+            } else {
+                finalRect.left = (std::min)(ctx->startX, ctx->endX);
+                finalRect.top = (std::min)(ctx->startY, ctx->endY);
+                finalRect.right = (std::max)(ctx->startX, ctx->endX);
+                finalRect.bottom = (std::max)(ctx->startY, ctx->endY);
+            }
+
+            // 提取结果
+            ScreenshotResult* result = ExtractRegionResult(ctx->memDC, finalRect,
+                ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+
+            if (g_screenshotTsfn != nullptr) {
+                napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+            }
+            ctx->state = CS_Done;
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_RBUTTONDOWN: {
+        ctx->state = CS_Cancelled;
+        // 回调失败结果
+        if (g_screenshotTsfn != nullptr) {
+            ScreenshotResult* result = new ScreenshotResult();
+            result->success = false;
+            result->x = 0; result->y = 0; result->x2 = 0; result->y2 = 0;
+            result->width = 0; result->height = 0;
+            napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+        }
+        DestroyWindow(hwnd);
+        return 0;
+    }
+
+    case WM_KEYDOWN: {
+        if (wParam == VK_ESCAPE) {
+            ctx->state = CS_Cancelled;
+            if (g_screenshotTsfn != nullptr) {
+                ScreenshotResult* result = new ScreenshotResult();
+                result->success = false;
+                result->x = 0; result->y = 0; result->x2 = 0; result->y2 = 0;
+                result->width = 0; result->height = 0;
+                napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+            }
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_DESTROY: {
+        g_screenshotOverlayWindow = NULL;
+        PostQuitMessage(0);
+        return 0;
+    }
+    }
+
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// 截图线程（创建遮罩窗口）
-void ScreenshotCaptureThread() {
-    // 设置 DPI 感知（Per-Monitor V2）
-    // 这样可以正确处理高 DPI 显示器
+// 截图线程（预截屏 + 双缓冲架构）
+static void ScreenshotCaptureThread() {
+    // 设置 DPI 感知
     typedef DPI_AWARENESS_CONTEXT (WINAPI *SetThreadDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (user32) {
-        SetThreadDpiAwarenessContextProc setDpiProc = 
-            (SetThreadDpiAwarenessContextProc)GetProcAddress(user32, "SetThreadDpiAwarenessContext");
+        auto setDpiProc = (SetThreadDpiAwarenessContextProc)GetProcAddress(user32, "SetThreadDpiAwarenessContext");
         if (setDpiProc) {
             setDpiProc(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
     }
-    
+
+    double dpiScale = GetDpiScaleFactor();
+
+    // 预截屏整个虚拟屏幕
+    HDC memDC = NULL;
+    HBITMAP screenBitmap = NULL;
+    int vx, vy, vw, vh;
+    if (!CaptureVirtualScreen(memDC, screenBitmap, vx, vy, vw, vh, dpiScale)) {
+        g_isCapturing = false;
+        return;
+    }
+
+    // 创建双缓冲
+    HDC backDC = NULL;
+    HBITMAP backBmp = NULL;
+    if (!CreateBackBuffer(backDC, backBmp, vw, vh)) {
+        DeleteDC(memDC);
+        DeleteObject(screenBitmap);
+        g_isCapturing = false;
+        return;
+    }
+
+    // 枚举窗口
+    std::vector<SCWindowInfo> windows = EnumWindowsForCapture();
+
+    // 初始化 GDI 资源
+    SCGdiResources gdi;
+    gdi.Init();
+
+    // 初始化上下文
+    CaptureContext ctx = {};
+    ctx.state = CS_Idle;
+    ctx.virtualX = vx; ctx.virtualY = vy;
+    ctx.virtualW = vw; ctx.virtualH = vh;
+    ctx.startX = 0; ctx.startY = 0;
+    ctx.endX = 0; ctx.endY = 0;
+    ctx.hoveredWindow = -1;
+    ctx.screenBitmap = screenBitmap;
+    ctx.memDC = memDC;
+    ctx.backDC = backDC;
+    ctx.backBitmap = backBmp;
+    ctx.lastPanelRect = {0,0,0,0};
+    ctx.lastSelectionRect = {0,0,0,0};
+    ctx.lastLabelRect = {0,0,0,0};
+    ctx.lastHighlightRect = {0,0,0,0};
+    ctx.needFullRedraw = true;
+    ctx.dpiScale = dpiScale;
+    ctx.gdi = gdi;
+    ctx.windows = std::move(windows);
+
+    // 获取初始鼠标位置和颜色
+    POINT pt;
+    GetCursorPos(&pt);
+    ctx.mouseX = pt.x;
+    ctx.mouseY = pt.y;
+    ctx.currentColor = GetPixelColorFromBitmap(memDC, pt.x, pt.y, vx, vy, dpiScale);
+
+    g_captureCtx = &ctx;
+
     // 注册窗口类
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = ScreenshotOverlayWndProc;
     wc.hInstance = GetModuleHandle(NULL);
-    wc.hCursor = LoadCursor(NULL, IDC_CROSS);  // 十字光标
-    wc.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);  // 默认鼠标样式
     wc.lpszClassName = L"ZToolsScreenshotOverlay";
-    
+
     if (!RegisterClassExW(&wc)) {
+        gdi.Cleanup();
+        DeleteDC(backDC); DeleteObject(backBmp);
+        DeleteDC(memDC); DeleteObject(screenBitmap);
+        g_captureCtx = nullptr;
         g_isCapturing = false;
         return;
     }
-    
-    // 获取虚拟屏幕尺寸（支持多显示器）
-    int screenX = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int screenY = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    
-    // 创建全屏分层窗口（覆盖所有显示器）
+
+    // 创建普通 WS_POPUP 窗口（非分层窗口）
     g_screenshotOverlayWindow = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         L"ZToolsScreenshotOverlay",
         L"Screenshot Overlay",
         WS_POPUP,
-        screenX, screenY, screenWidth, screenHeight,
+        vx, vy, vw, vh,
         NULL, NULL, GetModuleHandle(NULL), NULL
     );
-    
+
     if (g_screenshotOverlayWindow == NULL) {
         UnregisterClassW(L"ZToolsScreenshotOverlay", GetModuleHandle(NULL));
+        gdi.Cleanup();
+        DeleteDC(backDC); DeleteObject(backBmp);
+        DeleteDC(memDC); DeleteObject(screenBitmap);
+        g_captureCtx = nullptr;
         g_isCapturing = false;
         return;
     }
-    
-    // 显示窗口
+
     ShowWindow(g_screenshotOverlayWindow, SW_SHOW);
     SetForegroundWindow(g_screenshotOverlayWindow);
-    
-    // 初始绘制（没有选区时的半透明遮罩）
-    DrawSelectionOverlay(g_screenshotOverlayWindow);
-    
+
     // 消息循环
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    while (true) {
+        if (ctx.state == CS_Done || ctx.state == CS_Cancelled) break;
+
+        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        } else {
+            // 检查 ESC 键（窗口可能没有焦点）
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                if (ctx.state != CS_Done && ctx.state != CS_Cancelled) {
+                    ctx.state = CS_Cancelled;
+                    if (g_screenshotTsfn != nullptr) {
+                        ScreenshotResult* result = new ScreenshotResult();
+                        result->success = false;
+                        result->x = 0; result->y = 0; result->x2 = 0; result->y2 = 0;
+                        result->width = 0; result->height = 0;
+                        napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+                    }
+                    DestroyWindow(g_screenshotOverlayWindow);
+                    break;
+                }
+            }
+            Sleep(1);
+        }
     }
-    
+
     // 清理
+    g_captureCtx = nullptr;
+    gdi.Cleanup();
+    DeleteDC(backDC); DeleteObject(backBmp);
+    DeleteDC(memDC); DeleteObject(screenBitmap);
     UnregisterClassW(L"ZToolsScreenshotOverlay", GetModuleHandle(NULL));
     g_isCapturing = false;
 }
@@ -1120,46 +1894,35 @@ void ScreenshotCaptureThread() {
 // 启动区域截图
 Napi::Value StartRegionCapture(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    
+
     if (g_isCapturing) {
         Napi::Error::New(env, "Screenshot already in progress").ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    
+
     // 可选的回调函数
     if (info.Length() > 0 && info[0].IsFunction()) {
         Napi::Function callback = info[0].As<Napi::Function>();
         napi_value resource_name;
         napi_create_string_utf8(env, "ScreenshotCallback", NAPI_AUTO_LENGTH, &resource_name);
-        
-        // 创建线程安全函数
+
         napi_status status = napi_create_threadsafe_function(
-            env,
-            callback,
-            nullptr,
-            resource_name,
-            0,
-            1,
-            nullptr,
-            nullptr,
-            nullptr,
-            CallScreenshotJs,
-            &g_screenshotTsfn
+            env, callback, nullptr, resource_name,
+            0, 1, nullptr, nullptr, nullptr,
+            CallScreenshotJs, &g_screenshotTsfn
         );
-        
+
         if (status != napi_ok) {
             Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
             return env.Undefined();
         }
     }
-    
+
     g_isCapturing = true;
-    g_isSelecting = false;
-    
-    // 启动截图线程
+
     g_screenshotThread = std::thread(ScreenshotCaptureThread);
     g_screenshotThread.detach();
-    
+
     return env.Undefined();
 }
 
