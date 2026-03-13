@@ -17,6 +17,7 @@
 #include <shellapi.h>  // For DragQueryFile, SHGetFileInfoW
 #include <shlobj.h>    // For SHLoadIndirectString, IApplicationActivationManager
 #include <shobjidl.h>  // For IApplicationActivationManager
+#include <exdisp.h>    // For IShellWindows, IWebBrowserApp (COM Explorer 路径查询)
 #include <appmodel.h>  // For package APIs
 #include <shlwapi.h>   // For PathCombineW
 #include <dwmapi.h>    // For DwmGetWindowAttribute
@@ -234,6 +235,8 @@ struct WindowInfo {
     std::string title;
     std::string app;
     std::string appPath;
+    std::string className;  // 窗口类名（CabinetWClass/Progman/WorkerW 等，用于识别 Explorer 窗口类型）
+    uint64_t hwnd;          // 窗口句柄（用于 COM IShellWindows 查询 Explorer 目录路径）
     int x;
     int y;
     int width;
@@ -279,6 +282,19 @@ WindowInfo* GetWindowInfo(HWND hwnd) {
             WideCharToMultiByte(CP_UTF8, 0, wTitle.c_str(), -1, &info->title[0], size, NULL, NULL);
         }
     }
+
+    // 获取窗口类名（CabinetWClass = Explorer 窗口, Progman/WorkerW = 桌面）
+    WCHAR classNameBuf[256] = {0};
+    int classLen = GetClassNameW(hwnd, classNameBuf, 256);
+    if (classLen > 0) {
+        int cnSize = WideCharToMultiByte(CP_UTF8, 0, classNameBuf, -1, NULL, 0, NULL, NULL);
+        if (cnSize > 0) {
+            info->className.resize(cnSize - 1);
+            WideCharToMultiByte(CP_UTF8, 0, classNameBuf, -1, &info->className[0], cnSize, NULL, NULL);
+        }
+    }
+    // 保存窗口句柄，用于后续 COM 查询
+    info->hwnd = (uint64_t)hwnd;
 
     // 获取进程句柄
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, info->processId);
@@ -375,6 +391,16 @@ void CallWindowJs(napi_env env, napi_value js_callback, void* context, void* dat
         napi_value height;
         napi_create_int32(env, info->height, &height);
         napi_set_named_property(env, result, "height", height);
+
+        // 窗口类名（CabinetWClass/Progman/WorkerW 等，用于识别 Explorer 窗口类型）
+        napi_value className;
+        napi_create_string_utf8(env, info->className.c_str(), NAPI_AUTO_LENGTH, &className);
+        napi_set_named_property(env, result, "className", className);
+
+        // 窗口句柄（用于 COM IShellWindows 查询 Explorer 目录路径）
+        napi_value hwndVal;
+        napi_create_double(env, (double)info->hwnd, &hwndVal);
+        napi_set_named_property(env, result, "hwnd", hwndVal);
 
         // 调用回调
         napi_value global;
@@ -686,6 +712,20 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
         }
         CloseHandle(hProcess);
     }
+
+    // 获取窗口类名（CabinetWClass = Explorer 窗口, Progman/WorkerW = 桌面）
+    WCHAR activeClassNameBuf[256] = {0};
+    int activeClassLen = GetClassNameW(hwnd, activeClassNameBuf, 256);
+    if (activeClassLen > 0) {
+        int cnSize = WideCharToMultiByte(CP_UTF8, 0, activeClassNameBuf, -1, NULL, 0, NULL, NULL);
+        if (cnSize > 0) {
+            std::string classNameUtf8(cnSize - 1, 0);
+            WideCharToMultiByte(CP_UTF8, 0, activeClassNameBuf, -1, &classNameUtf8[0], cnSize, NULL, NULL);
+            result.Set("className", Napi::String::New(env, classNameUtf8));
+        }
+    }
+    // 窗口句柄（用于 COM IShellWindows 查询 Explorer 目录路径）
+    result.Set("hwnd", Napi::Number::New(env, (double)(uint64_t)hwnd));
 
     return result;
 }
@@ -4342,6 +4382,110 @@ Napi::Value UnicodeType(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, result == inputs.size());
 }
 
+// ==================== Explorer 路径查询 ====================
+
+/**
+ * 通过 COM IShellWindows 查询指定窗口句柄对应的 Explorer 文件夹路径
+ * 
+ * 工作原理：
+ * 1. 枚举所有 Shell 窗口（IShellWindows）
+ * 2. 通过 HWND 匹配目标 Explorer 窗口
+ * 3. 获取该窗口的 LocationURL（file:/// 格式的路径）
+ * 
+ * @param hwnd - 目标窗口句柄（从 WindowInfo.hwnd 获取）
+ * @returns file:/// 格式的路径字符串，失败返回 null
+ */
+Napi::Value GetExplorerFolderPath(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 参数校验：需要一个 number 类型的 hwnd
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "hwnd (number) is required").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    // 获取目标窗口句柄
+    uint64_t hwndValue = (uint64_t)info[0].As<Napi::Number>().Int64Value();
+    HWND targetHwnd = (HWND)hwndValue;
+
+    // 初始化 COM（STA 模式，与 Electron 主线程兼容）
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // S_OK 或 S_FALSE（已初始化）都是可接受的
+    bool needUninit = (hrInit == S_OK);
+
+    std::string result;
+
+    // 创建 ShellWindows COM 对象，枚举所有打开的 Explorer 窗口
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_IShellWindows, (void**)&shellWindows
+    );
+
+    if (SUCCEEDED(hr) && shellWindows) {
+        long count = 0;
+        shellWindows->get_Count(&count);
+
+        // 遍历所有 Shell 窗口，查找匹配的 HWND
+        for (long i = 0; i < count; i++) {
+            VARIANT idx;
+            idx.vt = VT_I4;
+            idx.lVal = i;
+
+            IDispatch* disp = nullptr;
+            hr = shellWindows->Item(idx, &disp);
+            if (FAILED(hr) || !disp) continue;
+
+            // 查询 IWebBrowserApp 接口（Explorer 窗口实现该接口）
+            IWebBrowserApp* browser = nullptr;
+            hr = disp->QueryInterface(IID_IWebBrowserApp, (void**)&browser);
+            disp->Release();
+
+            if (FAILED(hr) || !browser) continue;
+
+            // 比对窗口句柄（HWND）
+            SHANDLE_PTR browserHwndPtr = 0;
+            browser->get_HWND(&browserHwndPtr);
+            HWND browserHwnd = (HWND)browserHwndPtr;
+
+            if (browserHwnd == targetHwnd) {
+                // 找到匹配窗口，获取当前目录的 URL
+                BSTR url = nullptr;
+                hr = browser->get_LocationURL(&url);
+                if (SUCCEEDED(hr) && url) {
+                    // 将 BSTR (UTF-16) 转换为 UTF-8 字符串
+                    int len = SysStringLen(url);
+                    if (len > 0) {
+                        int size = WideCharToMultiByte(CP_UTF8, 0, url, len, NULL, 0, NULL, NULL);
+                        if (size > 0) {
+                            result.resize(size);
+                            WideCharToMultiByte(CP_UTF8, 0, url, len, &result[0], size, NULL, NULL);
+                        }
+                    }
+                    SysFreeString(url);
+                }
+                browser->Release();
+                break;
+            }
+
+            browser->Release();
+        }
+
+        shellWindows->Release();
+    }
+
+    // 仅在本次调用初始化 COM 时才反初始化
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    // 返回路径或 null
+    if (result.empty()) {
+        return env.Null();
+    }
+    return Napi::String::New(env, result);
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -4368,6 +4512,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
     exports.Set("resolveMuiStrings", Napi::Function::New(env, ResolveMuiStrings));
     exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
+    // 通过 COM IShellWindows 查询 Explorer 窗口的当前文件夹路径
+    exports.Set("getExplorerFolderPath", Napi::Function::New(env, GetExplorerFolderPath));
     return exports;
 }
 
