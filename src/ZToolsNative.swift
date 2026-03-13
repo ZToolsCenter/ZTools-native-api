@@ -1298,6 +1298,130 @@ private func stopColorPickerEventTap() {
 
 // MARK: - Helper Functions
 
+// MARK: - Mouse Simulation
+
+/// 模拟鼠标移动到指定屏幕位置
+/// - Parameters:
+///   - x: 距离屏幕左侧的位置（像素）
+///   - y: 距离屏幕顶部的位置（像素）
+/// - Returns: 是否成功 (1: 成功, 0: 失败)
+@_cdecl("simulateMouseMove")
+public func simulateMouseMove(_ x: Double, _ y: Double) -> Int32 {
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        print("Error: Failed to create event source")
+        return 0
+    }
+
+    let point = CGPoint(x: x, y: y)
+    guard let moveEvent = CGEvent(mouseEventSource: eventSource, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
+        print("Error: Failed to create mouse move event")
+        return 0
+    }
+
+    moveEvent.post(tap: .cghidEventTap)
+    return 1
+}
+
+/// 模拟鼠标左键单击
+/// - Parameters:
+///   - x: 距离屏幕左侧的位置（像素）
+///   - y: 距离屏幕顶部的位置（像素）
+/// - Returns: 是否成功 (1: 成功, 0: 失败)
+@_cdecl("simulateMouseClick")
+public func simulateMouseClick(_ x: Double, _ y: Double) -> Int32 {
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        print("Error: Failed to create event source")
+        return 0
+    }
+
+    let point = CGPoint(x: x, y: y)
+
+    guard let downEvent = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left) else {
+        return 0
+    }
+    guard let upEvent = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+        return 0
+    }
+
+    downEvent.post(tap: .cghidEventTap)
+    usleep(10_000)
+    upEvent.post(tap: .cghidEventTap)
+    return 1
+}
+
+/// 模拟鼠标左键双击
+/// - Parameters:
+///   - x: 距离屏幕左侧的位置（像素）
+///   - y: 距离屏幕顶部的位置（像素）
+/// - Returns: 是否成功 (1: 成功, 0: 失败)
+@_cdecl("simulateMouseDoubleClick")
+public func simulateMouseDoubleClick(_ x: Double, _ y: Double) -> Int32 {
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        print("Error: Failed to create event source")
+        return 0
+    }
+
+    let point = CGPoint(x: x, y: y)
+
+    // 第一次点击
+    guard let down1 = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left) else {
+        return 0
+    }
+    guard let up1 = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+        return 0
+    }
+    down1.setIntegerValueField(.mouseEventClickState, value: 1)
+    up1.setIntegerValueField(.mouseEventClickState, value: 1)
+
+    // 第二次点击（clickState = 2 表示双击）
+    guard let down2 = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left) else {
+        return 0
+    }
+    guard let up2 = CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+        return 0
+    }
+    down2.setIntegerValueField(.mouseEventClickState, value: 2)
+    up2.setIntegerValueField(.mouseEventClickState, value: 2)
+
+    down1.post(tap: .cghidEventTap)
+    usleep(10_000)
+    up1.post(tap: .cghidEventTap)
+    usleep(10_000)
+    down2.post(tap: .cghidEventTap)
+    usleep(10_000)
+    up2.post(tap: .cghidEventTap)
+    return 1
+}
+
+/// 模拟鼠标右键单击
+/// - Parameters:
+///   - x: 距离屏幕左侧的位置（像素）
+///   - y: 距离屏幕顶部的位置（像素）
+/// - Returns: 是否成功 (1: 成功, 0: 失败)
+@_cdecl("simulateMouseRightClick")
+public func simulateMouseRightClick(_ x: Double, _ y: Double) -> Int32 {
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        print("Error: Failed to create event source")
+        return 0
+    }
+
+    let point = CGPoint(x: x, y: y)
+
+    guard let downEvent = CGEvent(mouseEventSource: eventSource, mouseType: .rightMouseDown, mouseCursorPosition: point, mouseButton: .right) else {
+        return 0
+    }
+    guard let upEvent = CGEvent(mouseEventSource: eventSource, mouseType: .rightMouseUp, mouseCursorPosition: point, mouseButton: .right) else {
+        return 0
+    }
+
+    downEvent.post(tap: .cghidEventTap)
+    usleep(10_000)
+    upEvent.post(tap: .cghidEventTap)
+    return 1
+}
+
+// MARK: - Helper Functions (Utilities)
+
 /// 辅助函数：转义 JSON 字符串
 private func escapeJSON(_ string: String) -> String {
     return string

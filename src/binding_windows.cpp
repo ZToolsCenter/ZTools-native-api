@@ -2676,6 +2676,193 @@ Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, result == eventCount);
 }
 
+// 模拟鼠标移动
+Napi::Value SimulateMouseMove(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected x and y as number arguments").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    double x = info[0].As<Napi::Number>().DoubleValue();
+    double y = info[1].As<Napi::Number>().DoubleValue();
+
+    // 获取虚拟屏幕（包含所有显示器）的尺寸和偏移
+    int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int screenTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    if (screenWidth == 0 || screenHeight == 0) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 将屏幕像素坐标转换为归一化坐标（0-65535）
+    INPUT input = {0};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = static_cast<LONG>(((x - screenLeft) * 65535.0) / (screenWidth - 1));
+    input.mi.dy = static_cast<LONG>(((y - screenTop) * 65535.0) / (screenHeight - 1));
+    input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+
+    UINT result = SendInput(1, &input, sizeof(INPUT));
+    return Napi::Boolean::New(env, result == 1);
+}
+
+// 模拟鼠标左键单击
+Napi::Value SimulateMouseClick(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected x and y as number arguments").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    double x = info[0].As<Napi::Number>().DoubleValue();
+    double y = info[1].As<Napi::Number>().DoubleValue();
+
+    int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int screenTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    if (screenWidth == 0 || screenHeight == 0) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    LONG normX = static_cast<LONG>(((x - screenLeft) * 65535.0) / (screenWidth - 1));
+    LONG normY = static_cast<LONG>(((y - screenTop) * 65535.0) / (screenHeight - 1));
+
+    INPUT inputs[3] = {};
+
+    // 移动到目标位置
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dx = normX;
+    inputs[0].mi.dy = normY;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+
+    // 按下左键
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dx = normX;
+    inputs[1].mi.dy = normY;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTDOWN;
+
+    // 释放左键
+    inputs[2].type = INPUT_MOUSE;
+    inputs[2].mi.dx = normX;
+    inputs[2].mi.dy = normY;
+    inputs[2].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP;
+
+    UINT result = SendInput(3, inputs, sizeof(INPUT));
+    return Napi::Boolean::New(env, result == 3);
+}
+
+// 模拟鼠标左键双击
+Napi::Value SimulateMouseDoubleClick(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected x and y as number arguments").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    double x = info[0].As<Napi::Number>().DoubleValue();
+    double y = info[1].As<Napi::Number>().DoubleValue();
+
+    int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int screenTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    if (screenWidth == 0 || screenHeight == 0) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    LONG normX = static_cast<LONG>(((x - screenLeft) * 65535.0) / (screenWidth - 1));
+    LONG normY = static_cast<LONG>(((y - screenTop) * 65535.0) / (screenHeight - 1));
+
+    INPUT inputs[5] = {};
+
+    // 移动到目标位置
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dx = normX;
+    inputs[0].mi.dy = normY;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+
+    // 第一次点击
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dx = normX;
+    inputs[1].mi.dy = normY;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTDOWN;
+
+    inputs[2].type = INPUT_MOUSE;
+    inputs[2].mi.dx = normX;
+    inputs[2].mi.dy = normY;
+    inputs[2].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP;
+
+    // 第二次点击
+    inputs[3].type = INPUT_MOUSE;
+    inputs[3].mi.dx = normX;
+    inputs[3].mi.dy = normY;
+    inputs[3].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTDOWN;
+
+    inputs[4].type = INPUT_MOUSE;
+    inputs[4].mi.dx = normX;
+    inputs[4].mi.dy = normY;
+    inputs[4].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_LEFTUP;
+
+    UINT result = SendInput(5, inputs, sizeof(INPUT));
+    return Napi::Boolean::New(env, result == 5);
+}
+
+// 模拟鼠标右键单击
+Napi::Value SimulateMouseRightClick(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected x and y as number arguments").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    double x = info[0].As<Napi::Number>().DoubleValue();
+    double y = info[1].As<Napi::Number>().DoubleValue();
+
+    int screenWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int screenTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    if (screenWidth == 0 || screenHeight == 0) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    LONG normX = static_cast<LONG>(((x - screenLeft) * 65535.0) / (screenWidth - 1));
+    LONG normY = static_cast<LONG>(((y - screenTop) * 65535.0) / (screenHeight - 1));
+
+    INPUT inputs[3] = {};
+
+    // 移动到目标位置
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dx = normX;
+    inputs[0].mi.dy = normY;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
+
+    // 按下右键
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dx = normX;
+    inputs[1].mi.dy = normY;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_RIGHTDOWN;
+
+    // 释放右键
+    inputs[2].type = INPUT_MOUSE;
+    inputs[2].mi.dx = normX;
+    inputs[2].mi.dy = normY;
+    inputs[2].mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_RIGHTUP;
+
+    UINT result = SendInput(3, inputs, sizeof(INPUT));
+    return Napi::Boolean::New(env, result == 3);
+}
+
 // ==================== UWP 应用功能 ====================
 
 // 辅助函数：宽字符串转 UTF-8
@@ -4127,6 +4314,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("activateWindow", Napi::Function::New(env, ActivateWindow));
     exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
     exports.Set("simulateKeyboardTap", Napi::Function::New(env, SimulateKeyboardTap));
+    exports.Set("simulateMouseMove", Napi::Function::New(env, SimulateMouseMove));
+    exports.Set("simulateMouseClick", Napi::Function::New(env, SimulateMouseClick));
+    exports.Set("simulateMouseDoubleClick", Napi::Function::New(env, SimulateMouseDoubleClick));
+    exports.Set("simulateMouseRightClick", Napi::Function::New(env, SimulateMouseRightClick));
     exports.Set("startRegionCapture", Napi::Function::New(env, StartRegionCapture));
     exports.Set("getClipboardFiles", Napi::Function::New(env, GetClipboardFiles));
     exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
