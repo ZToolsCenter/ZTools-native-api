@@ -21,6 +21,7 @@ typedef int (*SetClipboardFilesFunc)(const char *);        // 设置剪贴板文
 typedef void (*MouseEventCB)(const char *);                       // 鼠标事件回调
 typedef void (*StartMouseMonitorFunc)(const char *, int, MouseEventCB); // 启动鼠标监控
 typedef void (*StopMouseMonitorFunc)();                            // 停止鼠标监控
+typedef void (*ReplayMouseEventsFunc)();                           // 重放鼠标事件
 typedef int (*SimulateMouseMoveFunc)(double, double);              // 模拟鼠标移动
 typedef int (*SimulateMouseClickFunc)(double, double);             // 模拟鼠标单击
 typedef int (*SimulateMouseDoubleClickFunc)(double, double);       // 模拟鼠标双击
@@ -47,6 +48,7 @@ static SetClipboardFilesFunc setClipboardFilesFunc = nullptr; // 设置剪贴板
 static napi_threadsafe_function mouseTsfn = nullptr;
 static StartMouseMonitorFunc startMouseMonitorFunc = nullptr;
 static StopMouseMonitorFunc stopMouseMonitorFunc = nullptr;
+static ReplayMouseEventsFunc replayMouseEventsFunc = nullptr;
 static SimulateMouseMoveFunc simulateMouseMoveFunc = nullptr;
 static SimulateMouseClickFunc simulateMouseClickFunc = nullptr;
 static SimulateMouseDoubleClickFunc simulateMouseDoubleClickFunc = nullptr;
@@ -273,6 +275,8 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (StartMouseMonitorFunc)dlsym(swiftLibHandle, "startMouseMonitor");
   stopMouseMonitorFunc =
       (StopMouseMonitorFunc)dlsym(swiftLibHandle, "stopMouseMonitor");
+  replayMouseEventsFunc =
+      (ReplayMouseEventsFunc)dlsym(swiftLibHandle, "replayMouseEvents");
   simulateMouseMoveFunc =
       (SimulateMouseMoveFunc)dlsym(swiftLibHandle, "simulateMouseMove");
   simulateMouseClickFunc =
@@ -579,6 +583,44 @@ Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo &info) {
   return Napi::Boolean::New(env, success == 1);
 }
 
+// 检查回调返回值中的 shouldBlock 并触发重放
+void CheckMouseShouldBlock(napi_env env, napi_value value) {
+  if (value == nullptr) return;
+
+  napi_valuetype valueType;
+  napi_typeof(env, value, &valueType);
+  if (valueType != napi_object) return;
+
+  napi_value shouldBlockVal;
+  napi_status propStatus = napi_get_named_property(env, value, "shouldBlock", &shouldBlockVal);
+  if (propStatus != napi_ok || shouldBlockVal == nullptr) return;
+
+  napi_valuetype sbType;
+  napi_typeof(env, shouldBlockVal, &sbType);
+  if (sbType != napi_boolean) return;
+
+  bool shouldBlock;
+  napi_get_value_bool(env, shouldBlockVal, &shouldBlock);
+  if (!shouldBlock && replayMouseEventsFunc != nullptr) {
+    replayMouseEventsFunc();
+  }
+}
+
+// Promise.then() 回调：异步回调 resolve 后检查 shouldBlock
+napi_value OnMousePromiseResolved(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  if (argc > 0) {
+    CheckMouseShouldBlock(env, argv[0]);
+  }
+
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 // 模拟鼠标移动
 Napi::Value SimulateMouseMove(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
@@ -665,14 +707,40 @@ void CallMouseJs(napi_env env, napi_value js_callback, void *context,
   if (env != nullptr && js_callback != nullptr && data != nullptr) {
     char *eventType = static_cast<char *>(data);
     Napi::Env napiEnv(env);
-    Napi::Object result = Napi::Object::New(napiEnv);
-    result.Set("type", Napi::String::New(napiEnv, eventType));
+    Napi::Object callbackArg = Napi::Object::New(napiEnv);
+    callbackArg.Set("type", Napi::String::New(napiEnv, eventType));
     free(eventType);
 
     napi_value global;
     napi_get_global(env, &global);
-    napi_value resultValue = result;
-    napi_call_function(env, global, js_callback, 1, &resultValue, nullptr);
+    napi_value argValue = callbackArg;
+    napi_value result;
+    napi_status status = napi_call_function(env, global, js_callback, 1, &argValue, &result);
+
+    // 检查回调返回值：如果返回 {shouldBlock: false}，则重放被拦截的事件
+    if (status == napi_ok && result != nullptr) {
+      napi_valuetype resultType;
+      napi_typeof(env, result, &resultType);
+
+      if (resultType == napi_object) {
+        // 检查是否为 Promise/thenable（有 .then 方法）
+        napi_value thenFunc;
+        napi_get_named_property(env, result, "then", &thenFunc);
+        napi_valuetype thenType;
+        napi_typeof(env, thenFunc, &thenType);
+
+        if (thenType == napi_function) {
+          // 异步回调：通过 .then() 获取 resolve 值
+          napi_value resolveCallback;
+          napi_create_function(env, "onResolved", NAPI_AUTO_LENGTH,
+                               OnMousePromiseResolved, nullptr, &resolveCallback);
+          napi_call_function(env, result, thenFunc, 1, &resolveCallback, nullptr);
+        } else {
+          // 同步回调：直接检查 shouldBlock
+          CheckMouseShouldBlock(env, result);
+        }
+      }
+    }
   }
 }
 

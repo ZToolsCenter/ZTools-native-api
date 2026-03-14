@@ -75,6 +75,7 @@ static std::atomic<bool> g_mouseButtonPressed(false);
 static std::chrono::steady_clock::time_point g_mousePressStartTime;
 static std::atomic<bool> g_mouseLongPressTriggered(false);
 static bool g_mouseNeedReplay = false;
+static std::atomic<bool> g_mouseReplayOnRelease(false);
 #define MOUSE_REPLAY_MAGIC 0x5A544F4F
 
 // 全局变量 - 取色器
@@ -2219,13 +2220,82 @@ Napi::Value SetClipboardFiles(const Napi::CallbackInfo& info) {
 
 // ==================== 鼠标监控功能 ====================
 
+// 检查回调返回值中的 shouldBlock 并触发重放
+void CheckMouseShouldBlock(napi_env env, napi_value value) {
+    if (value == nullptr) return;
+
+    napi_valuetype valueType;
+    napi_typeof(env, value, &valueType);
+    if (valueType != napi_object) return;
+
+    napi_value shouldBlockVal;
+    napi_status propStatus = napi_get_named_property(env, value, "shouldBlock", &shouldBlockVal);
+    if (propStatus != napi_ok || shouldBlockVal == nullptr) return;
+
+    napi_valuetype sbType;
+    napi_typeof(env, shouldBlockVal, &sbType);
+    if (sbType != napi_boolean) return;
+
+    bool shouldBlock;
+    napi_get_value_bool(env, shouldBlockVal, &shouldBlock);
+    if (!shouldBlock) {
+        if (g_mouseButtonPressed) {
+            // 长按模式：按钮仍被按下，标记在释放时重放
+            g_mouseReplayOnRelease = true;
+        } else {
+            // 点击模式或按钮已释放，立即重放
+            g_mouseNeedReplay = true;
+        }
+    }
+}
+
+// Promise.then() 回调：异步回调 resolve 后检查 shouldBlock
+napi_value OnMousePromiseResolved(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+    if (argc > 0) {
+        CheckMouseShouldBlock(env, argv[0]);
+    }
+
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
 // 在主线程调用 JS 回调（鼠标事件）
 void CallMouseJs(napi_env env, napi_value js_callback, void* context, void* data) {
     if (env != nullptr && js_callback != nullptr) {
-        // 不传递任何参数，只调用回调
         napi_value global;
         napi_get_global(env, &global);
-        napi_call_function(env, global, js_callback, 0, nullptr, nullptr);
+        napi_value result;
+        napi_status status = napi_call_function(env, global, js_callback, 0, nullptr, &result);
+
+        // 检查回调返回值：如果返回 {shouldBlock: false}，则重放被拦截的事件
+        if (status == napi_ok && result != nullptr) {
+            napi_valuetype resultType;
+            napi_typeof(env, result, &resultType);
+
+            if (resultType == napi_object) {
+                // 检查是否为 Promise/thenable（有 .then 方法）
+                napi_value thenFunc;
+                napi_get_named_property(env, result, "then", &thenFunc);
+                napi_valuetype thenType;
+                napi_typeof(env, thenFunc, &thenType);
+
+                if (thenType == napi_function) {
+                    // 异步回调：通过 .then() 获取 resolve 值
+                    napi_value resolveCallback;
+                    napi_create_function(env, "onResolved", NAPI_AUTO_LENGTH,
+                                         OnMousePromiseResolved, nullptr, &resolveCallback);
+                    napi_call_function(env, result, thenFunc, 1, &resolveCallback, nullptr);
+                } else {
+                    // 同步回调：直接检查 shouldBlock
+                    CheckMouseShouldBlock(env, result);
+                }
+            }
+        }
     }
 }
 
@@ -2260,6 +2330,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         shouldBlock = true;
                         if (!g_mouseLongPressTriggered) {
                             g_mouseNeedReplay = true;
+                        } else if (g_mouseReplayOnRelease) {
+                            g_mouseReplayOnRelease = false;
+                            g_mouseNeedReplay = true;
                         }
                     }
                 }
@@ -2275,6 +2348,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     g_mouseButtonPressed = false;
                     shouldBlock = true;
                     if (!g_mouseLongPressTriggered) {
+                        g_mouseNeedReplay = true;
+                    } else if (g_mouseReplayOnRelease) {
+                        g_mouseReplayOnRelease = false;
                         g_mouseNeedReplay = true;
                     }
                 }
@@ -2301,6 +2377,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         } else {
                             shouldBlock = true;
                             if (!g_mouseLongPressTriggered) {
+                                g_mouseNeedReplay = true;
+                            } else if (g_mouseReplayOnRelease) {
+                                g_mouseReplayOnRelease = false;
                                 g_mouseNeedReplay = true;
                             }
                         }
@@ -2329,6 +2408,9 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         } else {
                             shouldBlock = true;
                             if (!g_mouseLongPressTriggered) {
+                                g_mouseNeedReplay = true;
+                            } else if (g_mouseReplayOnRelease) {
+                                g_mouseReplayOnRelease = false;
                                 g_mouseNeedReplay = true;
                             }
                         }
@@ -2510,6 +2592,7 @@ Napi::Value StartMouseMonitor(const Napi::CallbackInfo& info) {
     // 重置状态
     g_mouseButtonPressed = false;
     g_mouseLongPressTriggered = false;
+    g_mouseReplayOnRelease = false;
     g_isMouseMonitoring = true;
 
     // 启动监控线程
@@ -2543,6 +2626,7 @@ Napi::Value StopMouseMonitor(const Napi::CallbackInfo& info) {
     g_mouseButtonPressed = false;
     g_mouseLongPressTriggered = false;
     g_mouseNeedReplay = false;
+    g_mouseReplayOnRelease = false;
     g_mouseButtonType.clear();
     g_mouseLongPressMs = 0;
 

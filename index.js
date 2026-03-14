@@ -270,6 +270,10 @@ class MouseMonitor {
    *   - >0: 监听长按（按住达到该时长后触发）
    *   - 注意：'right' 只支持长按（longPressMs 必须 > 0）
    * @param {Function} callback - 鼠标事件回调函数（无参数）
+   *   回调函数可以返回一个对象 { shouldBlock: boolean }
+   *   - 不返回值或返回 undefined: 阻止原生事件（默认行为）
+   *   - 返回 { shouldBlock: false }: 不阻止原生事件（事件会被重放）
+   *   - 返回 { shouldBlock: true }: 阻止原生事件
    */
   static start(buttonType, longPressMs, callback) {
     if (MouseMonitor._isMonitoring) {
@@ -298,7 +302,7 @@ class MouseMonitor {
 
     addon.startMouseMonitor(buttonType, longPressMs, () => {
       if (MouseMonitor._callback) {
-        MouseMonitor._callback();
+        return MouseMonitor._callback();
       }
     });
   }

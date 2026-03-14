@@ -573,6 +573,8 @@ private var btnIsDown = false
 private var btnLongPressFired = false
 private var btnTimer: DispatchWorkItem? = nil
 private var storedMouseDownEvent: CGEvent? = nil // 存储原始 mouseDown 用于重放
+private var storedMouseUpEvent: CGEvent? = nil   // 存储原始 mouseUp 用于可能的重放
+private var mouseReplayOnRelease = false         // 长按模式下标记是否在释放时重放
 
 private let mouseTimerQueue = DispatchQueue(label: "com.ztools.mouse.timer", qos: .userInteractive)
 
@@ -656,12 +658,20 @@ func mouseEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event
         mouseLock.lock()
         let wasDown = btnIsDown
         let longPressFired = btnLongPressFired
+        let replayOnRelease = mouseReplayOnRelease
         let storedDown = storedMouseDownEvent
         btnTimer?.cancel()
         btnTimer = nil
         btnIsDown = false
         btnLongPressFired = false
-        storedMouseDownEvent = nil
+        mouseReplayOnRelease = false
+
+        if mouseIsLongPress || !wasDown {
+            // 长按模式或非配对事件，清理存储的事件
+            storedMouseDownEvent = nil
+        }
+        // 点击模式 + wasDown: 保留 storedMouseDownEvent 用于可能的重放
+
         mouseLock.unlock()
 
         if !wasDown {
@@ -670,7 +680,18 @@ func mouseEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event
 
         if mouseIsLongPress {
             if longPressFired {
-                // 长按已触发回调，吞掉 mouseUp
+                if replayOnRelease {
+                    // JS 回调返回 {shouldBlock: false}，重放事件
+                    if let downEvent = storedDown {
+                        downEvent.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+                        downEvent.post(tap: .cgSessionEventTap)
+                    }
+                    if let upEvent = event.copy() {
+                        upEvent.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+                        upEvent.post(tap: .cgSessionEventTap)
+                    }
+                }
+                // 长按已触发回调，吞掉 mouseUp（除非 replayOnRelease 已重放）
                 return nil
             } else {
                 // 未达到长按阈值，重放原始 mouseDown + mouseUp（恢复默认行为）
@@ -685,7 +706,10 @@ func mouseEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event
                 return nil // 拦截当前 mouseUp，重放的带标记事件会被放行
             }
         } else {
-            // 点击模式：触发回调，拦截事件
+            // 点击模式：存储 mouseUp 事件用于可能的重放，触发回调
+            mouseLock.lock()
+            storedMouseUpEvent = event.copy()
+            mouseLock.unlock()
             notifyMouseEvent()
             return nil
         }
@@ -806,6 +830,8 @@ public func stopMouseMonitor() {
     btnIsDown = false
     btnLongPressFired = false
     storedMouseDownEvent = nil
+    storedMouseUpEvent = nil
+    mouseReplayOnRelease = false
     mouseLock.unlock()
 
     // 停止事件监听
@@ -831,6 +857,38 @@ public func stopMouseMonitor() {
     mouseMonitorCallback = nil
 
     print("Mouse monitor stopped")
+}
+
+/// 重放被拦截的鼠标事件（由 C++ 层在 JS 回调返回 {shouldBlock: false} 时调用）
+@_cdecl("replayMouseEvents")
+public func replayMouseEvents() {
+    mouseLock.lock()
+    let downEvent = storedMouseDownEvent
+    let upEvent = storedMouseUpEvent
+
+    if upEvent != nil {
+        // 点击模式：mouseDown 和 mouseUp 都已存储，立即重放
+        storedMouseDownEvent = nil
+        storedMouseUpEvent = nil
+        mouseLock.unlock()
+
+        if let down = downEvent {
+            down.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+            down.post(tap: .cgSessionEventTap)
+        }
+        if let up = upEvent {
+            up.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+            up.post(tap: .cgSessionEventTap)
+        }
+    } else if btnIsDown {
+        // 长按模式：按钮仍被按下，标记在释放时重放
+        mouseReplayOnRelease = true
+        mouseLock.unlock()
+    } else {
+        // 无可重放的事件
+        storedMouseDownEvent = nil
+        mouseLock.unlock()
+    }
 }
 
 // MARK: - Color Picker

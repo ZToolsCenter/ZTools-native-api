@@ -13,9 +13,10 @@ console.log('');
 console.log('按 Ctrl+C 停止');
 console.log('---');
 
-MouseMonitor.start(buttonType, longPressMs, () => {
+MouseMonitor.start(buttonType, longPressMs, async () => {
   const time = new Date().toLocaleTimeString();
   console.log(`[${time}] 事件触发`);
+  return { shouldBlock: false }
 });
 
 process.on('SIGINT', () => {
