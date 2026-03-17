@@ -35,6 +35,7 @@
               "shell32.lib",
               "shlwapi.lib",
               "ole32.lib",
+              "uiautomationcore.lib",
               "gdiplus.lib",
               "dwmapi.lib",
               "gdi32.lib"

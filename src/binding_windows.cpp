@@ -14,14 +14,17 @@
 #include <memory>      // For std::unique_ptr, std::addressof
 #include <cstddef>
 #include <cwchar>
+#include <cwctype>
 #include <shellapi.h>  // For DragQueryFile, SHGetFileInfoW
 #include <shlobj.h>    // For SHLoadIndirectString, IApplicationActivationManager
 #include <shobjidl.h>  // For IApplicationActivationManager
 #include <exdisp.h>    // For IShellWindows, IWebBrowserApp (COM Explorer 路径查询)
+#include <uiautomation.h> // For browser URL reading via UI Automation
 #include <appmodel.h>  // For package APIs
 #include <shlwapi.h>   // For PathCombineW
 #include <dwmapi.h>    // For DwmGetWindowAttribute
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uiautomationcore.lib")
 
 // DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
 #ifndef DWMWA_CLOAKED
@@ -4570,6 +4573,372 @@ Napi::Value GetExplorerFolderPath(const Napi::CallbackInfo& info) {
     return Napi::String::New(env, result);
 }
 
+// ==================== 浏览器 URL 查询 ====================
+
+std::wstring Utf8ToWideString(const std::string& input) {
+    if (input.empty()) {
+        return std::wstring();
+    }
+
+    int size = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, nullptr, 0);
+    if (size <= 0) {
+        return std::wstring();
+    }
+
+    std::wstring result(size - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, &result[0], size);
+    return result;
+}
+
+std::string WideToUtf8String(const std::wstring& input) {
+    if (input.empty()) {
+        return std::string();
+    }
+
+    int size = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return std::string();
+    }
+
+    std::string result(size - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, input.c_str(), -1, &result[0], size, nullptr, nullptr);
+    return result;
+}
+
+std::wstring ToLowerWideString(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value;
+}
+
+bool StartsWithWideString(const std::wstring& value, const std::wstring& prefix) {
+    return value.size() >= prefix.size() &&
+           std::equal(prefix.begin(), prefix.end(), value.begin());
+}
+
+bool LooksLikeBrowserUrl(const std::wstring& value) {
+    if (value.empty()) {
+        return false;
+    }
+
+    std::wstring trimmed = value;
+    trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(), [](wchar_t ch) {
+        return !iswspace(ch);
+    }));
+    trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), [](wchar_t ch) {
+        return !iswspace(ch);
+    }).base(), trimmed.end());
+
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    const std::wstring lower = ToLowerWideString(trimmed);
+    const std::wstring prefixes[] = {
+        L"http://", L"https://", L"file:///", L"about:", L"chrome://",
+        L"edge://", L"brave://", L"opera://", L"vivaldi://",
+        L"moz-extension://", L"ftp://"
+    };
+
+    for (const auto& prefix : prefixes) {
+        if (StartsWithWideString(lower, prefix)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool IsBrowserAddressBarName(const std::wstring& name) {
+    if (name.empty()) {
+        return false;
+    }
+
+    const std::wstring lower = ToLowerWideString(name);
+    const std::wstring keywords[] = {
+        L"address and search bar",
+        L"search or enter address",
+        L"address bar",
+        L"search with google or enter address",
+        L"地址和搜索栏",
+        L"地址栏",
+        L"输入搜索词或网址"
+    };
+
+    for (const auto& keyword : keywords) {
+        if (lower.find(keyword) != std::wstring::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::wstring ReadElementValuePattern(IUIAutomationElement* element) {
+    if (!element) {
+        return std::wstring();
+    }
+
+    IUIAutomationValuePattern* valuePattern = nullptr;
+    HRESULT hr = element->GetCurrentPatternAs(UIA_ValuePatternId, IID_IUIAutomationValuePattern,
+                                             reinterpret_cast<void**>(&valuePattern));
+    if (FAILED(hr) || !valuePattern) {
+        return std::wstring();
+    }
+
+    BSTR value = nullptr;
+    hr = valuePattern->get_CurrentValue(&value);
+    valuePattern->Release();
+
+    if (FAILED(hr) || !value) {
+        return std::wstring();
+    }
+
+    std::wstring result(value, SysStringLen(value));
+    SysFreeString(value);
+    return result;
+}
+
+std::wstring TryExtractUrlFromAutomationElement(IUIAutomationElement* element) {
+    if (!element) {
+        return std::wstring();
+    }
+
+    CONTROLTYPEID controlType = 0;
+    element->get_CurrentControlType(&controlType);
+
+    BSTR elementName = nullptr;
+    element->get_CurrentName(&elementName);
+    std::wstring name = elementName ? std::wstring(elementName, SysStringLen(elementName)) : std::wstring();
+    if (elementName) {
+        SysFreeString(elementName);
+    }
+
+    const bool isLikelyAddressControl =
+        controlType == UIA_EditControlTypeId ||
+        controlType == UIA_ComboBoxControlTypeId ||
+        controlType == UIA_DocumentControlTypeId ||
+        controlType == UIA_PaneControlTypeId ||
+        IsBrowserAddressBarName(name);
+
+    if (!isLikelyAddressControl) {
+        return std::wstring();
+    }
+
+    std::wstring value = ReadElementValuePattern(element);
+    if (LooksLikeBrowserUrl(value)) {
+        return value;
+    }
+
+    if (LooksLikeBrowserUrl(name)) {
+        return name;
+    }
+
+    return std::wstring();
+}
+
+std::wstring FindBrowserUrlRecursive(IUIAutomation* automation,
+                                     IUIAutomationTreeWalker* walker,
+                                     IUIAutomationElement* element,
+                                     int depth,
+                                     int& visited) {
+    if (!automation || !walker || !element || depth > 18 || visited > 600) {
+        return std::wstring();
+    }
+
+    visited++;
+
+    std::wstring currentValue = TryExtractUrlFromAutomationElement(element);
+    if (!currentValue.empty()) {
+        return currentValue;
+    }
+
+    IUIAutomationElement* child = nullptr;
+    if (FAILED(walker->GetFirstChildElement(element, &child)) || !child) {
+        return std::wstring();
+    }
+
+    std::wstring result;
+    while (child) {
+        result = FindBrowserUrlRecursive(automation, walker, child, depth + 1, visited);
+
+        IUIAutomationElement* nextSibling = nullptr;
+        HRESULT hr = walker->GetNextSiblingElement(child, &nextSibling);
+        child->Release();
+        child = nullptr;
+
+        if (!result.empty()) {
+            if (nextSibling) {
+                nextSibling->Release();
+            }
+            return result;
+        }
+
+        if (FAILED(hr) || !nextSibling) {
+            break;
+        }
+
+        child = nextSibling;
+    }
+
+    return std::wstring();
+}
+
+std::wstring ReadBrowserUrlByUIAutomation(HWND targetHwnd) {
+    if (!targetHwnd) {
+        return std::wstring();
+    }
+
+    IUIAutomation* automation = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IUIAutomation, reinterpret_cast<void**>(&automation));
+    if (FAILED(hr) || !automation) {
+        return std::wstring();
+    }
+
+    IUIAutomationElement* rootElement = nullptr;
+    hr = automation->ElementFromHandle(targetHwnd, &rootElement);
+    if (FAILED(hr) || !rootElement) {
+        automation->Release();
+        return std::wstring();
+    }
+
+    IUIAutomationTreeWalker* controlWalker = nullptr;
+    automation->get_ControlViewWalker(&controlWalker);
+
+    int visited = 0;
+    std::wstring result;
+    if (controlWalker) {
+        result = FindBrowserUrlRecursive(automation, controlWalker, rootElement, 0, visited);
+        controlWalker->Release();
+    }
+
+    // ControlView 未找到时，再退化到 RawView 做一次宽松扫描。
+    if (result.empty()) {
+        IUIAutomationTreeWalker* rawWalker = nullptr;
+        automation->get_RawViewWalker(&rawWalker);
+        if (rawWalker) {
+            visited = 0;
+            result = FindBrowserUrlRecursive(automation, rawWalker, rootElement, 0, visited);
+            rawWalker->Release();
+        }
+    }
+
+    rootElement->Release();
+    automation->Release();
+    return result;
+}
+
+std::string GetShellWindowLocationUrl(HWND targetHwnd) {
+    std::string result;
+
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_IShellWindows, reinterpret_cast<void**>(&shellWindows)
+    );
+
+    if (FAILED(hr) || !shellWindows) {
+        return result;
+    }
+
+    long count = 0;
+    shellWindows->get_Count(&count);
+
+    for (long i = 0; i < count; i++) {
+        VARIANT idx;
+        VariantInit(&idx);
+        idx.vt = VT_I4;
+        idx.lVal = i;
+
+        IDispatch* disp = nullptr;
+        hr = shellWindows->Item(idx, &disp);
+        VariantClear(&idx);
+        if (FAILED(hr) || !disp) {
+            continue;
+        }
+
+        IWebBrowserApp* browser = nullptr;
+        hr = disp->QueryInterface(IID_IWebBrowserApp, reinterpret_cast<void**>(&browser));
+        disp->Release();
+
+        if (FAILED(hr) || !browser) {
+            continue;
+        }
+
+        SHANDLE_PTR browserHwndPtr = 0;
+        browser->get_HWND(&browserHwndPtr);
+        HWND browserHwnd = reinterpret_cast<HWND>(browserHwndPtr);
+
+        if (browserHwnd == targetHwnd) {
+            BSTR url = nullptr;
+            hr = browser->get_LocationURL(&url);
+            if (SUCCEEDED(hr) && url) {
+                result = WideToUtf8String(std::wstring(url, SysStringLen(url)));
+                SysFreeString(url);
+            }
+            browser->Release();
+            break;
+        }
+
+        browser->Release();
+    }
+
+    shellWindows->Release();
+    return result;
+}
+
+/**
+ * 读取指定浏览器窗口当前 URL。
+ *
+ * 参数：
+ * 1. browserName: string - 浏览器标识（如 chrome/msedge/firefox）
+ * 2. hwnd: number - 目标窗口句柄
+ * 3. callback: function - 接收读取结果，失败时传 null
+ */
+Napi::Value ReadBrowserWindowUrl(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 3 || !info[0].IsString() || !info[1].IsNumber() || !info[2].IsFunction()) {
+        Napi::TypeError::New(env, "browserName (string), hwnd (number) and callback (function) are required")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    const std::string browserName = info[0].As<Napi::String>().Utf8Value();
+    const std::string browserNameLower = WideToUtf8String(ToLowerWideString(Utf8ToWideString(browserName)));
+    const uint64_t hwndValue = static_cast<uint64_t>(info[1].As<Napi::Number>().Int64Value());
+    HWND targetHwnd = reinterpret_cast<HWND>(hwndValue);
+    Napi::Function callback = info[2].As<Napi::Function>();
+
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool needUninit = (hrInit == S_OK);
+
+    std::string result;
+
+    // IE / 旧版 Edge 优先尝试 IWebBrowserApp.LocationURL。
+    if (browserNameLower == "iexplore" || browserNameLower == "microsoftedge") {
+        result = GetShellWindowLocationUrl(targetHwnd);
+    }
+
+    // Chromium / Firefox 以及 shell windows 失败后的回退都走 UI Automation。
+    if (result.empty()) {
+        const std::wstring uiaResult = ReadBrowserUrlByUIAutomation(targetHwnd);
+        if (!uiaResult.empty()) {
+            result = WideToUtf8String(uiaResult);
+        }
+    }
+
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    Napi::Value resultValue = result.empty() ? env.Null() : Napi::String::New(env, result);
+    callback.Call({ resultValue });
+    return env.Undefined();
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -4598,6 +4967,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
     // 通过 COM IShellWindows 查询 Explorer 窗口的当前文件夹路径
     exports.Set("getExplorerFolderPath", Napi::Function::New(env, GetExplorerFolderPath));
+    // 读取指定浏览器窗口的当前 URL
+    exports.Set("readBrowserWindowUrl", Napi::Function::New(env, ReadBrowserWindowUrl));
     return exports;
 }
 
