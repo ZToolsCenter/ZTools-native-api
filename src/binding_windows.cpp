@@ -37,22 +37,7 @@ namespace Gdiplus {
     using std::max;
 }
 #include <gdiplus.h>
-using namespace Gdiplus;
 #pragma comment(lib, "gdiplus.lib")
-
-class GDIInit {
-    public:
-        ULONG_PTR token;
-        GDIInit() {
-            GdiplusStartupInput input;
-            GdiplusStartup(&token, &input, NULL);
-        }
-        ~GDIInit() {
-            GdiplusShutdown(token);
-        }
-    };
-
-static GDIInit g_gdiInit;
 
 // DROPFILES 已由 shlobj.h 提供，不再需要手动定义
 
@@ -3594,81 +3579,108 @@ static int GetPngEncoderClsid(CLSID* pClsid) {
 
 // 将 HICON 转换为 PNG 字节数组
 static std::vector<unsigned char> HIconToPNG(HICON hIcon) {
-    std::vector<unsigned char> result;
+    GdiPlusInit init;
 
-    ICONINFO iconInfo;
-    if (!GetIconInfo(hIcon, &iconInfo))
-        return result;
+    std::vector<std::int32_t> buffer;
+    auto bitmap = CreateBitmapFromIcon(hIcon, buffer);
 
-    BITMAP bmp = {};
-    if (!GetObject(iconInfo.hbmColor, sizeof(BITMAP), &bmp)) {
-        DeleteObject(iconInfo.hbmColor);
-        DeleteObject(iconInfo.hbmMask);
-        return result;
+    CLSID encoder;
+    if (GetPngEncoderClsid(std::addressof(encoder)) == -1) {
+        return std::vector<unsigned char>{};
     }
 
-    int width = bmp.bmWidth;
-    int height = bmp.bmHeight;
+    IStream* tmp;
+    if (CreateStreamOnHGlobal(nullptr, TRUE, std::addressof(tmp)) != S_OK) {
+        return std::vector<unsigned char>{};
+    }
+    std::unique_ptr<IStream, IStreamDeleter> pStream{tmp};
 
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    std::vector<unsigned char> pixels(width * height * 4);
-
-    HDC hdc = GetDC(NULL);
-    GetDIBits(
-        hdc,
-        iconInfo.hbmColor,
-        0,
-        height,
-        pixels.data(),
-        &bmi,
-        DIB_RGB_COLORS
-    );
-    ReleaseDC(NULL, hdc);
-
-    DeleteObject(iconInfo.hbmColor);
-    DeleteObject(iconInfo.hbmMask);
-
-    // 用 Scan0 创建 Bitmap
-    Gdiplus::Bitmap bitmap(
-        width,
-        height,
-        width * 4,
-        PixelFormat32bppARGB,
-        pixels.data()
-    );
-
-    IStream* stream = nullptr;
-    CreateStreamOnHGlobal(NULL, TRUE, &stream);
-
-    CLSID clsid;
-    CLSIDFromString(
-        L"{557CF406-1A04-11D3-9A73-0000F81EF32E}", // PNG
-        &clsid
-    );
-
-    if (bitmap.Save(stream, &clsid, NULL) == Gdiplus::Ok) {
-        STATSTG stat;
-        stream->Stat(&stat, STATFLAG_NONAME);
-
-        ULONG size = stat.cbSize.LowPart;
-        result.resize(size);
-
-        LARGE_INTEGER li = {};
-        stream->Seek(li, STREAM_SEEK_SET, NULL);
-
-        ULONG read = 0;
-        stream->Read(result.data(), size, &read);
+    if (bitmap->Save(pStream.get(), std::addressof(encoder), nullptr) != Gdiplus::Status::Ok) {
+        return std::vector<unsigned char>{};
     }
 
-    stream->Release();
+    STATSTG stg = {0};
+    LARGE_INTEGER offset = {0};
+    if (pStream->Stat(std::addressof(stg), STATFLAG_NONAME) != S_OK ||
+        pStream->Seek(offset, STREAM_SEEK_SET, nullptr) != S_OK) {
+        return std::vector<unsigned char>{};
+    }
+
+    std::vector<unsigned char> result(static_cast<std::size_t>(stg.cbSize.QuadPart));
+    ULONG ul;
+    if (pStream->Read(std::addressof(result[0]),
+                      static_cast<ULONG>(stg.cbSize.QuadPart), std::addressof(ul)) != S_OK ||
+        stg.cbSize.QuadPart != ul) {
+        return std::vector<unsigned char>{};
+    }
+
     return result;
+}
+
+// .lnk 快捷方式解析结果
+struct LnkIconInfo {
+    std::wstring targetPath;    // 快捷方式目标路径
+    std::wstring iconLocation;  // 自定义图标路径
+    int iconIndex;              // 自定义图标索引
+    DWORD targetAttributes;     // 目标文件属性（来自 .lnk 存储的数据）
+};
+
+// 解析 .lnk 快捷方式（使用独立 STA 线程，IShellLink 需要 COM STA）
+static LnkIconInfo ResolveLnkInfo(const std::wstring& lnkPath) {
+    LnkIconInfo info = { L"", L"", 0, 0 };
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    IShellLinkW* pShellLink = nullptr;
+    IPersistFile* pPersistFile = nullptr;
+
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IShellLinkW, reinterpret_cast<void**>(&pShellLink));
+    if (SUCCEEDED(hr) && pShellLink) {
+        hr = pShellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&pPersistFile));
+        if (SUCCEEDED(hr) && pPersistFile) {
+            hr = pPersistFile->Load(lnkPath.c_str(), STGM_READ);
+            if (SUCCEEDED(hr)) {
+                // 获取自定义图标位置
+                WCHAR iconPath[MAX_PATH] = {0};
+                int iconIdx = 0;
+                hr = pShellLink->GetIconLocation(iconPath, MAX_PATH, &iconIdx);
+                if (SUCCEEDED(hr) && iconPath[0] != L'\0') {
+                    // 展开环境变量（如 %SystemRoot%）
+                    WCHAR expandedIconPath[MAX_PATH] = {0};
+                    DWORD expandedLen = ExpandEnvironmentStringsW(iconPath, expandedIconPath, MAX_PATH);
+                    if (expandedLen > 0 && expandedLen <= MAX_PATH) {
+                        info.iconLocation = expandedIconPath;
+                    } else {
+                        info.iconLocation = iconPath;
+                    }
+                    info.iconIndex = iconIdx;
+                }
+
+                // 获取目标路径（使用默认标志以展开环境变量）
+                WCHAR targetPath[MAX_PATH] = {0};
+                WIN32_FIND_DATAW findData = {0};
+                hr = pShellLink->GetPath(targetPath, MAX_PATH, &findData, 0);
+                if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
+                    info.targetPath = targetPath;
+                    info.targetAttributes = findData.dwFileAttributes;
+                }
+            }
+            pPersistFile->Release();
+        }
+        pShellLink->Release();
+    }
+
+    CoUninitialize();
+    return info;
+}
+
+// 判断文件扩展名是否为 .lnk（不区分大小写）
+static bool IsLnkFile(const std::wstring& path) {
+    if (path.size() < 4) return false;
+    std::wstring ext = path.substr(path.size() - 4);
+    for (auto& c : ext) c = towlower(c);
+    return ext == L".lnk";
 }
 
 // 判断是否为网络路径（UNC 路径或映射的网络驱动器）
@@ -3686,85 +3698,104 @@ static bool IsNetworkPath(const std::wstring& path) {
 }
 
 // 从文件路径提取图标 (PNG Buffer)
-// 参数: path (string)
-static std::vector<unsigned char> ExtractIconFromPath(const std::wstring& path) {
+// 参数: path (string), size (number: 16 | 32 | 64 | 256)
+static std::vector<unsigned char> ExtractIconFromPath(std::wstring widePath, int size) {
+    // 如果是 .lnk 快捷方式，解析自定义图标或目标路径
+    DWORD targetAttrs = 0;
+    if (IsLnkFile(widePath)) {
+        LnkIconInfo lnkInfo = ResolveLnkInfo(widePath);
 
-    SHFILEINFOW sfi = {};
-    if (!SHGetFileInfoW(
-            path.c_str(),
-            0,
-            &sfi,
-            sizeof(sfi),
-            SHGFI_SYSICONINDEX | SHGFI_ICON))
-    {
-        return {};
+        // 优先使用快捷方式自定义图标（PrivateExtractIconsW 直接提取，无叠加箭头）
+        // 跳过网络路径上的图标文件，避免网络不可达时长时间阻塞
+        if (!lnkInfo.iconLocation.empty() && !IsNetworkPath(lnkInfo.iconLocation)) {
+            HICON hIcon = nullptr;
+            UINT extracted = PrivateExtractIconsW(
+                lnkInfo.iconLocation.c_str(), lnkInfo.iconIndex,
+                size, size, &hIcon, nullptr, 1, 0);
+            if (extracted > 0 && hIcon) {
+                auto pngData = HIconToPNG(hIcon);
+                DestroyIcon(hIcon);
+                return pngData;
+            }
+        }
+
+        // 回退：使用目标路径（避免 SHGetFileInfoW 对 .lnk 叠加箭头）
+        if (!lnkInfo.targetPath.empty()) {
+            widePath = lnkInfo.targetPath;
+            targetAttrs = lnkInfo.targetAttributes;
+        }
     }
 
-    IImageList* imageList = nullptr;
-    if (FAILED(SHGetImageList(SHIL_SMALL, IID_IImageList, (void**)&imageList))) {
-        DestroyIcon(sfi.hIcon);
-        return {};
+    UINT flag = SHGFI_ICON;
+
+    switch (size) {
+        case 16:
+            flag |= SHGFI_SMALLICON;
+            break;
+        case 32:
+            flag |= SHGFI_LARGEICON;
+            break;
+        case 64:
+        case 256:
+            flag |= SHGFI_SYSICONINDEX;
+            break;
+        default:
+            flag |= SHGFI_LARGEICON;
+            break;
     }
 
+    SHFILEINFOW sfi = {0};
     HICON hIcon = nullptr;
-    if (FAILED(imageList->GetIcon(sfi.iIcon, ILD_TRANSPARENT, &hIcon))) {
-        imageList->Release();
+
+    // 网络路径优化：使用 SHGFI_USEFILEATTRIBUTES 根据扩展名获取关联图标，避免网络 I/O
+    bool isNetwork = IsNetworkPath(widePath);
+    if (isNetwork) {
+        DWORD fileAttr = (targetAttrs != 0) ? targetAttrs : FILE_ATTRIBUTE_NORMAL;
+        auto hr = SHGetFileInfoW(widePath.c_str(), fileAttr,
+            std::addressof(sfi), sizeof(sfi), flag | SHGFI_USEFILEATTRIBUTES);
+        if (hr == 0) {
+            return std::vector<unsigned char>{};
+        }
+    } else {
+        auto hr = SHGetFileInfoW(widePath.c_str(), 0, std::addressof(sfi), sizeof(sfi), flag);
+        if (hr == 0) {
+            // 回退：文件不存在或路径无效时，根据扩展名获取关联图标
+            memset(&sfi, 0, sizeof(sfi));
+            hr = SHGetFileInfoW(widePath.c_str(), FILE_ATTRIBUTE_NORMAL,
+                std::addressof(sfi), sizeof(sfi), flag | SHGFI_USEFILEATTRIBUTES);
+            if (hr == 0) {
+                return std::vector<unsigned char>{};
+            }
+        }
+    }
+
+    if (size == 16 || size == 32) {
+        hIcon = sfi.hIcon;
+    } else {
+        HIMAGELIST* imageList;
+        HRESULT hrImg = SHGetImageList(
+            size == 64 ? SHIL_EXTRALARGE : SHIL_JUMBO,
+            IID_IImageList,
+            static_cast<void**>(static_cast<void*>(std::addressof(imageList))));
+
+        if (FAILED(hrImg)) {
+            DestroyIcon(sfi.hIcon);
+            return std::vector<unsigned char>{};
+        }
+
+        hrImg = static_cast<IImageList*>(static_cast<void*>(imageList))
+            ->GetIcon(sfi.iIcon, ILD_TRANSPARENT, std::addressof(hIcon));
+
         DestroyIcon(sfi.hIcon);
-        return {};
+
+        if (FAILED(hrImg)) {
+            return std::vector<unsigned char>{};
+        }
     }
 
-    imageList->Release();
-    DestroyIcon(sfi.hIcon);
-
-    auto png = HIconToPNG(hIcon);
+    auto pngData = HIconToPNG(hIcon);
     DestroyIcon(hIcon);
-
-    return png;
-}
-
-static bool ResolveLnk(const std::wstring& path, std::wstring& target) {
-    CoInitialize(NULL);
-
-    IShellLinkW* psl;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
-        IID_IShellLinkW, (void**)&psl))) {
-        CoUninitialize();
-        return false;
-    }
-
-    IPersistFile* ppf;
-    if (FAILED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
-        psl->Release();
-        CoUninitialize();
-        return false;
-    }
-
-    if (FAILED(ppf->Load(path.c_str(), STGM_READ))) {
-        ppf->Release();
-        psl->Release();
-        CoUninitialize();
-        return false;
-    }
-
-    WCHAR buf[MAX_PATH];
-    if (SUCCEEDED(psl->GetPath(buf, MAX_PATH, NULL, 0))) {
-        target = buf;
-    }
-
-    ppf->Release();
-    psl->Release();
-    CoUninitialize();
-
-    return !target.empty();
-}
-
-static bool IsLnkPath(const std::wstring& path) {
-    if (path.length() < 4) return false;
-
-    return _wcsicmp(
-        path.c_str() + path.length() - 4,
-        L".lnk"
-    ) == 0;
+    return pngData;
 }
 
 class IconWorker : public Napi::AsyncWorker {
@@ -3772,21 +3803,12 @@ class IconWorker : public Napi::AsyncWorker {
         IconWorker(const std::wstring& path, Napi::Env env, Napi::Promise::Deferred deferred)
             : Napi::AsyncWorker(env), path_(path), deferred_(deferred) {}
         void Execute() override {
-            CoInitialize(NULL);  // 关键
-
-            if (IsLnkPath(path_)) {
-                std::wstring target;
-                if (ResolveLnk(path_, target)) {
-                    path_ = target;
-                }
-            }
-
-            result_ = ExtractIconFromPath(path_);
-            CoUninitialize();
+            result_ = ExtractIconFromPath(path_,32);
         }
         void OnOK() override {
             if (result_.empty()) {
-                deferred_.Reject(Napi::String::New(Env(), "Failed"));
+                auto emptyBuffer = Napi::Buffer<unsigned char>::New(Env(), 0);
+                deferred_.Resolve(emptyBuffer);
                 return;
             }
             auto buffer = Napi::Buffer<unsigned char>::Copy(
@@ -3807,12 +3829,11 @@ Napi::Value GetFileIcon(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
     if (info.Length() < 1 || !info[0].IsString()) {
-        Napi::TypeError::New(env, "Path required").ThrowAsJavaScriptException();
-        return env.Null();
+        Napi::TypeError::New(env, "Expected file path (string) as first argument").ThrowAsJavaScriptException();
+        return env.Undefined();
     }
 
-    std::string path = info[0].As<Napi::String>();
-
+    std::string path = info[0].As<Napi::String>().Utf8Value();
     int size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
     std::wstring wpath(size - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], size);
