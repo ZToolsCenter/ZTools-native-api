@@ -424,34 +424,26 @@ class ScreenCapture {
 // 应用图标提取类
 class IconExtractor {
   /**
-   * 获取文件/应用的图标（PNG 格式 Buffer）
+   * 异步获取文件/应用的图标（PNG 格式 Buffer）
    * @param {string} filePath - 文件路径（可以是 .exe、.lnk、.dll 或任何文件类型）
-   * @param {number} [size=32] - 图标尺寸：16 | 32 | 64 | 256
-   * @returns {Buffer|null} PNG 格式的图标数据，失败时返回 null
+   * @returns {Promise<Buffer>} Promise，resolve 为 PNG 格式的图标数据
    * @example
    * // 获取 exe 的 32x32 图标
-   * const icon = IconExtractor.getFileIcon('C:\\Windows\\notepad.exe');
-   *
-   * // 获取 256x256 大图标
-   * const largeIcon = IconExtractor.getFileIcon('C:\\Windows\\notepad.exe', 256);
+   * const icon = await IconExtractor.getFileIcon('C:\\Windows\\notepad.exe');
    *
    * // 保存为文件
    * const fs = require('fs');
-   * const icon = IconExtractor.getFileIcon('C:\\Windows\\notepad.exe', 256);
+   * const icon = await IconExtractor.getFileIcon('C:\\Windows\\notepad.exe');
    * if (icon) fs.writeFileSync('icon.png', icon);
    */
-  static getFileIcon(filePath, size = 32) {
+  static getFileIcon(filePath) {
     if (platform !== 'win32') {
       throw new Error('getFileIcon is only supported on Windows');
     }
     if (typeof filePath !== 'string' || !filePath) {
       throw new TypeError('filePath must be a non-empty string');
     }
-    const validSizes = [16, 32, 64, 256];
-    if (!validSizes.includes(size)) {
-      throw new TypeError(`size must be one of: ${validSizes.join(', ')}`);
-    }
-    return addon.getFileIcon(filePath, size);
+    return addon.getFileIcon(filePath);
   }
 }
 
