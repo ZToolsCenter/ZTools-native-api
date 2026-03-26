@@ -3111,34 +3111,11 @@ static std::wstring ResolveIndirectString(const std::wstring& raw, const std::ws
 static std::wstring FindBestLogo(const std::wstring& installLocation, const std::wstring& logoRelPath) {
     if (installLocation.empty() || logoRelPath.empty()) return L"";
 
-    // 构建完整路径
-    std::wstring fullPath = installLocation + L"\\" + logoRelPath;
-
-    // 检查原路径是否直接存在
-    if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return fullPath;
-    }
-
-    // UWP 图标常见的缩放后缀变体
-    // 例如 Assets\StoreLogo.png -> Assets\StoreLogo.scale-100.png
-    size_t dotPos = fullPath.find_last_of(L'.');
-    if (dotPos == std::wstring::npos) return L"";
-
-    std::wstring basePath = fullPath.substr(0, dotPos);
-    std::wstring ext = fullPath.substr(dotPos);
-
     // 按照优先级尝试不同的 scale 后缀
     const wchar_t* scales[] = {
         L".scale-100", L".scale-125", L".scale-150",
         L".scale-200", L".scale-400"
     };
-
-    for (const wchar_t* scale : scales) {
-        std::wstring candidate = basePath + scale + ext;
-        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            return candidate;
-        }
-    }
 
     // 尝试 targetsize 变体
     const wchar_t* sizes[] = {
@@ -3147,18 +3124,56 @@ static std::wstring FindBestLogo(const std::wstring& installLocation, const std:
         L".targetsize-16"
     };
 
-    for (const wchar_t* sz : sizes) {
-        std::wstring candidate = basePath + sz + ext;
-        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            return candidate;
+    auto tryResolvePath = [&](const std::wstring& fullPath) -> std::wstring {
+        if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return fullPath;
         }
+
+        // UWP 图标常见的缩放后缀变体
+        // 例如 Assets\StoreLogo.png -> Assets\StoreLogo.scale-100.png
+        size_t dotPos = fullPath.find_last_of(L'.');
+        if (dotPos == std::wstring::npos) return L"";
+
+        std::wstring basePath = fullPath.substr(0, dotPos);
+        std::wstring ext = fullPath.substr(dotPos);
+
+        for (const wchar_t* scale : scales) {
+            std::wstring candidate = basePath + scale + ext;
+            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return candidate;
+            }
+        }
+
+        for (const wchar_t* sz : sizes) {
+            std::wstring candidate = basePath + sz + ext;
+            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return candidate;
+            }
+        }
+
+        for (const wchar_t* sz : sizes) {
+            std::wstring candidate = basePath + sz + L"_altform-unplated" + ext;
+            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return candidate;
+            }
+        }
+
+        return L"";
+    };
+
+    std::vector<std::wstring> relativeCandidates;
+    relativeCandidates.push_back(logoRelPath);
+
+    // 某些包的 manifest 写的是 PRODUCTION\Logo.png，但实际文件位于 images\PRODUCTION\...
+    if (logoRelPath.find(L"images\\") != 0 && logoRelPath.find(L"Images\\") != 0) {
+        relativeCandidates.push_back(L"images\\" + logoRelPath);
+        relativeCandidates.push_back(L"Images\\" + logoRelPath);
     }
 
-    // 尝试 altform-unplated 变体
-    for (const wchar_t* sz : sizes) {
-        std::wstring candidate = basePath + sz + L"_altform-unplated" + ext;
-        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            return candidate;
+    for (const auto& relativePath : relativeCandidates) {
+        std::wstring resolved = tryResolvePath(installLocation + L"\\" + relativePath);
+        if (!resolved.empty()) {
+            return resolved;
         }
     }
 
@@ -3352,6 +3367,7 @@ Napi::Value GetUwpApps(const Napi::CallbackInfo& info) {
                 searchPos = appBlockEnd;
                 continue;
             }
+            std::wstring executableRelPath = GetXmlAttribute(appBlock, L"Application", L"Executable");
 
             // 检查 AppListEntry 属性，跳过标记为 "none" 的内部入口
             std::wstring appListEntry = GetXmlAttribute(appBlock, L"uap:VisualElements", L"AppListEntry");
@@ -3404,6 +3420,14 @@ Napi::Value GetUwpApps(const Napi::CallbackInfo& info) {
 
             // 查找实际的图标文件
             std::wstring iconFullPath = FindBestLogo(std::wstring(installLocation), logoRelPath);
+            if (iconFullPath.empty()
+                && !executableRelPath.empty()
+                && std::wstring(installLocation).find(L"\\WindowsApps\\") != std::wstring::npos) {
+                std::wstring executableFullPath = std::wstring(installLocation) + L"\\" + executableRelPath;
+                if (GetFileAttributesW(executableFullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    iconFullPath = executableFullPath;
+                }
+            }
 
             // 跳过没有图标的应用（通常是系统基础设施组件，如 Win32WebViewHost）
             if (iconFullPath.empty()) {
