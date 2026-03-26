@@ -3629,53 +3629,49 @@ struct LnkIconInfo {
 static LnkIconInfo ResolveLnkInfo(const std::wstring& lnkPath) {
     LnkIconInfo info = { L"", L"", 0, 0 };
 
-    std::thread t([&lnkPath, &info]() {
-        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-        IShellLinkW* pShellLink = nullptr;
-        IPersistFile* pPersistFile = nullptr;
+    IShellLinkW* pShellLink = nullptr;
+    IPersistFile* pPersistFile = nullptr;
 
-        HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_IShellLinkW, reinterpret_cast<void**>(&pShellLink));
-        if (SUCCEEDED(hr) && pShellLink) {
-            hr = pShellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&pPersistFile));
-            if (SUCCEEDED(hr) && pPersistFile) {
-                hr = pPersistFile->Load(lnkPath.c_str(), STGM_READ);
-                if (SUCCEEDED(hr)) {
-                    // 获取自定义图标位置
-                    WCHAR iconPath[MAX_PATH] = {0};
-                    int iconIdx = 0;
-                    hr = pShellLink->GetIconLocation(iconPath, MAX_PATH, &iconIdx);
-                    if (SUCCEEDED(hr) && iconPath[0] != L'\0') {
-                        // 展开环境变量（如 %SystemRoot%）
-                        WCHAR expandedIconPath[MAX_PATH] = {0};
-                        DWORD expandedLen = ExpandEnvironmentStringsW(iconPath, expandedIconPath, MAX_PATH);
-                        if (expandedLen > 0 && expandedLen <= MAX_PATH) {
-                            info.iconLocation = expandedIconPath;
-                        } else {
-                            info.iconLocation = iconPath;
-                        }
-                        info.iconIndex = iconIdx;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IShellLinkW, reinterpret_cast<void**>(&pShellLink));
+    if (SUCCEEDED(hr) && pShellLink) {
+        hr = pShellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&pPersistFile));
+        if (SUCCEEDED(hr) && pPersistFile) {
+            hr = pPersistFile->Load(lnkPath.c_str(), STGM_READ);
+            if (SUCCEEDED(hr)) {
+                // 获取自定义图标位置
+                WCHAR iconPath[MAX_PATH] = {0};
+                int iconIdx = 0;
+                hr = pShellLink->GetIconLocation(iconPath, MAX_PATH, &iconIdx);
+                if (SUCCEEDED(hr) && iconPath[0] != L'\0') {
+                    // 展开环境变量（如 %SystemRoot%）
+                    WCHAR expandedIconPath[MAX_PATH] = {0};
+                    DWORD expandedLen = ExpandEnvironmentStringsW(iconPath, expandedIconPath, MAX_PATH);
+                    if (expandedLen > 0 && expandedLen <= MAX_PATH) {
+                        info.iconLocation = expandedIconPath;
+                    } else {
+                        info.iconLocation = iconPath;
                     }
-
-                    // 获取目标路径（使用默认标志以展开环境变量）
-                    WCHAR targetPath[MAX_PATH] = {0};
-                    WIN32_FIND_DATAW findData = {0};
-                    hr = pShellLink->GetPath(targetPath, MAX_PATH, &findData, 0);
-                    if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
-                        info.targetPath = targetPath;
-                        info.targetAttributes = findData.dwFileAttributes;
-                    }
+                    info.iconIndex = iconIdx;
                 }
-                pPersistFile->Release();
+
+                // 获取目标路径（使用默认标志以展开环境变量）
+                WCHAR targetPath[MAX_PATH] = {0};
+                WIN32_FIND_DATAW findData = {0};
+                hr = pShellLink->GetPath(targetPath, MAX_PATH, &findData, 0);
+                if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
+                    info.targetPath = targetPath;
+                    info.targetAttributes = findData.dwFileAttributes;
+                }
             }
-            pShellLink->Release();
+            pPersistFile->Release();
         }
+        pShellLink->Release();
+    }
 
-        CoUninitialize();
-    });
-    t.join();
-
+    CoUninitialize();
     return info;
 }
 
@@ -3703,16 +3699,7 @@ static bool IsNetworkPath(const std::wstring& path) {
 
 // 从文件路径提取图标 (PNG Buffer)
 // 参数: path (string), size (number: 16 | 32 | 64 | 256)
-static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, int size) {
-
-    // UTF-8 转宽字符
-    int wideSize = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
-    if (wideSize <= 0) {
-        return std::vector<unsigned char>{};
-    }
-    std::wstring widePath(wideSize - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &widePath[0], wideSize);
-
+static std::vector<unsigned char> ExtractIconFromPath(std::wstring widePath, int size) {
     // 如果是 .lnk 快捷方式，解析自定义图标或目标路径
     DWORD targetAttrs = 0;
     if (IsLnkFile(widePath)) {
@@ -3811,6 +3798,32 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
     return pngData;
 }
 
+class IconWorker : public Napi::AsyncWorker {
+    public:
+        IconWorker(const std::wstring& path, Napi::Env env, Napi::Promise::Deferred deferred)
+            : Napi::AsyncWorker(env), path_(path), deferred_(deferred) {}
+        void Execute() override {
+            result_ = ExtractIconFromPath(path_,32);
+        }
+        void OnOK() override {
+            if (result_.empty()) {
+                auto emptyBuffer = Napi::Buffer<unsigned char>::New(Env(), 0);
+                deferred_.Resolve(emptyBuffer);
+                return;
+            }
+            auto buffer = Napi::Buffer<unsigned char>::Copy(
+                Env(), result_.data(), result_.size());
+            deferred_.Resolve(buffer);
+        }
+        void OnError(const Napi::Error& e) override {
+            deferred_.Reject(e.Value());
+        }
+    private:
+        std::wstring path_;
+        std::vector<unsigned char> result_;
+        Napi::Promise::Deferred deferred_;
+};
+
 // N-API: getFileIcon(path: string, size?: number) => Buffer<PNG>
 Napi::Value GetFileIcon(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -3820,21 +3833,16 @@ Napi::Value GetFileIcon(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
-    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    std::string path = info[0].As<Napi::String>().Utf8Value();
+    int size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+    std::wstring wpath(size - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], size);
 
-    int size = 32; // 默认 32x32
-    if (info.Length() >= 2 && info[1].IsNumber()) {
-        size = info[1].As<Napi::Number>().Int32Value();
-    }
+    auto deferred = Napi::Promise::Deferred::New(env);
+    auto* worker = new IconWorker(wpath, env,deferred);
+    worker->Queue();
 
-    auto data = ExtractIconFromPath(filePath, size);
-
-    if (data.empty()) {
-        return env.Null();
-    }
-
-    return Napi::Buffer<char>::Copy(
-        env, reinterpret_cast<char*>(&data[0]), data.size());
+    return deferred.Promise();
 }
 
 // ==================== MUI 资源字符串解析 ====================
