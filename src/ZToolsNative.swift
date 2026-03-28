@@ -558,14 +558,15 @@ private var mouseMonitorRunLoop: CFRunLoop? = nil
 private var isMouseMonitoring = false
 
 // 当前监听配置
-private var mouseButtonType: String = ""   // "middle", "right", "back", "forward"
+private var mouseButtonType: String = ""   // "left", "middle", "right", "back", "forward"
 private var mouseLongPressMs: Int = 0      // 0=点击, >0=长按阈值
 private var mouseIsLongPress: Bool = false // 是否为长按模式
 private var mouseEventTypeName: String = "" // 回调事件名（如 "middleClick", "backLongPress"）
 
-// 按钮目标编号（CGEvent buttonNumber: 1=right, 2=middle, 3=back, 4=forward）
+// 按钮目标编号（CGEvent buttonNumber: 0=left, 1=right, 2=middle, 3=back, 4=forward）
 private var mouseTargetButton: Int64 = -1
 private var mouseTargetIsRight: Bool = false // 是否监听右键（右键事件类型不同）
+private var mouseTargetIsLeft: Bool = false  // 是否监听左键（左键事件类型不同）
 
 // 按钮状态（通过 mouseLock 保护跨线程访问）
 private var mouseLock = NSLock()
@@ -611,7 +612,10 @@ func mouseEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event
     var isTargetDown = false
     var isTargetUp = false
 
-    if mouseTargetIsRight {
+    if mouseTargetIsLeft {
+        isTargetDown = (type == .leftMouseDown)
+        isTargetUp = (type == .leftMouseUp)
+    } else if mouseTargetIsRight {
         isTargetDown = (type == .rightMouseDown)
         isTargetUp = (type == .rightMouseUp)
     } else {
@@ -720,7 +724,7 @@ func mouseEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event
 
 /// 启动鼠标监控
 /// - Parameters:
-///   - buttonType: 按钮类型（"middle", "right", "back", "forward"）
+///   - buttonType: 按钮类型（"left", "middle", "right", "back", "forward"）
 ///   - longPressMs: 长按阈值（毫秒），0 表示监听点击，>0 表示监听长按
 ///   - callback: 事件回调，传递事件类型字符串
 @_cdecl("startMouseMonitor")
@@ -744,20 +748,29 @@ public func startMouseMonitor(_ buttonType: UnsafePointer<CChar>?, _ longPressMs
 
     // 确定目标按钮和事件名
     switch button {
+    case "left":
+        mouseTargetButton = 0
+        mouseTargetIsLeft = true
+        mouseTargetIsRight = false
+        mouseEventTypeName = "leftLongPress"
     case "middle":
         mouseTargetButton = 2
+        mouseTargetIsLeft = false
         mouseTargetIsRight = false
         mouseEventTypeName = mouseIsLongPress ? "middleLongPress" : "middleClick"
     case "right":
         mouseTargetButton = 1
+        mouseTargetIsLeft = false
         mouseTargetIsRight = true
         mouseEventTypeName = "rightLongPress"
     case "back":
         mouseTargetButton = 3
+        mouseTargetIsLeft = false
         mouseTargetIsRight = false
         mouseEventTypeName = mouseIsLongPress ? "backLongPress" : "backClick"
     case "forward":
         mouseTargetButton = 4
+        mouseTargetIsLeft = false
         mouseTargetIsRight = false
         mouseEventTypeName = mouseIsLongPress ? "forwardLongPress" : "forwardClick"
     default:
@@ -769,7 +782,10 @@ public func startMouseMonitor(_ buttonType: UnsafePointer<CChar>?, _ longPressMs
     DispatchQueue.global(qos: .userInteractive).async {
         // 只监听目标按钮对应的事件类型
         var eventMask: CGEventMask = 0
-        if mouseTargetIsRight {
+        if mouseTargetIsLeft {
+            eventMask = (1 << CGEventType.leftMouseDown.rawValue) |
+                        (1 << CGEventType.leftMouseUp.rawValue)
+        } else if mouseTargetIsRight {
             eventMask = (1 << CGEventType.rightMouseDown.rawValue) |
                         (1 << CGEventType.rightMouseUp.rawValue)
         } else {

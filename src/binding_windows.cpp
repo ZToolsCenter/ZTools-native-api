@@ -2315,7 +2315,22 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         bool shouldBlock = false;
 
         // 根据按钮类型处理不同的鼠标事件
-        if (g_mouseButtonType == "middle") {
+        if (g_mouseButtonType == "left") {
+            if (wParam == WM_LBUTTONDOWN) {
+                g_mouseButtonPressed = true;
+                g_mousePressStartTime = std::chrono::steady_clock::now();
+                g_mouseLongPressTriggered = false;
+                shouldBlock = true;
+            } else if (wParam == WM_LBUTTONUP) {
+                if (g_mouseButtonPressed) {
+                    g_mouseButtonPressed = false;
+                    shouldBlock = true;
+                    if (!g_mouseLongPressTriggered) {
+                        g_mouseNeedReplay = true;
+                    }
+                }
+            }
+        } else if (g_mouseButtonType == "middle") {
             if (wParam == WM_MBUTTONDOWN) {
                 g_mouseButtonPressed = true;
                 g_mousePressStartTime = std::chrono::steady_clock::now();
@@ -2459,7 +2474,15 @@ void MouseMonitorThread() {
         if (g_mouseNeedReplay) {
             g_mouseNeedReplay = false;
             INPUT inputs[2] = {};
-            if (g_mouseButtonType == "middle") {
+            if (g_mouseButtonType == "left") {
+                inputs[0].type = INPUT_MOUSE;
+                inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                inputs[1].type = INPUT_MOUSE;
+                inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                inputs[1].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                SendInput(2, inputs, sizeof(INPUT));
+            } else if (g_mouseButtonType == "middle") {
                 inputs[0].type = INPUT_MOUSE;
                 inputs[0].mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
                 inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
@@ -2550,9 +2573,9 @@ Napi::Value StartMouseMonitor(const Napi::CallbackInfo& info) {
     g_mouseLongPressMs = info[1].As<Napi::Number>().Int32Value();
 
     // 验证按钮类型
-    if (g_mouseButtonType != "middle" && g_mouseButtonType != "right" &&
+    if (g_mouseButtonType != "left" && g_mouseButtonType != "middle" && g_mouseButtonType != "right" &&
         g_mouseButtonType != "back" && g_mouseButtonType != "forward") {
-        Napi::TypeError::New(env, "buttonType must be one of: middle, right, back, forward").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "buttonType must be one of: left, middle, right, back, forward").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
@@ -2565,6 +2588,12 @@ Napi::Value StartMouseMonitor(const Napi::CallbackInfo& info) {
     // 右键只支持长按
     if (g_mouseButtonType == "right" && g_mouseLongPressMs == 0) {
         Napi::TypeError::New(env, "'right' button only supports long press (longPressMs must be > 0)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // 左键只支持长按
+    if (g_mouseButtonType == "left" && g_mouseLongPressMs == 0) {
+        Napi::TypeError::New(env, "'left' button only supports long press (longPressMs must be > 0)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
