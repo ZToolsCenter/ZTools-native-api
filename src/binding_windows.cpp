@@ -79,6 +79,10 @@ static std::chrono::steady_clock::time_point g_mousePressStartTime;
 static std::atomic<bool> g_mouseLongPressTriggered(false);
 static bool g_mouseNeedReplay = false;
 static std::atomic<bool> g_mouseReplayOnRelease(false);
+static POINT g_mousePressPos = {0, 0};     // 左键按下时的鼠标位置
+static bool g_mouseMoved = false;          // 是否检测到位移超阈值
+static bool g_needReplayDown = false;      // 需要重放 mouseDown（拖拽模式恢复）
+static const long MOUSE_MOVE_THRESHOLD_SQ = 25; // 5px * 5px，避免 sqrt
 #define MOUSE_REPLAY_MAGIC 0x5A544F4F
 
 // 全局变量 - 取色器
@@ -2320,13 +2324,23 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_mouseButtonPressed = true;
                 g_mousePressStartTime = std::chrono::steady_clock::now();
                 g_mouseLongPressTriggered = false;
+                g_mouseMoved = false;
+                g_needReplayDown = false;
+                g_mousePressPos = pMouseStruct->pt;
                 shouldBlock = true;
             } else if (wParam == WM_LBUTTONUP) {
                 if (g_mouseButtonPressed) {
-                    g_mouseButtonPressed = false;
-                    shouldBlock = true;
-                    if (!g_mouseLongPressTriggered) {
-                        g_mouseNeedReplay = true;
+                    if (g_mouseMoved) {
+                        // 拖拽模式：mouseDown 已经重放，直接放行 mouseUp
+                        g_mouseButtonPressed = false;
+                        g_mouseMoved = false;
+                        shouldBlock = false;
+                    } else {
+                        g_mouseButtonPressed = false;
+                        shouldBlock = true;
+                        if (!g_mouseLongPressTriggered) {
+                            g_mouseNeedReplay = true;
+                        }
                     }
                 }
             }
@@ -2437,6 +2451,18 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
         }
 
+        // 左键：检测鼠标移动，超阈值则取消长按并切换到拖拽模式
+        if (g_mouseButtonType == "left" && wParam == WM_MOUSEMOVE &&
+            g_mouseButtonPressed && !g_mouseMoved && !g_mouseLongPressTriggered) {
+            long dx = (long)pMouseStruct->pt.x - (long)g_mousePressPos.x;
+            long dy = (long)pMouseStruct->pt.y - (long)g_mousePressPos.y;
+            if (dx * dx + dy * dy > MOUSE_MOVE_THRESHOLD_SQ) {
+                g_mouseMoved = true;
+                g_needReplayDown = true; // 消息循环负责发送 SendInput(LEFTDOWN)
+            }
+            // MOUSEMOVE 本身不拦截
+        }
+
         // 如果需要屏蔽事件，返回1
         if (shouldBlock) {
             return 1;
@@ -2468,6 +2494,16 @@ void MouseMonitorThread() {
                 g_isMouseMonitoring = false;
                 break;
             }
+        }
+
+        // 左键拖拽模式：重放被拦截的 LBUTTONDOWN，让应用正常处理后续拖拽
+        if (g_needReplayDown) {
+            g_needReplayDown = false;
+            INPUT inputs[1] = {};
+            inputs[0].type = INPUT_MOUSE;
+            inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+            inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+            SendInput(1, inputs, sizeof(INPUT));
         }
 
         // 长按未触发时，从消息循环中重放原始点击（不在钩子回调中调用 SendInput）
@@ -2521,8 +2557,8 @@ void MouseMonitorThread() {
             }
         }
 
-        // 检查长按
-        if (g_mouseLongPressMs > 0 && g_mouseButtonPressed && !g_mouseLongPressTriggered) {
+        // 检查长按（鼠标移动超阈值时跳过，避免拖拽触发超级面板）
+        if (g_mouseLongPressMs > 0 && g_mouseButtonPressed && !g_mouseLongPressTriggered && !g_mouseMoved) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_mousePressStartTime).count();
 
@@ -2659,6 +2695,8 @@ Napi::Value StopMouseMonitor(const Napi::CallbackInfo& info) {
     g_mouseLongPressTriggered = false;
     g_mouseNeedReplay = false;
     g_mouseReplayOnRelease = false;
+    g_mouseMoved = false;
+    g_needReplayDown = false;
     g_mouseButtonType.clear();
     g_mouseLongPressMs = 0;
 
