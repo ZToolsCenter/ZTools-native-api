@@ -52,6 +52,11 @@ static std::thread g_messageThread;
 static std::atomic<bool> g_isMonitoring(false);
 static napi_threadsafe_function g_tsfn = nullptr;
 
+// 剪贴板防抖：Edge 等浏览器复制时会分多次写入不同格式，
+// 每次写入都触发 WM_CLIPBOARDUPDATE，使用定时器合并为一次回调
+#define CLIPBOARD_DEBOUNCE_TIMER_ID 1
+#define CLIPBOARD_DEBOUNCE_MS 100
+
 // 全局变量 - 窗口监控
 static HWINEVENTHOOK g_winEventHook = NULL;
 static HWINEVENTHOOK g_winEventHookTitle = NULL;
@@ -97,12 +102,21 @@ static std::atomic<bool> g_colorPickerCallbackCalled(false);
 LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CLIPBOARDUPDATE:
-            // 剪贴板变化，通知 JS
-            if (g_tsfn != nullptr) {
-                napi_call_threadsafe_function(g_tsfn, nullptr, napi_tsfn_nonblocking);
+            // 剪贴板变化，使用防抖：重置定时器，延迟触发回调
+            // 这样如果短时间内收到多次 WM_CLIPBOARDUPDATE（如 Edge 复制地址栏），
+            // 只会在最后一次变化后触发一次回调
+            SetTimer(hwnd, CLIPBOARD_DEBOUNCE_TIMER_ID, CLIPBOARD_DEBOUNCE_MS, NULL);
+            return 0;
+        case WM_TIMER:
+            if (wParam == CLIPBOARD_DEBOUNCE_TIMER_ID) {
+                KillTimer(hwnd, CLIPBOARD_DEBOUNCE_TIMER_ID);
+                if (g_tsfn != nullptr) {
+                    napi_call_threadsafe_function(g_tsfn, nullptr, napi_tsfn_nonblocking);
+                }
             }
             return 0;
         case WM_DESTROY:
+            KillTimer(hwnd, CLIPBOARD_DEBOUNCE_TIMER_ID);
             PostQuitMessage(0);
             return 0;
     }
