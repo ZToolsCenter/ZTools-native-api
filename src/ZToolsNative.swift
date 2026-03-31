@@ -18,6 +18,83 @@ private var windowMonitorQueue: DispatchQueue?
 private var isWindowMonitoring = false
 private var lastBundleId: String = ""
 private var lastProcessId: pid_t = 0
+private let fileIconSize = NSSize(width: 80, height: 80)
+
+// MARK: - File Icon
+
+private func resizeImage(_ image: NSImage, to size: NSSize) -> NSImage? {
+    let newImage = NSImage(size: size)
+    newImage.lockFocus()
+    defer { newImage.unlockFocus() }
+
+    NSGraphicsContext.current?.imageInterpolation = .high
+    image.draw(
+        in: NSRect(origin: .zero, size: size),
+        from: .zero,
+        operation: .copy,
+        fraction: 1.0
+    )
+    return newImage
+}
+
+private func createFileIconPNGData(for input: String) -> Data? {
+    var image: NSImage?
+
+    if input.hasPrefix("/") {
+        image = NSWorkspace.shared.icon(forFile: input)
+    } else if input == "folder" {
+        image = NSWorkspace.shared.icon(forFileType: NSFileTypeForHFSTypeCode(fourCharCode("fldr")))
+    } else {
+        let normalizedType = input.hasPrefix(".") ? String(input.dropFirst()) : input
+        image = NSWorkspace.shared.icon(forFileType: normalizedType)
+    }
+
+    guard let sourceImage = image,
+          let resizedImage = resizeImage(sourceImage, to: fileIconSize),
+          let cgImage = resizedImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return nil
+    }
+
+    let rep = NSBitmapImageRep(cgImage: cgImage)
+    return rep.representation(using: .png, properties: [:])
+}
+
+private func fourCharCode(_ string: String) -> FourCharCode {
+    var result: FourCharCode = 0
+    for scalar in string.utf16 {
+        result = (result << 8) + FourCharCode(scalar)
+    }
+    return result
+}
+
+/// 获取文件/类型图标 PNG 数据，返回 malloc 分配的字节数组，调用方负责 free
+/// - Parameters:
+///   - input: 绝对路径、"folder" 或扩展名/类型标识
+///   - outLength: 输出字节长度
+/// - Returns: PNG 字节指针；失败返回 nil
+@_cdecl("fetchFileIcon")
+public func fetchFileIcon(
+    _ input: UnsafePointer<CChar>?,
+    _ outLength: UnsafeMutablePointer<UInt>?
+) -> UnsafeMutableRawPointer? {
+    guard let input = input, let outLength = outLength else { return nil }
+
+    let inputString = String(cString: input)
+    guard !inputString.isEmpty else { return nil }
+
+    return autoreleasepool {
+        guard let data = createFileIconPNGData(for: inputString), !data.isEmpty else {
+            return nil
+        }
+
+        let buffer = malloc(data.count)
+        guard let buffer = buffer else { return nil }
+
+        data.copyBytes(to: buffer.assumingMemoryBound(to: UInt8.self), count: data.count)
+        outLength.pointee = UInt(data.count)
+        return buffer
+    }
+}
 
 // MARK: - Clipboard Monitor
 

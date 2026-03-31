@@ -425,7 +425,7 @@ class ScreenCapture {
 class IconExtractor {
   /**
    * 异步获取文件/应用的图标（PNG 格式 Buffer）
-   * @param {string} filePath - 文件路径（可以是 .exe、.lnk、.dll 或任何文件类型）
+   * @param {string} filePath - 文件路径或类型（macOS 支持绝对路径、`folder`、`txt`、`pdf` 等）
    * @returns {Promise<Buffer>} Promise，resolve 为 PNG 格式的图标数据
    * @example
    * // 获取 exe 的 32x32 图标
@@ -437,8 +437,8 @@ class IconExtractor {
    * if (icon) fs.writeFileSync('icon.png', icon);
    */
   static getFileIcon(filePath) {
-    if (platform !== 'win32') {
-      throw new Error('getFileIcon is only supported on Windows');
+    if (platform !== 'win32' && platform !== 'darwin') {
+      throw new Error('getFileIcon is only supported on Windows and macOS');
     }
     if (typeof filePath !== 'string' || !filePath) {
       throw new TypeError('filePath must be a non-empty string');

@@ -29,6 +29,7 @@ typedef int (*SimulateMouseRightClickFunc)(double, double);        // 模拟鼠�
 typedef void (*ColorPickerCB)(const char *);                       // 取色器回调
 typedef void (*StartColorPickerFunc)(ColorPickerCB);               // 启动取色器
 typedef void (*StopColorPickerFunc)();                             // 停止取色器
+typedef void *(*FetchFileIconFunc)(const char *, size_t *);        // 获取文件图标 PNG
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -56,6 +57,7 @@ static SimulateMouseRightClickFunc simulateMouseRightClickFunc = nullptr;
 static napi_threadsafe_function colorPickerTsfn = nullptr;
 static StartColorPickerFunc startColorPickerFunc = nullptr;
 static StopColorPickerFunc stopColorPickerFunc = nullptr;
+static FetchFileIconFunc fetchFileIconFunc = nullptr;
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -289,6 +291,7 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (StartColorPickerFunc)dlsym(swiftLibHandle, "startColorPicker");
   stopColorPickerFunc =
       (StopColorPickerFunc)dlsym(swiftLibHandle, "stopColorPicker");
+  fetchFileIconFunc = (FetchFileIconFunc)dlsym(swiftLibHandle, "fetchFileIcon");
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
@@ -297,7 +300,7 @@ bool LoadSwiftLibrary(Napi::Env env) {
       !simulateMouseDoubleClickFunc || !simulateMouseRightClickFunc ||
       !startMouseMonitorFunc || !stopMouseMonitorFunc ||
       !startColorPickerFunc || !stopColorPickerFunc ||
-      !setClipboardFilesFunc) {
+      !setClipboardFilesFunc || !fetchFileIconFunc) {
     Napi::Error::New(env, "Failed to load Swift functions")
         .ThrowAsJavaScriptException();
     dlclose(swiftLibHandle);
@@ -969,6 +972,77 @@ Napi::Value UnicodeType(const Napi::CallbackInfo &info) {
   return Napi::Boolean::New(env, success == 1);
 }
 
+class FileIconWorker : public Napi::AsyncWorker {
+public:
+  FileIconWorker(const std::string &input, Napi::Env env,
+                 Napi::Promise::Deferred deferred)
+      : Napi::AsyncWorker(env), input_(input), deferred_(deferred) {}
+
+  ~FileIconWorker() override {
+    if (data_ != nullptr) {
+      free(data_);
+      data_ = nullptr;
+    }
+  }
+
+  void Execute() override {
+    if (fetchFileIconFunc == nullptr) {
+      SetError("fetchFileIcon is not available");
+      return;
+    }
+
+    size_t length = 0;
+    void *result = fetchFileIconFunc(input_.c_str(), &length);
+    if (result == nullptr || length == 0) {
+      SetError("get file icon failed");
+      return;
+    }
+
+    data_ = result;
+    length_ = length;
+  }
+
+  void OnOK() override {
+    Napi::Buffer<char> buffer = Napi::Buffer<char>::Copy(
+        Env(), reinterpret_cast<const char *>(data_), length_);
+    deferred_.Resolve(buffer);
+  }
+
+  void OnError(const Napi::Error &e) override { deferred_.Reject(e.Value()); }
+
+private:
+  std::string input_;
+  void *data_ = nullptr;
+  size_t length_ = 0;
+  Napi::Promise::Deferred deferred_;
+};
+
+Napi::Value GetFileIcon(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return env.Undefined();
+  }
+
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Expected file path or type as first argument (string)")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string input = info[0].As<Napi::String>().Utf8Value();
+  if (input.empty()) {
+    Napi::TypeError::New(env, "Expected non-empty file path or type")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto deferred = Napi::Promise::Deferred::New(env);
+  auto *worker = new FileIconWorker(input, env, deferred);
+  worker->Queue();
+  return deferred.Promise();
+}
+
 // 停止取色器
 Napi::Value StopColorPicker(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
@@ -1013,6 +1087,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("stopColorPicker", Napi::Function::New(env, StopColorPicker));
   exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
   exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
+  exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
   return exports;
 }
 
