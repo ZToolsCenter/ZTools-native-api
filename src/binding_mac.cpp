@@ -3,6 +3,7 @@
 #include <napi.h>
 #include <string>
 #include <vector>
+#include <unistd.h>  // For usleep
 
 // Swift 动态库函数类型定义
 typedef void (*ClipboardCallback)();          // 无参数回调
@@ -58,6 +59,7 @@ static napi_threadsafe_function colorPickerTsfn = nullptr;
 static StartColorPickerFunc startColorPickerFunc = nullptr;
 static StopColorPickerFunc stopColorPickerFunc = nullptr;
 static FetchFileIconFunc fetchFileIconFunc = nullptr;
+static bool g_isPaused = false; // 剪贴板监控暂停状态
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -71,7 +73,7 @@ void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
 
 // Swift 回调 -> 推送到线程安全队列
 void OnClipboardChanged() {
-  if (tsfn != nullptr) {
+  if (tsfn != nullptr && !g_isPaused) {
     // 不需要传递数据
     napi_call_threadsafe_function(tsfn, nullptr, napi_tsfn_nonblocking);
   }
@@ -359,7 +361,240 @@ Napi::Value StopMonitor(const Napi::CallbackInfo &info) {
     tsfn = nullptr;
   }
 
+  g_isPaused = false; // 重置暂停状态
+
   return env.Undefined();
+}
+
+// 暂停剪贴板监控
+Napi::Value PauseMonitor(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  g_isPaused = true;
+  return env.Undefined();
+}
+
+// 恢复剪贴板监控
+Napi::Value ResumeMonitor(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  g_isPaused = false;
+  return env.Undefined();
+}
+
+// ==================== 获取选中内容（Mac 实现）====================
+
+// 获取剪贴板文本内容
+std::string GetPasteboardText() {
+  FILE* pipe = popen("pbpaste", "r");
+  if (!pipe) return "";
+
+  std::string result;
+  char buffer[256];
+  while (fgets(buffer, sizeof(buffer), pipe)) {
+    result += buffer;
+  }
+  pclose(pipe);
+  return result;
+}
+
+// 获取剪贴板文件列表
+std::vector<std::string> GetPasteboardFiles() {
+  std::vector<std::string> result;
+
+  // 使用 osascript 获取文件列表
+  FILE* pipe = popen("osascript -e 'try' -e 'set theList to (the clipboard as «class furl») as list' -e 'set output to \"\"' -e 'repeat with aFile in theList' -e 'set output to output & POSIX path of aFile & linefeed' -e 'end repeat' -e 'return output' -e 'end try'", "r");
+  if (!pipe) return result;
+
+  char buffer[1024];
+  while (fgets(buffer, sizeof(buffer), pipe)) {
+    std::string line = buffer;
+    // 移除换行符
+    if (!line.empty() && line[line.length() - 1] == '\n') {
+      line.erase(line.length() - 1);
+    }
+    if (!line.empty()) {
+      result.push_back(line);
+    }
+  }
+  pclose(pipe);
+  return result;
+}
+
+// 获取剪贴板图像（base64 PNG）
+std::string GetPasteboardImage() {
+  // 使用临时文件保存图像
+  std::string tmpFile = "/tmp/ztools_clipboard_image.png";
+
+  // 使用 osascript 保存剪贴板图像为 PNG
+  std::string cmd = "osascript -e 'try' -e 'set imgData to the clipboard as «class PNGf»' -e 'set outFile to open for access POSIX file \"" + tmpFile + "\" with write permission' -e 'set eof outFile to 0' -e 'write imgData to outFile' -e 'close access outFile' -e 'end try'";
+  int ret = system(cmd.c_str());
+
+  if (ret != 0) return "";
+
+  // 读取文件并转换为 base64
+  FILE* file = fopen(tmpFile.c_str(), "rb");
+  if (!file) return "";
+
+  fseek(file, 0, SEEK_END);
+  long size = ftell(file);
+  fseek(file, 0, SEEK_SET);
+
+  if (size <= 0) {
+    fclose(file);
+    unlink(tmpFile.c_str());
+    return "";
+  }
+
+  std::vector<unsigned char> buffer(size);
+  fread(buffer.data(), 1, size, file);
+  fclose(file);
+  unlink(tmpFile.c_str());
+
+  // Base64 编码
+  const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string result;
+  int idx = 0;
+  unsigned char char_array_3[3];
+  unsigned char char_array_4[4];
+
+  for (unsigned char c : buffer) {
+    char_array_3[idx++] = c;
+    if (idx == 3) {
+      char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+      char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+      char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+      char_array_4[3] = char_array_3[2] & 0x3f;
+
+      for (int k = 0; k < 4; k++) {
+        result += base64_chars[char_array_4[k]];
+      }
+      idx = 0;
+    }
+  }
+
+  if (idx) {
+    for (int j = idx; j < 3; j++) {
+      char_array_3[j] = '\0';
+    }
+
+    char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+    char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+    char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+
+    for (int j = 0; j < idx + 1; j++) {
+      result += base64_chars[char_array_4[j]];
+    }
+
+    while (idx++ < 3) {
+      result += '=';
+    }
+  }
+
+  return result;
+}
+
+// 获取选中内容（Mac 实现 - 使用模拟复制）
+Napi::Value GetSelectedContent(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  Napi::Array result = Napi::Array::New(env);
+
+  if (!LoadSwiftLibrary(env)) {
+    return result;
+  }
+
+  // 暂停监控以防止触发自身事件
+  bool wasMonitoring = (tsfn != nullptr && !g_isPaused);
+  if (wasMonitoring) {
+    g_isPaused = true;
+  }
+
+  // 保存原剪贴板内容
+  std::string originalText = GetPasteboardText();
+  std::vector<std::string> originalFiles = GetPasteboardFiles();
+  std::string originalImage = GetPasteboardImage();
+
+  // 清空剪贴板
+  system("pbcopy < /dev/null");
+
+  // 模拟 Cmd+C（使用 simulateKeyboardTap）
+  if (simulateKeyboardTapFunc != nullptr) {
+    simulateKeyboardTapFunc("c", "meta");
+
+    // 等待剪贴板更新
+    usleep(100000); // 100ms
+
+    // 读取新的剪贴板内容
+    std::string newText = GetPasteboardText();
+    std::vector<std::string> newFiles = GetPasteboardFiles();
+    std::string newImage = GetPasteboardImage();
+
+    uint32_t index = 0;
+
+    // 检查文本
+    if (!newText.empty() && newText != originalText) {
+      Napi::Object item = Napi::Object::New(env);
+      item.Set("type", "text");
+      item.Set("data", newText);
+      result.Set(index++, item);
+    }
+
+    // 检查文件
+    if (!newFiles.empty()) {
+      bool isDifferent = (newFiles.size() != originalFiles.size());
+      if (!isDifferent) {
+        for (size_t i = 0; i < newFiles.size(); i++) {
+          if (newFiles[i] != originalFiles[i]) {
+            isDifferent = true;
+            break;
+          }
+        }
+      }
+
+      if (isDifferent) {
+        Napi::Object item = Napi::Object::New(env);
+        item.Set("type", "file");
+        Napi::Array fileArray = Napi::Array::New(env);
+        for (size_t i = 0; i < newFiles.size(); i++) {
+          fileArray.Set(uint32_t(i), newFiles[i]);
+        }
+        item.Set("data", fileArray);
+        result.Set(index++, item);
+      }
+    }
+
+    // 检查图像
+    if (!newImage.empty() && newImage != originalImage) {
+      Napi::Object item = Napi::Object::New(env);
+      item.Set("type", "image");
+      item.Set("data", newImage);
+      item.Set("format", "png");
+      item.Set("encoding", "base64");
+      result.Set(index++, item);
+    }
+  }
+
+  // 恢复原剪贴板内容
+  if (!originalText.empty()) {
+    // 转义单引号
+    std::string escapedText = originalText;
+    size_t pos = 0;
+    while ((pos = escapedText.find("'", pos)) != std::string::npos) {
+      escapedText.replace(pos, 1, "'\\''");
+      pos += 4;
+    }
+    std::string cmd = "printf '%s' '" + escapedText + "' | pbcopy";
+    system(cmd.c_str());
+  } else if (!originalFiles.empty()) {
+    // 恢复文件列表比较复杂，这里简化处理
+    // 实际应用中可能需要更完善的实现
+  }
+
+  // 恢复监控状态
+  if (wasMonitoring) {
+    usleep(50000); // 50ms 延迟
+    g_isPaused = false;
+  }
+
+  return result;
 }
 
 // 获取当前激活窗口
@@ -1063,6 +1298,8 @@ Napi::Value StopColorPicker(const Napi::CallbackInfo &info) {
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
   exports.Set("stopMonitor", Napi::Function::New(env, StopMonitor));
+  exports.Set("pauseMonitor", Napi::Function::New(env, PauseMonitor));
+  exports.Set("resumeMonitor", Napi::Function::New(env, ResumeMonitor));
   exports.Set("startWindowMonitor",
               Napi::Function::New(env, StartWindowMonitor));
   exports.Set("stopWindowMonitor", Napi::Function::New(env, StopWindowMonitor));
@@ -1088,6 +1325,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
   exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
   exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
+  exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
   return exports;
 }
 

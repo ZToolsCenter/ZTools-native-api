@@ -11,6 +11,10 @@ macOS 和 Windows 原生 API 的 Node.js 封装，使用 Swift + Win32 API + Nod
 5. **键盘模拟** - 模拟键盘按键和快捷键（支持修饰键）
 6. **粘贴模拟** - 模拟 Cmd+V (macOS) / Ctrl+V (Windows)
 7. **区域截图** - 选区截图并自动保存到剪贴板（Windows）
+8. **获取选中内容** - 获取当前选中的文本、文件或图像（支持 Cursor/VS Code 等编辑器）
+9. **鼠标监控** - 实时监听鼠标移动、点击事件
+10. **鼠标模拟** - 模拟鼠标移动、点击操作
+11. **取色器** - 全屏取色工具
 
 ## 🔧 系统要求
 
@@ -106,6 +110,25 @@ ScreenCapture.start((result) => {
   }
 });
 // 操作：拖拽选择区域后释放鼠标，或按 ESC 取消
+
+// 8. 获取选中内容（支持文本、文件、图像）
+const { getSelectedContent } = require('ztools-native-api');
+
+// 在任意应用中选中内容后调用
+const contents = getSelectedContent();
+contents.forEach(item => {
+  switch (item.type) {
+    case 'text':
+      console.log('选中的文本:', item.data);
+      break;
+    case 'file':
+      console.log('选中的文件:', item.data);
+      break;
+    case 'image':
+      console.log('选中的图像 (base64):', item.data.substring(0, 50) + '...');
+      break;
+  }
+});
 ```
 
 ### 跨平台兼容示例
@@ -290,6 +313,66 @@ ScreenCapture.start((result) => {
 });
 ```
 
+---
+
+### `getSelectedContent()`
+
+#### `getSelectedContent()`
+获取当前选中的内容（支持文本、文件、图像）
+- **返回值**: `Array<{type: string, data: any}>` - 选中内容数组
+  - `type`: 'text' | 'file' | 'image'
+  - `data`: 根据类型不同：
+    - text: 字符串
+    - file: 文件路径字符串数组
+    - image: base64 编码的 PNG 图像（带 format 和 encoding 字段）
+- **平台**: ✅ Windows 和 macOS
+
+**功能说明**：
+- **Windows**: 优先使用 UI Automation API，回退到剪贴板方法
+  - 适用于标准 Windows 控件和 Electron/Chromium 应用（Cursor、VS Code 等）
+- **macOS**: 使用模拟复制方法（Cmd+C）
+- 自动暂停内部的 clipboardMonitor，防止误触发监听自身发起的事件
+- 操作后会恢复原剪贴板内容
+
+**示例**:
+```javascript
+const { getSelectedContent } = require('ztools-native-api');
+
+// 在用户选中内容后调用
+const contents = getSelectedContent();
+
+contents.forEach((item, index) => {
+  console.log(`[${index + 1}] 类型: ${item.type}`);
+  
+  switch (item.type) {
+    case 'text':
+      console.log('文本内容:', item.data);
+      console.log('文本长度:', item.data.length);
+      break;
+      
+    case 'file':
+      console.log('文件列表:');
+      item.data.forEach((path, i) => {
+        console.log(`  ${i + 1}. ${path}`);
+      });
+      break;
+      
+    case 'image':
+      console.log('图像格式:', item.format);  // 'png'
+      console.log('编码方式:', item.encoding); // 'base64'
+      console.log('数据长度:', item.data.length);
+      // 可以直接用于 <img src="data:image/png;base64,..." />
+      break;
+  }
+});
+```
+
+**支持的应用**:
+- ✅ Windows: 记事本、Word、Excel、Edge、Chrome、Firefox、VS Code、Notepad++、**Cursor**、**任何 Electron 应用**
+- ✅ macOS: 所有支持标准复制快捷键（Cmd+C）的应用
+- ✅ 支持文件资源管理器/Finder 中选中的文件
+- ✅ 支持图像编辑器中选中的图像区域
+
 
 ## 🧪 测试
 
@@ -299,6 +382,7 @@ npm test
 # 或运行特定测试
 node test/test-keyboard.js         # 完整键盘测试
 node test/test-keyboard-simple.js  # 简单键盘测试
+node test/test-selected-content.js # 获取选中内容测试
 ```
 
 ## ⚠️ 平台差异
@@ -310,6 +394,7 @@ node test/test-keyboard-simple.js  # 简单键盘测试
 | **剪贴板监控** | 轮询 `changeCount` | 消息循环 + `WM_CLIPBOARDUPDATE` |
 | **键盘模拟** | ✅ 需要辅助功能权限 | ✅ 无需特殊权限 |
 | **区域截图** | ❌ 暂不支持 | ✅ 支持（分层窗口 + GDI） |
+| **获取选中内容** | ✅ 支持（模拟复制） | ✅ 支持（UI Automation + 剪贴板回退） |
 | **权限要求** | 辅助功能权限（键盘模拟） | 无特殊要求 |
 
 ## 📝 注意事项

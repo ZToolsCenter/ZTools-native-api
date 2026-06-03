@@ -50,6 +50,7 @@ namespace Gdiplus {
 static HWND g_hwnd = NULL;
 static std::thread g_messageThread;
 static std::atomic<bool> g_isMonitoring(false);
+static std::atomic<bool> g_isPaused(false);  // 新增：暂停状态
 static napi_threadsafe_function g_tsfn = nullptr;
 
 // 剪贴板防抖：Edge 等浏览器复制时会分多次写入不同格式，
@@ -110,7 +111,8 @@ LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_TIMER:
             if (wParam == CLIPBOARD_DEBOUNCE_TIMER_ID) {
                 KillTimer(hwnd, CLIPBOARD_DEBOUNCE_TIMER_ID);
-                if (g_tsfn != nullptr) {
+                // 仅在未暂停时触发回调
+                if (g_tsfn != nullptr && !g_isPaused) {
                     napi_call_threadsafe_function(g_tsfn, nullptr, napi_tsfn_nonblocking);
                 }
             }
@@ -227,6 +229,7 @@ Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
     g_isMonitoring = false;
+    g_isPaused = false;  // 重置暂停状态
 
     if (g_hwnd != NULL) {
         PostMessageW(g_hwnd, WM_QUIT, 0, 0);
@@ -241,6 +244,20 @@ Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
         g_tsfn = nullptr;
     }
 
+    return env.Undefined();
+}
+
+// 暂停剪贴板监控（不触发回调，但保持监控线程运行）
+Napi::Value PauseMonitor(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    g_isPaused = true;
+    return env.Undefined();
+}
+
+// 恢复剪贴板监控
+Napi::Value ResumeMonitor(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    g_isPaused = false;
     return env.Undefined();
 }
 
@@ -2705,6 +2722,407 @@ WORD GetVirtualKeyCode(const std::string& key) {
     return 0;  // 未知键
 }
 
+// ==================== 获取选中内容功能 ====================
+
+// UI Automation 接口（延迟加载）
+#include <uiautomation.h>
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "crypt32.lib")  // For CryptBinaryToStringA
+
+// ==================== 剪贴板内容读取辅助函数 ====================
+
+// 读取剪贴板文本内容
+std::string GetClipboardTextContent() {
+    std::string result;
+
+    if (!OpenClipboard(NULL)) {
+        return result;
+    }
+
+    // 尝试读取 Unicode 文本
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+        if (hData != NULL) {
+            wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
+            if (pszText != NULL) {
+                int utf8Size = WideCharToMultiByte(CP_UTF8, 0, pszText, -1, nullptr, 0, nullptr, nullptr);
+                if (utf8Size > 0) {
+                    result.resize(utf8Size - 1);
+                    WideCharToMultiByte(CP_UTF8, 0, pszText, -1, &result[0], utf8Size, nullptr, nullptr);
+                }
+                GlobalUnlock(hData);
+            }
+        }
+    }
+    // 回退到 ANSI 文本
+    else if (IsClipboardFormatAvailable(CF_TEXT)) {
+        HANDLE hData = GetClipboardData(CF_TEXT);
+        if (hData != NULL) {
+            char* pszText = static_cast<char*>(GlobalLock(hData));
+            if (pszText != NULL) {
+                result = pszText;
+                GlobalUnlock(hData);
+            }
+        }
+    }
+
+    CloseClipboard();
+    return result;
+}
+
+// 读取剪贴板图像内容（返回 base64 编码的 PNG）
+std::string GetClipboardImageContent() {
+    std::string result;
+
+    if (!OpenClipboard(NULL)) {
+        return result;
+    }
+
+    HBITMAP hBitmap = NULL;
+
+    // 尝试获取位图
+    if (IsClipboardFormatAvailable(CF_BITMAP)) {
+        hBitmap = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+    } else if (IsClipboardFormatAvailable(CF_DIB)) {
+        HANDLE hDIB = GetClipboardData(CF_DIB);
+        if (hDIB != NULL) {
+            BITMAPINFO* pBMI = static_cast<BITMAPINFO*>(GlobalLock(hDIB));
+            if (pBMI != NULL) {
+                HDC hDC = GetDC(NULL);
+                void* pBits = reinterpret_cast<BYTE*>(pBMI) + pBMI->bmiHeader.biSize;
+                hBitmap = CreateDIBitmap(hDC, &pBMI->bmiHeader, CBM_INIT, pBits, pBMI, DIB_RGB_COLORS);
+                ReleaseDC(NULL, hDC);
+                GlobalUnlock(hDIB);
+            }
+        }
+    }
+
+    if (hBitmap != NULL) {
+        // 使用 GDI+ 将位图转换为 PNG base64
+        Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromHBITMAP(hBitmap, NULL);
+        if (bitmap != NULL) {
+            IStream* pStream = NULL;
+            if (CreateStreamOnHGlobal(NULL, TRUE, &pStream) == S_OK) {
+                CLSID pngClsid;
+                CLSIDFromString(L"{557CF406-1A04-11D3-9A73-0000F81EF32E}", &pngClsid);
+
+                if (bitmap->Save(pStream, &pngClsid, NULL) == Gdiplus::Ok) {
+                    HGLOBAL hGlobal = NULL;
+                    if (GetHGlobalFromStream(pStream, &hGlobal) == S_OK) {
+                        SIZE_T size = GlobalSize(hGlobal);
+                        void* pData = GlobalLock(hGlobal);
+                        if (pData != NULL) {
+                            // Base64 编码
+                            DWORD base64Size = 0;
+                            CryptBinaryToStringA(static_cast<BYTE*>(pData), size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &base64Size);
+                            if (base64Size > 0) {
+                                result.resize(base64Size);
+                                CryptBinaryToStringA(static_cast<BYTE*>(pData), size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &result[0], &base64Size);
+                                result.resize(base64Size - 1); // 移除 null terminator
+                            }
+                            GlobalUnlock(hGlobal);
+                        }
+                    }
+                }
+                pStream->Release();
+            }
+            delete bitmap;
+        }
+
+        if (IsClipboardFormatAvailable(CF_BITMAP)) {
+            // CF_BITMAP 不需要删除，由系统管理
+        } else {
+            DeleteObject(hBitmap);
+        }
+    }
+
+    CloseClipboard();
+    return result;
+}
+
+// 读取剪贴板文件列表
+std::vector<std::string> GetClipboardFilesList() {
+    std::vector<std::string> result;
+
+    if (!OpenClipboard(NULL)) {
+        return result;
+    }
+
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        HDROP hDrop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+        if (hDrop != NULL) {
+            UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+            for (UINT i = 0; i < fileCount; i++) {
+                UINT pathLen = DragQueryFileW(hDrop, i, NULL, 0);
+                if (pathLen > 0) {
+                    std::wstring wPath(pathLen, L'\0');
+                    DragQueryFileW(hDrop, i, &wPath[0], pathLen + 1);
+
+                    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                    if (utf8Size > 0) {
+                        std::string utf8Path(utf8Size - 1, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), -1, &utf8Path[0], utf8Size, nullptr, nullptr);
+                        result.push_back(utf8Path);
+                    }
+                }
+            }
+        }
+    }
+
+    CloseClipboard();
+    return result;
+}
+
+// 模拟复制操作（Ctrl + C）
+bool SimulateCopyOperation() {
+    INPUT inputs[4] = {};
+
+    // 1. 按下 Ctrl 键
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    inputs[0].ki.dwFlags = 0;
+
+    // 2. 按下 C 键
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'C';
+    inputs[1].ki.dwFlags = 0;
+
+    // 3. 释放 C 键
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'C';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    // 4. 释放 Ctrl 键
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    UINT result = SendInput(4, inputs, sizeof(INPUT));
+    return result == 4;
+}
+
+// ==================== 获取选中内容（增强版）====================
+
+// 尝试使用 UI Automation 获取选中文本
+std::string TryGetSelectedTextViaUIAutomation() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool comInitialized = SUCCEEDED(hr);
+
+    IUIAutomation* pAutomation = nullptr;
+    IUIAutomationElement* pFocusedElement = nullptr;
+    IUIAutomationTextPattern* pTextPattern = nullptr;
+    IUIAutomationTextRangeArray* pSelection = nullptr;
+    std::string selectedText;
+
+    do {
+        hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                              __uuidof(IUIAutomation), (void**)&pAutomation);
+        if (FAILED(hr) || !pAutomation) break;
+
+        hr = pAutomation->GetFocusedElement(&pFocusedElement);
+        if (FAILED(hr) || !pFocusedElement) break;
+
+        IUnknown* pPatternUnk = nullptr;
+        hr = pFocusedElement->GetCurrentPatternAs(UIA_TextPatternId, __uuidof(IUIAutomationTextPattern),
+                                                   (void**)&pPatternUnk);
+        if (FAILED(hr) || !pPatternUnk) {
+            hr = pFocusedElement->GetCurrentPatternAs(UIA_TextPattern2Id, __uuidof(IUIAutomationTextPattern),
+                                                       (void**)&pPatternUnk);
+            if (FAILED(hr) || !pPatternUnk) break;
+        }
+
+        pTextPattern = static_cast<IUIAutomationTextPattern*>(pPatternUnk);
+
+        hr = pTextPattern->GetSelection(&pSelection);
+        if (FAILED(hr) || !pSelection) break;
+
+        int selectionCount = 0;
+        hr = pSelection->get_Length(&selectionCount);
+        if (FAILED(hr) || selectionCount == 0) break;
+
+        for (int i = 0; i < selectionCount; i++) {
+            IUIAutomationTextRange* pRange = nullptr;
+            hr = pSelection->GetElement(i, &pRange);
+            if (SUCCEEDED(hr) && pRange) {
+                BSTR bstrText = nullptr;
+                hr = pRange->GetText(-1, &bstrText);
+                if (SUCCEEDED(hr) && bstrText) {
+                    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, bstrText, -1, nullptr, 0, nullptr, nullptr);
+                    if (utf8Size > 0) {
+                        std::string utf8Text(utf8Size - 1, 0);
+                        WideCharToMultiByte(CP_UTF8, 0, bstrText, -1, &utf8Text[0], utf8Size, nullptr, nullptr);
+                        if (!selectedText.empty()) selectedText += "\n";
+                        selectedText += utf8Text;
+                    }
+                    SysFreeString(bstrText);
+                }
+                pRange->Release();
+            }
+        }
+    } while (false);
+
+    if (pSelection) pSelection->Release();
+    if (pTextPattern) pTextPattern->Release();
+    if (pFocusedElement) pFocusedElement->Release();
+    if (pAutomation) pAutomation->Release();
+    if (comInitialized) CoUninitialize();
+
+    return selectedText;
+}
+
+// 获取选中内容（Windows 实现）
+Napi::Value GetSelectedContent(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Array result = Napi::Array::New(env);
+
+    // 方法1：尝试 UI Automation（适用于标准 Windows 控件）
+    std::string uiaText = TryGetSelectedTextViaUIAutomation();
+    if (!uiaText.empty()) {
+        Napi::Object item = Napi::Object::New(env);
+        item.Set("type", "text");
+        item.Set("data", uiaText);
+        result.Set(uint32_t(0), item);
+        return result;
+    }
+
+    // 方法2：回退到剪贴板方法（适用于 Electron/Chromium 应用）
+    // 暂停监控以防止触发自身事件
+    bool wasMonitoring = g_isMonitoring && !g_isPaused;
+    if (wasMonitoring) {
+        g_isPaused = true;
+    }
+
+    // 保存原剪贴板内容
+    std::string originalText = GetClipboardTextContent();
+    std::string originalImage = GetClipboardImageContent();
+    std::vector<std::string> originalFiles = GetClipboardFilesList();
+
+    // 清空剪贴板
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        CloseClipboard();
+    }
+
+    // 模拟 Ctrl+C
+    if (SimulateCopyOperation()) {
+        // 等待剪贴板更新
+        Sleep(100);
+
+        // 读取新的剪贴板内容
+        std::string newText = GetClipboardTextContent();
+        std::string newImage = GetClipboardImageContent();
+        std::vector<std::string> newFiles = GetClipboardFilesList();
+
+        uint32_t index = 0;
+
+        // 检查文本
+        if (!newText.empty() && newText != originalText) {
+            Napi::Object item = Napi::Object::New(env);
+            item.Set("type", "text");
+            item.Set("data", newText);
+            result.Set(index++, item);
+        }
+
+        // 检查文件
+        if (!newFiles.empty()) {
+            bool isDifferent = (newFiles.size() != originalFiles.size());
+            if (!isDifferent) {
+                for (size_t i = 0; i < newFiles.size(); i++) {
+                    if (newFiles[i] != originalFiles[i]) {
+                        isDifferent = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isDifferent) {
+                Napi::Object item = Napi::Object::New(env);
+                item.Set("type", "file");
+                Napi::Array fileArray = Napi::Array::New(env);
+                for (size_t i = 0; i < newFiles.size(); i++) {
+                    fileArray.Set(uint32_t(i), newFiles[i]);
+                }
+                item.Set("data", fileArray);
+                result.Set(index++, item);
+            }
+        }
+
+        // 检查图像
+        if (!newImage.empty() && newImage != originalImage) {
+            Napi::Object item = Napi::Object::New(env);
+            item.Set("type", "image");
+            item.Set("data", newImage);
+            item.Set("format", "png");
+            item.Set("encoding", "base64");
+            result.Set(index++, item);
+        }
+    }
+
+    // 恢复原剪贴板内容
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+
+        // 恢复文本
+        if (!originalText.empty()) {
+            int wideSize = MultiByteToWideChar(CP_UTF8, 0, originalText.c_str(), -1, nullptr, 0);
+            if (wideSize > 0) {
+                HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, wideSize * sizeof(wchar_t));
+                if (hGlobal != NULL) {
+                    wchar_t* pData = static_cast<wchar_t*>(GlobalLock(hGlobal));
+                    if (pData != NULL) {
+                        MultiByteToWideChar(CP_UTF8, 0, originalText.c_str(), -1, pData, wideSize);
+                        GlobalUnlock(hGlobal);
+                        SetClipboardData(CF_UNICODETEXT, hGlobal);
+                    }
+                }
+            }
+        }
+
+        // 恢复文件列表
+        if (!originalFiles.empty()) {
+            size_t totalSize = sizeof(DROPFILES);
+            for (const auto& file : originalFiles) {
+                int wideSize = MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, nullptr, 0);
+                totalSize += wideSize * sizeof(wchar_t);
+            }
+            totalSize += sizeof(wchar_t); // 额外的 null terminator
+
+            HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, totalSize);
+            if (hGlobal != NULL) {
+                DROPFILES* pDropFiles = static_cast<DROPFILES*>(GlobalLock(hGlobal));
+                if (pDropFiles != NULL) {
+                    pDropFiles->pFiles = sizeof(DROPFILES);
+                    pDropFiles->pt.x = 0;
+                    pDropFiles->pt.y = 0;
+                    pDropFiles->fNC = FALSE;
+                    pDropFiles->fWide = TRUE;
+
+                    wchar_t* pData = reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(pDropFiles) + sizeof(DROPFILES));
+                    for (const auto& file : originalFiles) {
+                        int wideSize = MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, pData, (totalSize - sizeof(DROPFILES)) / sizeof(wchar_t));
+                        pData += wideSize;
+                    }
+                    *pData = L'\0';
+
+                    GlobalUnlock(hGlobal);
+                    SetClipboardData(CF_HDROP, hGlobal);
+                }
+            }
+        }
+
+        CloseClipboard();
+    }
+
+    // 恢复监控状态
+    if (wasMonitoring) {
+        // 延迟恢复，避免立即触发监听
+        Sleep(50);
+        g_isPaused = false;
+    }
+
+    return result;
+}
+
 // 模拟粘贴操作（Ctrl + V）
 Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -4989,6 +5407,8 @@ Napi::Value ReadBrowserWindowUrl(const Napi::CallbackInfo& info) {
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
     exports.Set("stopMonitor", Napi::Function::New(env, StopMonitor));
+    exports.Set("pauseMonitor", Napi::Function::New(env, PauseMonitor));
+    exports.Set("resumeMonitor", Napi::Function::New(env, ResumeMonitor));
     exports.Set("startWindowMonitor", Napi::Function::New(env, StartWindowMonitor));
     exports.Set("stopWindowMonitor", Napi::Function::New(env, StopWindowMonitor));
     exports.Set("getActiveWindow", Napi::Function::New(env, GetActiveWindowInfo));
@@ -5015,6 +5435,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getExplorerFolderPath", Napi::Function::New(env, GetExplorerFolderPath));
     // 读取指定浏览器窗口的当前 URL
     exports.Set("readBrowserWindowUrl", Napi::Function::New(env, ReadBrowserWindowUrl));
+    exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
     return exports;
 }
 
