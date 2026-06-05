@@ -5277,6 +5277,71 @@ static bool FocusTargetWindow(HWND hwnd) {
     return GetForegroundWindow() == hwnd;
 }
 
+static bool NavigateExplorerWindow(HWND targetHwnd, const std::wstring& address) {
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    if (FAILED(hrInit)) {
+        return false;
+    }
+
+    bool success = false;
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_IShellWindows, reinterpret_cast<void**>(&shellWindows)
+    );
+
+    if (SUCCEEDED(hr) && shellWindows) {
+        long count = 0;
+        shellWindows->get_Count(&count);
+
+        for (long i = 0; i < count; i++) {
+            VARIANT idx;
+            VariantInit(&idx);
+            idx.vt = VT_I4;
+            idx.lVal = i;
+
+            IDispatch* disp = nullptr;
+            hr = shellWindows->Item(idx, &disp);
+            if (FAILED(hr) || !disp) continue;
+
+            IWebBrowser2* browser = nullptr;
+            hr = disp->QueryInterface(IID_IWebBrowser2, reinterpret_cast<void**>(&browser));
+            disp->Release();
+
+            if (FAILED(hr) || !browser) continue;
+
+            SHANDLE_PTR browserHwndPtr = 0;
+            hr = browser->get_HWND(&browserHwndPtr);
+            if (SUCCEEDED(hr) && reinterpret_cast<HWND>(browserHwndPtr) == targetHwnd) {
+                VARIANT url;
+                VariantInit(&url);
+                url.vt = VT_BSTR;
+                url.bstrVal = SysAllocString(address.c_str());
+
+                VARIANT empty;
+                VariantInit(&empty);
+                hr = browser->Navigate2(&url, &empty, &empty, &empty, &empty);
+                success = SUCCEEDED(hr);
+
+                VariantClear(&url);
+                browser->Release();
+                break;
+            }
+
+            browser->Release();
+        }
+
+        shellWindows->Release();
+    }
+
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    return success;
+}
+
 /**
  * 发送 Ctrl+L 快捷键，用于聚焦 Explorer 或文件对话框的地址栏。
  *
@@ -5372,6 +5437,13 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo& info) {
 
     if (address.empty() || !IsFileLocationWindow(targetHwnd)) {
         return Napi::Boolean::New(env, false);
+    }
+
+    WCHAR className[256] = {0};
+    GetClassNameW(targetHwnd, className, 256);
+    if (wcscmp(className, L"CabinetWClass") == 0 ||
+        wcscmp(className, L"ExploreWClass") == 0) {
+        return Napi::Boolean::New(env, NavigateExplorerWindow(targetHwnd, address));
     }
 
     if (!FocusTargetWindow(targetHwnd)) {
