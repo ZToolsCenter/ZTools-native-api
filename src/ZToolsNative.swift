@@ -1608,6 +1608,288 @@ public func simulateMouseRightClick(_ x: Double, _ y: Double) -> Int32 {
     return 1
 }
 
+// MARK: - Finder Windows
+
+/// 获取所有打开的 Finder 窗口的 file URL 列表
+///
+/// 通过 AppleScript 读取 Finder 窗口目标路径，再使用 URL(fileURLWithPath:)
+/// 统一转换为标准 file:/// URL，确保空格、中文和特殊字符被正确编码。
+/// - Returns: JSON 字符串数组，格式为 ["file:///path1", "file:///path2"]；失败或无窗口时返回 []
+@_cdecl("getAllFinderWindows")
+public func getAllFinderWindows() -> UnsafeMutablePointer<CChar>? {
+    let script = """
+    tell application "Finder"
+        set windowPaths to {}
+        repeat with w in (get every Finder window)
+            try
+                set targetPath to POSIX path of (target of w as alias)
+                set end of windowPaths to targetPath
+            end try
+        end repeat
+        return windowPaths
+    end tell
+    """
+
+    var error: NSDictionary?
+    guard let scriptObject = NSAppleScript(source: script) else {
+        return strdup("[]")
+    }
+
+    let output = scriptObject.executeAndReturnError(&error)
+
+    if let error = error {
+        print("AppleScript error: \(error)")
+        return strdup("[]")
+    }
+
+    // 解析 AppleScript 返回的列表
+    var paths: [String] = []
+    if output.numberOfItems > 0 {
+        for i in 1...output.numberOfItems {
+            if let item = output.atIndex(i), let path = item.stringValue {
+                paths.append(path)
+            }
+        }
+    }
+
+    // 将 POSIX 路径数组转换为标准 file URL JSON 字符串数组
+    let jsonPaths = paths.map { path -> String in
+        let fileURL = URL(fileURLWithPath: path).absoluteString
+        return "\"\(escapeJSON(fileURL))\""
+    }.joined(separator: ",")
+    let jsonString = "[\(jsonPaths)]"
+
+    return strdup(jsonString)
+}
+
+// MARK: - Set Address Bar
+
+/// 设置指定窗口的地址栏内容（支持浏览器和 Finder）
+/// - Parameters:
+///   - bundleId: 应用的 bundle identifier
+///   - address: 要设置的地址（URL 或文件路径）
+/// - Returns: 是否设置成功 (1: 成功, 0: 失败)
+@_cdecl("setAddressBar")
+public func setAddressBar(_ bundleId: UnsafePointer<CChar>?, _ address: UnsafePointer<CChar>?) -> Int32 {
+    guard let bundleId = bundleId, let address = address else {
+        return 0
+    }
+
+    let bundleIdString = String(cString: bundleId)
+    let addressString = String(cString: address)
+
+    guard !bundleIdString.isEmpty && !addressString.isEmpty else {
+        return 0
+    }
+
+    // 根据 bundleId 判断应用类型
+    if bundleIdString == "com.apple.finder" {
+        return setFinderLocation(addressString)
+    } else if isBrowserApp(bundleIdString) {
+        return setBrowserURL(bundleIdString, addressString)
+    }
+
+    return 0
+}
+
+/// 判断是否为浏览器应用
+private func isBrowserApp(_ bundleId: String) -> Bool {
+    let browserBundleIds = [
+        "com.apple.Safari",
+        "com.google.Chrome",
+        "com.microsoft.edgemac",
+        "org.mozilla.firefox",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser",  // Arc
+        "com.operasoftware.Opera"
+    ]
+    return browserBundleIds.contains(bundleId)
+}
+
+/// 设置 Finder 窗口位置
+private func setFinderLocation(_ path: String) -> Int32 {
+    // 转换为 POSIX 路径（如果是 file:// URL）
+    var targetPath = path
+    if path.hasPrefix("file://") {
+        if let url = URL(string: path) {
+            targetPath = url.path
+        }
+    }
+
+    let escapedPath = targetPath.replacingOccurrences(of: "\"", with: "\\\"")
+    let script = """
+    tell application "Finder"
+        if (count of Finder windows) > 0 then
+            set target of front Finder window to (POSIX file "\(escapedPath)")
+            return true
+        else
+            return false
+        end if
+    end tell
+    """
+
+    var error: NSDictionary?
+    guard let scriptObject = NSAppleScript(source: script) else {
+        return 0
+    }
+
+    let output = scriptObject.executeAndReturnError(&error)
+
+    if let error = error {
+        print("AppleScript error: \(error)")
+        return 0
+    }
+
+    // 检查返回值
+    if let result = output.booleanValue, result {
+        return 1
+    }
+
+    return 0
+}
+
+/// 设置浏览器地址栏 URL
+private func setBrowserURL(_ bundleId: String, _ urlString: String) -> Int32 {
+    let appName = getAppNameFromBundleId(bundleId)
+    let escapedURL = urlString.replacingOccurrences(of: "\"", with: "\\\"")
+
+    var script = ""
+
+    switch bundleId {
+    case "com.apple.Safari":
+        script = """
+        tell application "\(appName)"
+            if (count of windows) > 0 then
+                set URL of front document to "\(escapedURL)"
+                return true
+            else
+                return false
+            end if
+        end tell
+        """
+
+    case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi":
+        script = """
+        tell application "\(appName)"
+            if (count of windows) > 0 then
+                set URL of active tab of front window to "\(escapedURL)"
+                return true
+            else
+                return false
+            end if
+        end tell
+        """
+
+    case "org.mozilla.firefox":
+        // Firefox 不支持直接通过 AppleScript 设置 URL
+        // 使用模拟按键的方式：Cmd+L 聚焦地址栏，输入 URL，回车
+        return setFirefoxURL(escapedURL)
+
+    default:
+        return 0
+    }
+
+    var error: NSDictionary?
+    guard let scriptObject = NSAppleScript(source: script) else {
+        return 0
+    }
+
+    let output = scriptObject.executeAndReturnError(&error)
+
+    if let error = error {
+        print("AppleScript error: \(error)")
+        return 0
+    }
+
+    if let result = output.booleanValue, result {
+        return 1
+    }
+
+    return 0
+}
+
+/// 设置 Firefox URL（使用键盘模拟）
+private func setFirefoxURL(_ urlString: String) -> Int32 {
+    // 检查辅助功能权限
+    let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+    let accessEnabled = AXIsProcessTrustedWithOptions(options)
+
+    if !accessEnabled {
+        print("Error: Accessibility permission not granted")
+        return 0
+    }
+
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        return 0
+    }
+
+    // Cmd+L 聚焦地址栏
+    let lKeyCode: CGKeyCode = 37
+    guard let cmdLDown = CGEvent(keyboardEventSource: eventSource, virtualKey: lKeyCode, keyDown: true) else {
+        return 0
+    }
+    cmdLDown.flags = .maskCommand
+
+    guard let cmdLUp = CGEvent(keyboardEventSource: eventSource, virtualKey: lKeyCode, keyDown: false) else {
+        return 0
+    }
+    cmdLUp.flags = .maskCommand
+
+    cmdLDown.post(tap: .cghidEventTap)
+    usleep(50_000)
+    cmdLUp.post(tap: .cghidEventTap)
+    usleep(100_000)
+
+    // 输入 URL
+    let chars = Array(urlString.utf16)
+    guard let typeEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true) else {
+        return 0
+    }
+    typeEvent.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
+    typeEvent.post(tap: .cghidEventTap)
+    usleep(50_000)
+
+    // 回车
+    let returnKeyCode: CGKeyCode = 36
+    guard let returnDown = CGEvent(keyboardEventSource: eventSource, virtualKey: returnKeyCode, keyDown: true) else {
+        return 0
+    }
+    guard let returnUp = CGEvent(keyboardEventSource: eventSource, virtualKey: returnKeyCode, keyDown: false) else {
+        return 0
+    }
+
+    returnDown.post(tap: .cghidEventTap)
+    usleep(10_000)
+    returnUp.post(tap: .cghidEventTap)
+
+    return 1
+}
+
+/// 根据 bundleId 获取应用名称
+private func getAppNameFromBundleId(_ bundleId: String) -> String {
+    switch bundleId {
+    case "com.apple.Safari":
+        return "Safari"
+    case "com.google.Chrome":
+        return "Google Chrome"
+    case "com.microsoft.edgemac":
+        return "Microsoft Edge"
+    case "org.mozilla.firefox":
+        return "Firefox"
+    case "com.brave.Browser":
+        return "Brave Browser"
+    case "com.vivaldi.Vivaldi":
+        return "Vivaldi"
+    case "company.thebrowser.Browser":
+        return "Arc"
+    case "com.operasoftware.Opera":
+        return "Opera"
+    default:
+        return ""
+    }
+}
+
 // MARK: - Helper Functions (Utilities)
 
 /// 辅助函数：转义 JSON 字符串

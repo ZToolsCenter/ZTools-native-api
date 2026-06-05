@@ -31,6 +31,7 @@ typedef void (*ColorPickerCB)(const char *);                       // 取色器�
 typedef void (*StartColorPickerFunc)(ColorPickerCB);               // 启动取色器
 typedef void (*StopColorPickerFunc)();                             // 停止取色器
 typedef void *(*FetchFileIconFunc)(const char *, size_t *);        // 获取文件图标 PNG
+typedef char *(*GetAllFinderWindowsFunc)();                        // 获取所有 Finder 窗口
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -59,6 +60,7 @@ static napi_threadsafe_function colorPickerTsfn = nullptr;
 static StartColorPickerFunc startColorPickerFunc = nullptr;
 static StopColorPickerFunc stopColorPickerFunc = nullptr;
 static FetchFileIconFunc fetchFileIconFunc = nullptr;
+static GetAllFinderWindowsFunc getAllFinderWindowsFunc = nullptr;
 static bool g_isPaused = false; // 剪贴板监控暂停状态
 
 // 在主线程调用 JS 回调
@@ -294,6 +296,8 @@ bool LoadSwiftLibrary(Napi::Env env) {
   stopColorPickerFunc =
       (StopColorPickerFunc)dlsym(swiftLibHandle, "stopColorPicker");
   fetchFileIconFunc = (FetchFileIconFunc)dlsym(swiftLibHandle, "fetchFileIcon");
+  getAllFinderWindowsFunc =
+      (GetAllFinderWindowsFunc)dlsym(swiftLibHandle, "getAllFinderWindows");
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
@@ -1327,6 +1331,107 @@ Napi::Value StopColorPicker(const Napi::CallbackInfo &info) {
   return env.Undefined();
 }
 
+/**
+ * 获取所有打开的 Finder 窗口的 file URL 列表。
+ *
+ * Swift 动态库返回 JSON 字符串数组；这里解析成 JS Array<string>。getAllFinderWindows
+ * 是可选符号，避免旧版 dylib 缺少该符号时阻断其它 macOS 原生能力加载。
+ *
+ * @returns Array<string> - file:/// URL 列表；无窗口或调用失败时返回空数组，符号缺失时抛出错误
+ */
+Napi::Value GetAllExplorerWindows(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return env.Undefined();
+  }
+
+  if (getAllFinderWindowsFunc == nullptr) {
+    Napi::Error::New(env, "getAllFinderWindows is not available")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // 调用 Swift 函数获取 JSON 字符串
+  char *jsonResult = getAllFinderWindowsFunc();
+  if (jsonResult == nullptr) {
+    // 返回空数组
+    return Napi::Array::New(env, 0);
+  }
+
+  std::string jsonStr(jsonResult);
+  free(jsonResult);
+
+  // 解析 JSON 字符串数组 ["path1", "path2", ...]
+  Napi::Array result = Napi::Array::New(env);
+
+  // 简单的 JSON 数组解析（假设格式良好）
+  if (jsonStr.length() >= 2 && jsonStr[0] == '[' && jsonStr[jsonStr.length() - 1] == ']') {
+    std::string content = jsonStr.substr(1, jsonStr.length() - 2);
+
+    if (!content.empty()) {
+      std::vector<std::string> paths;
+      size_t start = 0;
+      bool inQuote = false;
+      bool escape = false;
+
+      for (size_t i = 0; i < content.length(); i++) {
+        char ch = content[i];
+
+        if (escape) {
+          escape = false;
+          continue;
+        }
+
+        if (ch == '\\') {
+          escape = true;
+          continue;
+        }
+
+        if (ch == '"') {
+          inQuote = !inQuote;
+          if (!inQuote) {
+            // 结束引号
+            std::string path = content.substr(start + 1, i - start - 1);
+            // 反转义
+            std::string unescaped;
+            for (size_t j = 0; j < path.length(); j++) {
+              if (path[j] == '\\' && j + 1 < path.length()) {
+                char next = path[j + 1];
+                if (next == '"' || next == '\\' || next == 'n' || next == 'r' || next == 't') {
+                  if (next == 'n') unescaped += '\n';
+                  else if (next == 'r') unescaped += '\r';
+                  else if (next == 't') unescaped += '\t';
+                  else unescaped += next;
+                  j++;
+                  continue;
+                }
+              }
+              unescaped += path[j];
+            }
+            paths.push_back(unescaped);
+          } else {
+            // 开始引号
+            start = i;
+          }
+        } else if (ch == ',' && !inQuote) {
+          // 逗号分隔符，跳过空白
+          while (i + 1 < content.length() && (content[i + 1] == ' ' || content[i + 1] == '\t')) {
+            i++;
+          }
+        }
+      }
+
+      // 转换为 Napi::Array
+      for (size_t i = 0; i < paths.size(); i++) {
+        result[i] = Napi::String::New(env, paths[i]);
+      }
+    }
+  }
+
+  return result;
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -1358,6 +1463,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
   exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
   exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
+  exports.Set("getAllExplorerWindows", Napi::Function::New(env, GetAllExplorerWindows));
   exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
   return exports;
 }

@@ -4978,8 +4978,11 @@ Napi::Value GetExplorerFolderPath(const Napi::CallbackInfo& info) {
 
     // 初始化 COM（STA 模式，与 Electron 主线程兼容）
     HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    // S_OK 或 S_FALSE（已初始化）都是可接受的
-    bool needUninit = (hrInit == S_OK);
+    // S_OK 和 S_FALSE 都表示本次 CoInitializeEx 成功，需要配对 CoUninitialize
+    bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    if (FAILED(hrInit)) {
+        return env.Null();
+    }
 
     std::string result;
 
@@ -5052,6 +5055,98 @@ Napi::Value GetExplorerFolderPath(const Napi::CallbackInfo& info) {
         return env.Null();
     }
     return Napi::String::New(env, result);
+}
+
+/**
+ * 获取所有打开的文件资源管理器窗口的 file URL 列表
+ *
+ * 工作原理：
+ * 1. 初始化当前线程的 COM STA 环境，枚举所有 Shell 窗口（IShellWindows）
+ * 2. 读取每个窗口的 LocationURL，并仅保留 file:/// URL，避免混入浏览器等非 Explorer URL
+ * 3. 对本函数成功初始化的 COM 调用执行配对 CoUninitialize，避免初始化计数泄露
+ *
+ * @returns Array<string> - file:/// 格式的路径字符串数组；COM 初始化失败或无窗口时返回空数组
+ */
+Napi::Value GetAllExplorerWindows(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 初始化 COM（STA 模式，与 Electron 主线程兼容）
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // S_OK 和 S_FALSE 都表示本次 CoInitializeEx 成功，需要配对 CoUninitialize
+    bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+
+    std::vector<std::string> results;
+
+    if (FAILED(hrInit)) {
+        return Napi::Array::New(env, 0);
+    }
+
+    // 创建 ShellWindows COM 对象，枚举所有打开的 Explorer 窗口
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_IShellWindows, (void**)&shellWindows
+    );
+
+    if (SUCCEEDED(hr) && shellWindows) {
+        long count = 0;
+        shellWindows->get_Count(&count);
+
+        // 遍历所有 Shell 窗口
+        for (long i = 0; i < count; i++) {
+            VARIANT idx;
+            idx.vt = VT_I4;
+            idx.lVal = i;
+
+            IDispatch* disp = nullptr;
+            hr = shellWindows->Item(idx, &disp);
+            if (FAILED(hr) || !disp) continue;
+
+            // 查询 IWebBrowserApp 接口（Explorer 窗口实现该接口）
+            IWebBrowserApp* browser = nullptr;
+            hr = disp->QueryInterface(IID_IWebBrowserApp, (void**)&browser);
+            disp->Release();
+
+            if (FAILED(hr) || !browser) continue;
+
+            // 获取当前目录的 URL
+            BSTR url = nullptr;
+            hr = browser->get_LocationURL(&url);
+            if (SUCCEEDED(hr) && url) {
+                // 将 BSTR (UTF-16) 转换为 UTF-8 字符串
+                int len = SysStringLen(url);
+                if (len > 0) {
+                    int size = WideCharToMultiByte(CP_UTF8, 0, url, len, NULL, 0, NULL, NULL);
+                    if (size > 0) {
+                        std::string urlStr;
+                        urlStr.resize(size);
+                        WideCharToMultiByte(CP_UTF8, 0, url, len, &urlStr[0], size, NULL, NULL);
+                        // IShellWindows 可能包含非文件窗口，仅保留 Explorer/Finder 语义一致的 file URL
+                        if (urlStr.rfind("file:///", 0) == 0) {
+                            results.push_back(urlStr);
+                        }
+                    }
+                }
+                SysFreeString(url);
+            }
+
+            browser->Release();
+        }
+
+        shellWindows->Release();
+    }
+
+    // 仅在本次调用初始化 COM 时才反初始化
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    // 返回字符串数组
+    Napi::Array resultArray = Napi::Array::New(env, results.size());
+    for (size_t i = 0; i < results.size(); i++) {
+        resultArray[i] = Napi::String::New(env, results[i]);
+    }
+    return resultArray;
 }
 
 // ==================== 浏览器 URL 查询 ====================
@@ -5394,7 +5489,11 @@ Napi::Value ReadBrowserWindowUrl(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[2].As<Napi::Function>();
 
     HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const bool needUninit = (hrInit == S_OK);
+    const bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    if (FAILED(hrInit)) {
+        callback.Call({ env.Null() });
+        return env.Undefined();
+    }
 
     std::string result;
 
@@ -5450,6 +5549,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
     // 通过 COM IShellWindows 查询 Explorer 窗口的当前文件夹路径
     exports.Set("getExplorerFolderPath", Napi::Function::New(env, GetExplorerFolderPath));
+    // 获取所有打开的文件资源管理器窗口的 URL 列表
+    exports.Set("getAllExplorerWindows", Napi::Function::New(env, GetAllExplorerWindows));
     // 读取指定浏览器窗口的当前 URL
     exports.Set("readBrowserWindowUrl", Napi::Function::New(env, ReadBrowserWindowUrl));
     exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));

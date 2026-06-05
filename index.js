@@ -276,6 +276,21 @@ class WindowManager {
     }
     return addon.simulateKeyboardTap(key, ...modifiers);
   }
+  /**
+   * 获取所有打开的文件资源管理器窗口的 URL 列表
+   * @returns {Array<string>} file:/// 格式的路径字符串数组
+   * @example
+   * // Windows
+   * const urls = WindowManager.getAllExplorerWindows();
+   * // ['file:///C:/Users/username/Documents', 'file:///D:/Projects']
+   *
+   * // macOS
+   * const urls = WindowManager.getAllExplorerWindows();
+   * // ['file:///Users/username/Documents', 'file:///Volumes/Data/Projects']
+   */
+  static getAllExplorerWindows() {
+    return addon.getAllExplorerWindows();
+  }
 }
 
 class MouseMonitor {
