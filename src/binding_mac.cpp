@@ -32,6 +32,7 @@ typedef void (*StartColorPickerFunc)(ColorPickerCB);               // 启动取�
 typedef void (*StopColorPickerFunc)();                             // 停止取色器
 typedef void *(*FetchFileIconFunc)(const char *, size_t *);        // 获取文件图标 PNG
 typedef char *(*GetAllFinderWindowsFunc)();                        // 获取所有 Finder 窗口
+typedef int (*SetAddressBarFunc)(const char *, const char *);       // 设置 Finder/文件对话框地址
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -61,6 +62,7 @@ static StartColorPickerFunc startColorPickerFunc = nullptr;
 static StopColorPickerFunc stopColorPickerFunc = nullptr;
 static FetchFileIconFunc fetchFileIconFunc = nullptr;
 static GetAllFinderWindowsFunc getAllFinderWindowsFunc = nullptr;
+static SetAddressBarFunc setAddressBarFunc = nullptr;
 static bool g_isPaused = false; // 剪贴板监控暂停状态
 
 // 在主线程调用 JS 回调
@@ -298,6 +300,8 @@ bool LoadSwiftLibrary(Napi::Env env) {
   fetchFileIconFunc = (FetchFileIconFunc)dlsym(swiftLibHandle, "fetchFileIcon");
   getAllFinderWindowsFunc =
       (GetAllFinderWindowsFunc)dlsym(swiftLibHandle, "getAllFinderWindows");
+  setAddressBarFunc =
+      (SetAddressBarFunc)dlsym(swiftLibHandle, "setAddressBar");
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
@@ -1432,6 +1436,49 @@ Napi::Value GetAllExplorerWindows(const Napi::CallbackInfo &info) {
   return result;
 }
 
+/**
+ * 设置 Finder 或文件选择对话框等文件定位窗口的地址。
+ *
+ * 第一个参数接受 bundleId 字符串或 pid 数字，C++ 层统一转为字符串传给 Swift；
+ * Swift 会限制目标为 Finder 或常见文件选择对话框所属应用，避免修改普通浏览器地址栏。
+ *
+ * @returns boolean - 地址设置成功返回 true，目标不支持或系统权限不足返回 false
+ */
+Napi::Value SetAddressBar(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (setAddressBarFunc == nullptr) {
+    Napi::Error::New(env, "setAddressBar is not available")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  if (info.Length() < 2 || (!info[0].IsString() && !info[0].IsNumber()) || !info[1].IsString()) {
+    Napi::TypeError::New(env, "target (bundleId or pid) and address (string) are required")
+        .ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+
+  std::string target;
+  if (info[0].IsString()) {
+    target = info[0].As<Napi::String>().Utf8Value();
+  } else {
+    target = std::to_string(info[0].As<Napi::Number>().Int64Value());
+  }
+
+  std::string address = info[1].As<Napi::String>().Utf8Value();
+  if (target.empty() || address.empty()) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  int success = setAddressBarFunc(target.c_str(), address.c_str());
+  return Napi::Boolean::New(env, success == 1);
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -1464,6 +1511,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
   exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
   exports.Set("getAllExplorerWindows", Napi::Function::New(env, GetAllExplorerWindows));
+  exports.Set("setAddressBar", Napi::Function::New(env, SetAddressBar));
   exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
   return exports;
 }

@@ -1664,50 +1664,88 @@ public func getAllFinderWindows() -> UnsafeMutablePointer<CChar>? {
 
 // MARK: - Set Address Bar
 
-/// 设置指定窗口的地址栏内容（支持浏览器和 Finder）
+/// 设置 Finder 或文件选择对话框的地址栏位置
 /// - Parameters:
-///   - bundleId: 应用的 bundle identifier
-///   - address: 要设置的地址（URL 或文件路径）
-/// - Returns: 是否设置成功 (1: 成功, 0: 失败)
+///   - target: Finder 的 bundleId，或文件选择对话框所属应用的 bundleId/pid 字符串
+///   - address: 要跳转的文件路径或 file:// URL
+/// - Returns: 1 成功，0 表示目标不是 Finder/文件选择对话框或系统权限不足
 @_cdecl("setAddressBar")
-public func setAddressBar(_ bundleId: UnsafePointer<CChar>?, _ address: UnsafePointer<CChar>?) -> Int32 {
-    guard let bundleId = bundleId, let address = address else {
+public func setAddressBar(_ target: UnsafePointer<CChar>?, _ address: UnsafePointer<CChar>?) -> Int32 {
+    guard let target = target, let address = address else {
         return 0
     }
 
-    let bundleIdString = String(cString: bundleId)
+    let targetString = String(cString: target)
     let addressString = String(cString: address)
 
-    guard !bundleIdString.isEmpty && !addressString.isEmpty else {
+    guard !targetString.isEmpty && !addressString.isEmpty else {
         return 0
     }
 
-    // 根据 bundleId 判断应用类型
-    if bundleIdString == "com.apple.finder" {
+    if targetString == "com.apple.finder" {
         return setFinderLocation(addressString)
-    } else if isBrowserApp(bundleIdString) {
-        return setBrowserURL(bundleIdString, addressString)
     }
 
-    return 0
+    guard let app = runningApplication(for: targetString) else {
+        return 0
+    }
+
+    if app.bundleIdentifier == "com.apple.finder" {
+        return setFinderLocation(addressString)
+    }
+
+    guard isFocusedFileDialog(of: app.processIdentifier) else {
+        return 0
+    }
+
+    return setFileDialogLocation(app: app, address: addressString)
 }
 
-/// 判断是否为浏览器应用
-private func isBrowserApp(_ bundleId: String) -> Bool {
-    let browserBundleIds = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.microsoft.edgemac",
-        "org.mozilla.firefox",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "company.thebrowser.Browser",  // Arc
-        "com.operasoftware.Opera"
-    ]
-    return browserBundleIds.contains(bundleId)
+/// 根据 bundleId 或 pid 字符串查找正在运行的应用。
+/// - Parameter target: bundleId（如 com.apple.TextEdit）或十进制 pid 字符串
+/// - Returns: 匹配到的 NSRunningApplication；未找到返回 nil
+private func runningApplication(for target: String) -> NSRunningApplication? {
+    if let pidValue = Int32(target), pidValue > 0 {
+        return NSRunningApplication(processIdentifier: pid_t(pidValue))
+    }
+
+    return NSRunningApplication.runningApplications(withBundleIdentifier: target).first
 }
 
-/// 设置 Finder 窗口位置
+/// 判断指定应用当前焦点窗口是否像系统打开/保存文件对话框。
+///
+/// macOS 的文件选择器通常以 AXDialog 或 AXSystemDialog 暴露，并包含 browser/table/list
+/// 等文件列表控件；该检查用于把快捷键注入限制在文件定位场景，避免误改普通输入框。
+private func isFocusedFileDialog(of pid: pid_t) -> Bool {
+    let appElement = AXUIElementCreateApplication(pid)
+    var windowValue: AnyObject?
+    let result = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowValue)
+
+    guard result == .success, let window = windowValue else {
+        return false
+    }
+
+    var roleValue: AnyObject?
+    var subroleValue: AnyObject?
+    AXUIElementCopyAttributeValue(window as! AXUIElement, kAXRoleAttribute as CFString, &roleValue)
+    AXUIElementCopyAttributeValue(window as! AXUIElement, kAXSubroleAttribute as CFString, &subroleValue)
+
+    let role = roleValue as? String ?? ""
+    let subrole = subroleValue as? String ?? ""
+    if role == kAXDialogRole as String || subrole == kAXSystemDialogSubrole as String {
+        return true
+    }
+
+    var titleValue: AnyObject?
+    AXUIElementCopyAttributeValue(window as! AXUIElement, kAXTitleAttribute as CFString, &titleValue)
+    let title = (titleValue as? String ?? "").lowercased()
+    let dialogTitleKeywords = ["open", "save", "choose", "export", "import", "打开", "存储", "保存", "选择", "导出", "导入"]
+    return dialogTitleKeywords.contains { title.contains($0) }
+}
+
+/// 设置 Finder 前台窗口位置。
+/// - Parameter path: POSIX 路径或 file:// URL
+/// - Returns: 1 成功，0 失败
 private func setFinderLocation(_ path: String) -> Int32 {
     // 转换为 POSIX 路径（如果是 file:// URL）
     var targetPath = path
@@ -1717,7 +1755,7 @@ private func setFinderLocation(_ path: String) -> Int32 {
         }
     }
 
-    let escapedPath = targetPath.replacingOccurrences(of: "\"", with: "\\\"")
+    let escapedPath = escapeAppleScriptString(targetPath)
     let script = """
     tell application "Finder"
         if (count of Finder windows) > 0 then
@@ -1741,153 +1779,83 @@ private func setFinderLocation(_ path: String) -> Int32 {
         return 0
     }
 
-    // 检查返回值
-    if let result = output.booleanValue, result {
-        return 1
-    }
-
-    return 0
+    return (output.booleanValue == true) ? 1 : 0
 }
 
-/// 设置浏览器地址栏 URL
-private func setBrowserURL(_ bundleId: String, _ urlString: String) -> Int32 {
-    let appName = getAppNameFromBundleId(bundleId)
-    let escapedURL = urlString.replacingOccurrences(of: "\"", with: "\\\"")
-
-    var script = ""
-
-    switch bundleId {
-    case "com.apple.Safari":
-        script = """
-        tell application "\(appName)"
-            if (count of windows) > 0 then
-                set URL of front document to "\(escapedURL)"
-                return true
-            else
-                return false
-            end if
-        end tell
-        """
-
-    case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi":
-        script = """
-        tell application "\(appName)"
-            if (count of windows) > 0 then
-                set URL of active tab of front window to "\(escapedURL)"
-                return true
-            else
-                return false
-            end if
-        end tell
-        """
-
-    case "org.mozilla.firefox":
-        // Firefox 不支持直接通过 AppleScript 设置 URL
-        // 使用模拟按键的方式：Cmd+L 聚焦地址栏，输入 URL，回车
-        return setFirefoxURL(escapedURL)
-
-    default:
-        return 0
-    }
-
-    var error: NSDictionary?
-    guard let scriptObject = NSAppleScript(source: script) else {
-        return 0
-    }
-
-    let output = scriptObject.executeAndReturnError(&error)
-
-    if let error = error {
-        print("AppleScript error: \(error)")
-        return 0
-    }
-
-    if let result = output.booleanValue, result {
-        return 1
-    }
-
-    return 0
-}
-
-/// 设置 Firefox URL（使用键盘模拟）
-private func setFirefoxURL(_ urlString: String) -> Int32 {
-    // 检查辅助功能权限
+/// 设置当前文件选择对话框的位置。
+///
+/// 通过 Cmd+Shift+G 打开系统“前往文件夹”输入框，输入路径后回车。该路径只在
+/// isFocusedFileDialog 通过后发送，且需要辅助功能权限允许本进程模拟键盘事件。
+private func setFileDialogLocation(app: NSRunningApplication, address: String) -> Int32 {
     let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
-    let accessEnabled = AXIsProcessTrustedWithOptions(options)
-
-    if !accessEnabled {
+    guard AXIsProcessTrustedWithOptions(options) else {
         print("Error: Accessibility permission not granted")
         return 0
     }
 
-    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
-        return 0
+    var targetPath = address
+    if address.hasPrefix("file://"), let url = URL(string: address) {
+        targetPath = url.path
     }
 
-    // Cmd+L 聚焦地址栏
-    let lKeyCode: CGKeyCode = 37
-    guard let cmdLDown = CGEvent(keyboardEventSource: eventSource, virtualKey: lKeyCode, keyDown: true) else {
-        return 0
-    }
-    cmdLDown.flags = .maskCommand
+    guard !targetPath.isEmpty else { return 0 }
 
-    guard let cmdLUp = CGEvent(keyboardEventSource: eventSource, virtualKey: lKeyCode, keyDown: false) else {
-        return 0
-    }
-    cmdLUp.flags = .maskCommand
+    _ = app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+    usleep(120_000)
 
-    cmdLDown.post(tap: .cghidEventTap)
-    usleep(50_000)
-    cmdLUp.post(tap: .cghidEventTap)
-    usleep(100_000)
-
-    // 输入 URL
-    let chars = Array(urlString.utf16)
-    guard let typeEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true) else {
-        return 0
-    }
-    typeEvent.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
-    typeEvent.post(tap: .cghidEventTap)
-    usleep(50_000)
-
-    // 回车
-    let returnKeyCode: CGKeyCode = 36
-    guard let returnDown = CGEvent(keyboardEventSource: eventSource, virtualKey: returnKeyCode, keyDown: true) else {
-        return 0
-    }
-    guard let returnUp = CGEvent(keyboardEventSource: eventSource, virtualKey: returnKeyCode, keyDown: false) else {
-        return 0
-    }
-
-    returnDown.post(tap: .cghidEventTap)
-    usleep(10_000)
-    returnUp.post(tap: .cghidEventTap)
-
-    return 1
+    guard sendKeyTap(keyCode: 5, flags: [.maskCommand, .maskShift]) else { return 0 } // Cmd+Shift+G
+    usleep(160_000)
+    guard sendUnicodeString(targetPath) else { return 0 }
+    usleep(40_000)
+    return sendKeyTap(keyCode: 36, flags: []) ? 1 : 0
 }
 
-/// 根据 bundleId 获取应用名称
-private func getAppNameFromBundleId(_ bundleId: String) -> String {
-    switch bundleId {
-    case "com.apple.Safari":
-        return "Safari"
-    case "com.google.Chrome":
-        return "Google Chrome"
-    case "com.microsoft.edgemac":
-        return "Microsoft Edge"
-    case "org.mozilla.firefox":
-        return "Firefox"
-    case "com.brave.Browser":
-        return "Brave Browser"
-    case "com.vivaldi.Vivaldi":
-        return "Vivaldi"
-    case "company.thebrowser.Browser":
-        return "Arc"
-    case "com.operasoftware.Opera":
-        return "Opera"
-    default:
-        return ""
+/// 发送一个键盘按键组合。
+/// - Parameters:
+///   - keyCode: macOS 虚拟键码
+///   - flags: 需要同时按下的修饰键
+/// - Returns: 事件创建并发送成功返回 true
+private func sendKeyTap(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
+    guard let eventSource = CGEventSource(stateID: .hidSystemState),
+          let downEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: true),
+          let upEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: false) else {
+        return false
     }
+
+    downEvent.flags = flags
+    upEvent.flags = flags
+    downEvent.post(tap: .cghidEventTap)
+    usleep(10_000)
+    upEvent.post(tap: .cghidEventTap)
+    return true
+}
+
+/// 通过 Unicode 键盘事件输入字符串。
+/// - Parameter text: 要输入的文本，支持中文、空格和其它非 ASCII 字符
+/// - Returns: 事件创建并发送成功返回 true
+private func sendUnicodeString(_ text: String) -> Bool {
+    guard !text.isEmpty,
+          let eventSource = CGEventSource(stateID: .hidSystemState),
+          let downEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
+          let upEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false) else {
+        return false
+    }
+
+    let chars = Array(text.utf16)
+    downEvent.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
+    downEvent.post(tap: .cghidEventTap)
+    usleep(10_000)
+    upEvent.post(tap: .cghidEventTap)
+    return true
+}
+
+/// 转义 AppleScript 字符串字面量中的特殊字符。
+/// - Parameter string: 原始路径或文本
+/// - Returns: 可安全放入双引号 AppleScript 字符串中的内容
+private func escapeAppleScriptString(_ string: String) -> String {
+    return string
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
 }
 
 // MARK: - Helper Functions (Utilities)

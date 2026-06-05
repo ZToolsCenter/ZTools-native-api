@@ -15,6 +15,7 @@ macOS 和 Windows 原生 API 的 Node.js 封装，使用 Swift + Win32 API + Nod
 9. **鼠标监控** - 实时监听鼠标移动、点击事件
 10. **鼠标模拟** - 模拟鼠标移动、点击操作
 11. **取色器** - 全屏取色工具
+12. **设置文件窗口地址栏** - 跳转 Finder/Explorer 或文件选择对话框到指定路径
 
 ## 🔧 系统要求
 
@@ -223,6 +224,30 @@ WindowManager.activateWindow(12345);
 #### `WindowManager.getPlatform()`
 获取当前平台
 - **返回**: `'darwin' | 'win32'`
+
+#### `WindowManager.setAddressBar(target, address)`
+设置文件资源管理器/Finder 或文件选择对话框的地址栏位置
+- **参数**:
+  - `target` - 目标窗口
+    - **Windows**: `hwnd` 数字，或 `WindowManager.getActiveWindow()` 返回的窗口对象
+    - **macOS**: `bundleId` / `pid`，或 `WindowManager.getActiveWindow()` 返回的窗口对象
+  - `address` (string) - 要跳转的文件路径或 `file:///` 地址
+- **返回**: `boolean` - 是否设置成功
+- **平台**: ✅ Windows 和 macOS
+
+**限制**:
+- Windows 仅允许 Explorer 顶级窗口和包含 Shell 文件视图的文件选择对话框
+- macOS 仅允许 Finder 和当前焦点为系统文件选择对话框的应用窗口
+- 需要目标窗口可被激活；macOS 文件选择对话框场景需要辅助功能权限
+
+**示例**:
+```javascript
+const current = WindowManager.getActiveWindow();
+WindowManager.setAddressBar(current, process.platform === 'win32'
+  ? 'C:\\Users\\username\\Documents'
+  : '/Users/username/Documents'
+);
+```
 
 #### `WindowManager.simulateKeyboardTap(key, ...modifiers)`
 模拟键盘按键

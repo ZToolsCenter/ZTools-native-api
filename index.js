@@ -291,6 +291,42 @@ class WindowManager {
   static getAllExplorerWindows() {
     return addon.getAllExplorerWindows();
   }
+
+  /**
+   * 设置指定文件资源管理器/Finder 或文件选择对话框的地址栏位置
+   * @param {Object|string|number} target - 目标窗口；Windows 支持 hwnd 数字或包含 hwnd 的窗口对象，macOS 支持 bundleId/pid 或窗口对象
+   * @param {string} address - 要跳转的文件路径或 file:/// 地址
+   * @returns {boolean} 是否设置成功
+   * @example
+   * const win = WindowManager.getActiveWindow();
+   * WindowManager.setAddressBar(win, 'C:\\Users\\username\\Documents');
+   */
+  static setAddressBar(target, address) {
+    if (typeof address !== 'string' || !address) {
+      throw new TypeError('address must be a non-empty string');
+    }
+
+    let identifier = target;
+    if (target && typeof target === 'object') {
+      if (platform === 'win32') {
+        identifier = target.hwnd;
+      } else if (platform === 'darwin') {
+        identifier = target.bundleId || target.pid;
+      }
+    }
+
+    if (platform === 'win32') {
+      if (typeof identifier !== 'number') {
+        throw new TypeError('On Windows, target must be a hwnd number or a window object with hwnd');
+      }
+    } else if (platform === 'darwin') {
+      if (typeof identifier !== 'string' && typeof identifier !== 'number') {
+        throw new TypeError('On macOS, target must be a bundleId, pid, or window object with bundleId/pid');
+      }
+    }
+
+    return addon.setAddressBar(identifier, address);
+  }
 }
 
 class MouseMonitor {
