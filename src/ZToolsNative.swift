@@ -423,7 +423,7 @@ private func getFrontmostAppUsingCG() -> WindowMetadata? {
             }
             kind = "mac-finder"
             preciseTarget = finderId != nil
-        } else if axRole == kAXDialogRole as String || axSubrole == kAXSystemDialogSubrole as String || axSubrole == "AXSheet" {
+        } else if axSubrole == kAXDialogSubrole as String || axSubrole == kAXSystemDialogSubrole as String || axRole == "AXSheet" || axSubrole == "AXSheet" {
             kind = "mac-file-dialog"
             preciseTarget = windowId > 0
         }
@@ -1914,7 +1914,7 @@ private func isFocusedFileDialog(of pid: pid_t) -> Bool {
 
     let role = roleValue as? String ?? ""
     let subrole = subroleValue as? String ?? ""
-    if role == kAXDialogRole as String || subrole == kAXSystemDialogSubrole as String {
+    if subrole == kAXDialogSubrole as String || subrole == kAXSystemDialogSubrole as String || role == "AXSheet" || subrole == "AXSheet" {
         return true
     }
 
