@@ -4978,8 +4978,11 @@ Napi::Value GetExplorerFolderPath(const Napi::CallbackInfo& info) {
 
     // 初始化 COM（STA 模式，与 Electron 主线程兼容）
     HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    // S_OK 或 S_FALSE（已初始化）都是可接受的
-    bool needUninit = (hrInit == S_OK);
+    // S_OK 和 S_FALSE 都表示本次 CoInitializeEx 成功，需要配对 CoUninitialize
+    bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    if (FAILED(hrInit)) {
+        return env.Null();
+    }
 
     std::string result;
 
@@ -5052,6 +5055,440 @@ Napi::Value GetExplorerFolderPath(const Napi::CallbackInfo& info) {
         return env.Null();
     }
     return Napi::String::New(env, result);
+}
+
+std::wstring Utf8ToWideString(const std::string& input);
+std::string WideToUtf8String(const std::wstring& input);
+
+static std::string FileUrlToPath(const std::wstring& fileUrl) {
+    DWORD pathLength = 32768;
+    std::wstring path(pathLength, L'\0');
+    HRESULT hr = PathCreateFromUrlW(fileUrl.c_str(), &path[0], &pathLength, 0);
+    if (FAILED(hr) || pathLength == 0) {
+        return std::string();
+    }
+    path.resize(pathLength);
+    return WideToUtf8String(path);
+}
+
+/**
+ * 获取所有打开的文件资源管理器窗口的结构化信息。
+ *
+ * 工作原理：
+ * 1. 初始化当前线程的 COM STA 环境，枚举所有 Shell 窗口（IShellWindows）
+ * 2. 读取每个窗口的 HWND 与 LocationURL，并仅保留 file:// URL
+ * 3. 补充顶级窗口标题和类名，调用方可用 hwnd 精确定位目标窗口
+ *
+ * @returns Array<object> - Explorer 窗口信息数组；COM 初始化失败或无窗口时返回空数组
+ */
+Napi::Value GetAllExplorerWindows(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+
+    std::vector<Napi::Object> results;
+
+    if (FAILED(hrInit)) {
+        return Napi::Array::New(env, 0);
+    }
+
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_IShellWindows, (void**)&shellWindows
+    );
+
+    if (SUCCEEDED(hr) && shellWindows) {
+        long count = 0;
+        shellWindows->get_Count(&count);
+
+        for (long i = 0; i < count; i++) {
+            VARIANT idx;
+            VariantInit(&idx);
+            idx.vt = VT_I4;
+            idx.lVal = i;
+
+            IDispatch* disp = nullptr;
+            hr = shellWindows->Item(idx, &disp);
+            VariantClear(&idx);
+            if (FAILED(hr) || !disp) continue;
+
+            IWebBrowserApp* browser = nullptr;
+            hr = disp->QueryInterface(IID_IWebBrowserApp, (void**)&browser);
+            disp->Release();
+
+            if (FAILED(hr) || !browser) continue;
+
+            SHANDLE_PTR browserHwndPtr = 0;
+            browser->get_HWND(&browserHwndPtr);
+            HWND browserHwnd = reinterpret_cast<HWND>(browserHwndPtr);
+
+            BSTR url = nullptr;
+            hr = browser->get_LocationURL(&url);
+            if (SUCCEEDED(hr) && url) {
+                std::wstring urlWide(url, SysStringLen(url));
+                std::string urlStr = WideToUtf8String(urlWide);
+                if (urlStr.rfind("file://", 0) == 0 && browserHwnd && IsWindow(browserHwnd)) {
+                    WCHAR title[512] = {0};
+                    WCHAR className[256] = {0};
+                    GetWindowTextW(browserHwnd, title, 512);
+                    GetClassNameW(browserHwnd, className, 256);
+
+                    Napi::Object item = Napi::Object::New(env);
+                    item.Set("platform", Napi::String::New(env, "win32"));
+                    item.Set("kind", Napi::String::New(env, "windows-explorer"));
+                    item.Set("preciseTarget", Napi::Boolean::New(env, true));
+                    item.Set("hwnd", Napi::Number::New(env, reinterpret_cast<uint64_t>(browserHwnd)));
+                    item.Set("url", Napi::String::New(env, urlStr));
+                    const std::string pathStr = FileUrlToPath(urlWide);
+                    if (!pathStr.empty()) {
+                        item.Set("path", Napi::String::New(env, pathStr));
+                    }
+                    item.Set("title", Napi::String::New(env, WideToUtf8String(title)));
+                    item.Set("className", Napi::String::New(env, WideToUtf8String(className)));
+                    item.Set("app", Napi::String::New(env, "explorer.exe"));
+                    results.push_back(item);
+                }
+                SysFreeString(url);
+            }
+
+            browser->Release();
+        }
+
+        shellWindows->Release();
+    }
+
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    Napi::Array resultArray = Napi::Array::New(env, results.size());
+    for (size_t i = 0; i < results.size(); i++) {
+        resultArray[i] = results[i];
+    }
+    return resultArray;
+}
+
+struct ChildClassSearchContext {
+    const wchar_t** classNames;
+    size_t classCount;
+    bool found;
+};
+
+/**
+ * 枚举子窗口并查找指定窗口类名。
+ *
+ * 用于确认 #32770 对话框是否真的是 Shell 文件选择对话框：普通系统对话框也会使用
+ * #32770 顶级类名，只有包含地址栏/文件列表相关子控件时才允许写入地址。
+ */
+static BOOL CALLBACK FindChildClassProc(HWND child, LPARAM lParam) {
+    ChildClassSearchContext* context = reinterpret_cast<ChildClassSearchContext*>(lParam);
+    if (!context || context->found) {
+        return FALSE;
+    }
+
+    WCHAR className[256] = {0};
+    int classLen = GetClassNameW(child, className, 256);
+    if (classLen > 0) {
+        for (size_t i = 0; i < context->classCount; i++) {
+            if (wcscmp(className, context->classNames[i]) == 0) {
+                context->found = true;
+                return FALSE;
+            }
+        }
+    }
+
+    EnumChildWindows(child, FindChildClassProc, lParam);
+    return !context->found;
+}
+
+/**
+ * 判断窗口是否包含 Shell 文件对话框的典型子控件。
+ *
+ * 现代和旧版 Windows 文件选择对话框的内部类名略有差异，因此同时匹配面包屑地址栏、
+ * Shell 文件视图和 DirectUI 文件视图，尽量覆盖打开/保存/选择文件夹等场景。
+ */
+static bool HasFileDialogChildControls(HWND hwnd) {
+    const wchar_t* fileDialogClasses[] = {
+        L"Breadcrumb Parent",
+        L"Address Band Root",
+        L"SHELLDLL_DefView",
+        L"DUIViewWndClassName"
+    };
+    ChildClassSearchContext context = { fileDialogClasses, 4, false };
+    EnumChildWindows(hwnd, FindChildClassProc, reinterpret_cast<LPARAM>(&context));
+    return context.found;
+}
+
+/**
+ * 判断目标窗口是否是允许修改地址栏的文件定位窗口。
+ *
+ * 仅放行 Explorer 顶级窗口和常见文件选择对话框，避免把传入地址写入浏览器、编辑器
+ * 或其它普通应用的输入框。文件对话框可能属于任意宿主进程，因此额外允许 #32770
+ * 对话框类名；Explorer 则通过 CabinetWClass/ExploreWClass 识别。
+ */
+static bool IsFileLocationWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+
+    WCHAR className[256] = {0};
+    int classLen = GetClassNameW(hwnd, className, 256);
+    if (classLen <= 0) {
+        return false;
+    }
+
+    if (wcscmp(className, L"CabinetWClass") == 0 ||
+        wcscmp(className, L"ExploreWClass") == 0) {
+        return true;
+    }
+
+    if (wcscmp(className, L"#32770") == 0) {
+        return HasFileDialogChildControls(hwnd);
+    }
+
+    return false;
+}
+
+Napi::Value IsFileLocationWindowBinding(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "hwnd (number) is required").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    uint64_t hwndValue = static_cast<uint64_t>(info[0].As<Napi::Number>().Int64Value());
+    HWND hwnd = reinterpret_cast<HWND>(hwndValue);
+    return Napi::Boolean::New(env, IsFileLocationWindow(hwnd));
+}
+
+/**
+ * 将目标窗口切到前台并获得键盘输入焦点。
+ *
+ * Windows 对跨进程 SetForegroundWindow 有限制，这里临时附加当前线程、前台线程和目标
+ * 窗口线程的输入队列，确保后续 Ctrl+L、文本输入和 Enter 被发送到指定窗口。
+ */
+static bool FocusTargetWindow(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+
+    HWND foregroundWnd = GetForegroundWindow();
+    DWORD foregroundThreadId = GetWindowThreadProcessId(foregroundWnd, NULL);
+    DWORD targetThreadId = GetWindowThreadProcessId(hwnd, NULL);
+    DWORD currentThreadId = GetCurrentThreadId();
+
+    BOOL attachedForeground = FALSE;
+    BOOL attachedCurrent = FALSE;
+
+    if (foregroundThreadId != targetThreadId) {
+        attachedForeground = AttachThreadInput(foregroundThreadId, targetThreadId, TRUE);
+    }
+    if (currentThreadId != targetThreadId && currentThreadId != foregroundThreadId) {
+        attachedCurrent = AttachThreadInput(currentThreadId, targetThreadId, TRUE);
+    }
+
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    SetFocus(hwnd);
+
+    if (attachedForeground) {
+        AttachThreadInput(foregroundThreadId, targetThreadId, FALSE);
+    }
+    if (attachedCurrent) {
+        AttachThreadInput(currentThreadId, targetThreadId, FALSE);
+    }
+
+    return GetForegroundWindow() == hwnd;
+}
+
+static bool NavigateExplorerWindow(HWND targetHwnd, const std::wstring& address) {
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    if (FAILED(hrInit)) {
+        return false;
+    }
+
+    bool success = false;
+    IShellWindows* shellWindows = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+        IID_IShellWindows, reinterpret_cast<void**>(&shellWindows)
+    );
+
+    if (SUCCEEDED(hr) && shellWindows) {
+        long count = 0;
+        shellWindows->get_Count(&count);
+
+        for (long i = 0; i < count; i++) {
+            VARIANT idx;
+            VariantInit(&idx);
+            idx.vt = VT_I4;
+            idx.lVal = i;
+
+            IDispatch* disp = nullptr;
+            hr = shellWindows->Item(idx, &disp);
+            if (FAILED(hr) || !disp) continue;
+
+            IWebBrowser2* browser = nullptr;
+            hr = disp->QueryInterface(IID_IWebBrowser2, reinterpret_cast<void**>(&browser));
+            disp->Release();
+
+            if (FAILED(hr) || !browser) continue;
+
+            SHANDLE_PTR browserHwndPtr = 0;
+            hr = browser->get_HWND(&browserHwndPtr);
+            if (SUCCEEDED(hr) && reinterpret_cast<HWND>(browserHwndPtr) == targetHwnd) {
+                VARIANT url;
+                VariantInit(&url);
+                url.vt = VT_BSTR;
+                url.bstrVal = SysAllocString(address.c_str());
+
+                VARIANT empty;
+                VariantInit(&empty);
+                hr = browser->Navigate2(&url, &empty, &empty, &empty, &empty);
+                success = SUCCEEDED(hr);
+
+                VariantClear(&url);
+                browser->Release();
+                break;
+            }
+
+            browser->Release();
+        }
+
+        shellWindows->Release();
+    }
+
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    return success;
+}
+
+/**
+ * 发送 Ctrl+L 快捷键，用于聚焦 Explorer 或文件对话框的地址栏。
+ *
+ * 该快捷键是 Windows Shell 文件定位界面的通用入口；如果窗口类型已被
+ * IsFileLocationWindow 限制为文件定位窗口，使用它比遍历不同版本 Shell UIA 树更稳定。
+ */
+static bool SendFocusAddressBarShortcut() {
+    INPUT inputs[4] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'L';
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'L';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    return SendInput(4, inputs, sizeof(INPUT)) == 4;
+}
+
+/**
+ * 使用 KEYEVENTF_UNICODE 输入任意 UTF-16 文本。
+ *
+ * 直接发送 Unicode 字符可以覆盖中文、空格和非 ASCII 路径，避免键盘布局影响。
+ */
+static bool SendUnicodeText(const std::wstring& text) {
+    if (text.empty()) {
+        return false;
+    }
+
+    std::vector<INPUT> inputs;
+    inputs.reserve(text.size() * 2);
+    for (wchar_t ch : text) {
+        INPUT down = {};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wScan = ch;
+        down.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs.push_back(down);
+
+        INPUT up = {};
+        up.type = INPUT_KEYBOARD;
+        up.ki.wScan = ch;
+        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(up);
+    }
+
+    UINT sent = SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    return sent == inputs.size();
+}
+
+/**
+ * 发送一个虚拟键的按下和释放事件。
+ *
+ * 主要用于在地址栏文本写入后发送 Enter，让 Explorer 或文件对话框跳转到目标地址。
+ */
+static bool SendVirtualKeyTap(WORD vk) {
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = vk;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = vk;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    return SendInput(2, inputs, sizeof(INPUT)) == 2;
+}
+
+/**
+ * 将指定 Explorer 或文件选择对话框的地址栏设置为传入地址。
+ *
+ * 参数：
+ * 1. hwnd: number - 目标文件资源管理器或文件选择对话框顶级窗口句柄
+ * 2. address: string - 目标文件夹路径或 file:/// URL
+ *
+ * 返回 true 表示快捷键、文本输入和跳转键都发送成功；目标窗口不是受支持类型、
+ * 不存在或无法获得焦点时返回 false。调用方可用 getActiveWindow() 的 hwnd 字段作为目标。
+ */
+Napi::Value SetAddressBar(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsString()) {
+        Napi::TypeError::New(env, "hwnd (number) and address (string) are required").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    uint64_t hwndValue = static_cast<uint64_t>(info[0].As<Napi::Number>().Int64Value());
+    HWND targetHwnd = reinterpret_cast<HWND>(hwndValue);
+    std::string addressUtf8 = info[1].As<Napi::String>().Utf8Value();
+    std::wstring address = Utf8ToWideString(addressUtf8);
+
+    if (address.empty() || !IsFileLocationWindow(targetHwnd)) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    WCHAR className[256] = {0};
+    GetClassNameW(targetHwnd, className, 256);
+    if (wcscmp(className, L"CabinetWClass") == 0 ||
+        wcscmp(className, L"ExploreWClass") == 0) {
+        return Napi::Boolean::New(env, NavigateExplorerWindow(targetHwnd, address));
+    }
+
+    if (!FocusTargetWindow(targetHwnd)) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    Sleep(60);
+    bool success = SendFocusAddressBarShortcut();
+    Sleep(80);
+    success = SendUnicodeText(address) && success;
+    Sleep(30);
+    success = SendVirtualKeyTap(VK_RETURN) && success;
+
+    return Napi::Boolean::New(env, success);
 }
 
 // ==================== 浏览器 URL 查询 ====================
@@ -5394,7 +5831,11 @@ Napi::Value ReadBrowserWindowUrl(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[2].As<Napi::Function>();
 
     HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const bool needUninit = (hrInit == S_OK);
+    const bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    if (FAILED(hrInit)) {
+        callback.Call({ env.Null() });
+        return env.Undefined();
+    }
 
     std::string result;
 
@@ -5450,6 +5891,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
     // 通过 COM IShellWindows 查询 Explorer 窗口的当前文件夹路径
     exports.Set("getExplorerFolderPath", Napi::Function::New(env, GetExplorerFolderPath));
+    // 获取所有打开的文件资源管理器窗口的 URL 列表
+    exports.Set("getAllExplorerWindows", Napi::Function::New(env, GetAllExplorerWindows));
+    // 设置 Explorer 或文件选择对话框地址栏
+    exports.Set("setAddressBar", Napi::Function::New(env, SetAddressBar));
+    // 判断窗口是否是可安全修改地址栏的文件定位窗口
+    exports.Set("isFileLocationWindow", Napi::Function::New(env, IsFileLocationWindowBinding));
     // 读取指定浏览器窗口的当前 URL
     exports.Set("readBrowserWindowUrl", Napi::Function::New(env, ReadBrowserWindowUrl));
     exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));

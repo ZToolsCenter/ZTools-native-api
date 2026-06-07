@@ -276,6 +276,64 @@ class WindowManager {
     }
     return addon.simulateKeyboardTap(key, ...modifiers);
   }
+  /**
+   * 获取所有打开的文件资源管理器/Finder 窗口信息
+   * @returns {Array<{platform?: string, kind?: string, preciseTarget?: boolean, hwnd?: number, windowId?: number, finderId?: number, pid?: number, bundleId?: string, app?: string, title?: string, className?: string, axRole?: string, axSubrole?: string, path?: string, url?: string}>}
+   */
+  static getAllExplorerWindows() {
+    return addon.getAllExplorerWindows();
+  }
+
+  /**
+   * 判断指定窗口是否是可安全修改地址栏的文件定位窗口
+   * @param {number} hwnd - Windows 窗口句柄
+   * @returns {boolean}
+   */
+  static isFileLocationWindow(hwnd) {
+    if (platform !== 'win32') {
+      throw new Error('isFileLocationWindow is only available on Windows');
+    }
+    if (typeof hwnd !== 'number' || !Number.isFinite(hwnd) || hwnd <= 0) {
+      throw new TypeError('hwnd must be a positive number');
+    }
+    return addon.isFileLocationWindow(hwnd);
+  }
+
+  /**
+   * 设置指定文件资源管理器/Finder 或文件选择对话框的地址栏位置
+   * @param {Object|string|number} target - 目标窗口；Windows 支持 hwnd 数字或包含 hwnd 的窗口对象，macOS 支持 bundleId/pid 或窗口对象
+   * @param {string} address - 要跳转的文件路径或 file:/// 地址
+   * @returns {boolean} 是否设置成功
+   * @example
+   * const win = WindowManager.getActiveWindow();
+   * WindowManager.setAddressBar(win, 'C:\\Users\\username\\Documents');
+   */
+  static setAddressBar(target, address) {
+    if (typeof address !== 'string' || !address) {
+      throw new TypeError('address must be a non-empty string');
+    }
+
+    let identifier = target;
+    if (target && typeof target === 'object') {
+      if (platform === 'win32') {
+        identifier = target.hwnd;
+      } else if (platform === 'darwin') {
+        identifier = target;
+      }
+    }
+
+    if (platform === 'win32') {
+      if (typeof identifier !== 'number') {
+        throw new TypeError('On Windows, target must be a hwnd number or a window object with hwnd');
+      }
+    } else if (platform === 'darwin') {
+      if (typeof identifier !== 'string' && typeof identifier !== 'number') {
+        throw new TypeError('On macOS, target must be a bundleId, pid, or window object with bundleId/pid');
+      }
+    }
+
+    return addon.setAddressBar(identifier, address);
+  }
 }
 
 class MouseMonitor {
