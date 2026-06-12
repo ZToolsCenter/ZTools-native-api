@@ -10,6 +10,7 @@ typedef void (*ClipboardCallback)();          // 无参数回调
 typedef void (*WindowCallback)(const char *); // 带JSON字符串参数回调
 typedef void (*StartMonitorFunc)(ClipboardCallback);
 typedef void (*StopMonitorFunc)();
+typedef void (*SetClipboardPollingBoostFunc)(int32_t, int32_t);
 typedef void (*StartWindowMonitorFunc)(WindowCallback);
 typedef void (*StopWindowMonitorFunc)();
 typedef char *(*GetActiveWindowFunc)();
@@ -40,6 +41,7 @@ static napi_threadsafe_function tsfn = nullptr;
 static napi_threadsafe_function windowTsfn = nullptr;
 static StartMonitorFunc startMonitorFunc = nullptr;
 static StopMonitorFunc stopMonitorFunc = nullptr;
+static SetClipboardPollingBoostFunc setClipboardPollingBoostFunc = nullptr;
 static StartWindowMonitorFunc startWindowMonitorFunc = nullptr;
 static StopWindowMonitorFunc stopWindowMonitorFunc = nullptr;
 static GetActiveWindowFunc getActiveWindowFunc = nullptr;
@@ -199,6 +201,8 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (StartMonitorFunc)dlsym(swiftLibHandle, "startClipboardMonitor");
   stopMonitorFunc =
       (StopMonitorFunc)dlsym(swiftLibHandle, "stopClipboardMonitor");
+  setClipboardPollingBoostFunc =
+      (SetClipboardPollingBoostFunc)dlsym(swiftLibHandle, "setClipboardPollingBoost");
   startWindowMonitorFunc =
       (StartWindowMonitorFunc)dlsym(swiftLibHandle, "startWindowMonitor");
   stopWindowMonitorFunc =
@@ -320,6 +324,28 @@ Napi::Value PauseMonitor(const Napi::CallbackInfo &info) {
 Napi::Value ResumeMonitor(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
   g_isPaused = false;
+  return env.Undefined();
+}
+
+// 设置剪贴板轮询加速
+Napi::Value SetClipboardPollingBoost(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "Expected intervalMs and durationMs numbers")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (setClipboardPollingBoostFunc == nullptr) {
+    Napi::Error::New(env, "setClipboardPollingBoost is not available")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  const int32_t intervalMs = info[0].As<Napi::Number>().Int32Value();
+  const int32_t durationMs = info[1].As<Napi::Number>().Int32Value();
+  setClipboardPollingBoostFunc(intervalMs, durationMs);
   return env.Undefined();
 }
 
@@ -1269,6 +1295,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("stopMonitor", Napi::Function::New(env, StopMonitor));
   exports.Set("pauseMonitor", Napi::Function::New(env, PauseMonitor));
   exports.Set("resumeMonitor", Napi::Function::New(env, ResumeMonitor));
+  exports.Set("setClipboardPollingBoost",
+              Napi::Function::New(env, SetClipboardPollingBoost));
   exports.Set("startWindowMonitor",
               Napi::Function::New(env, StartWindowMonitor));
   exports.Set("stopWindowMonitor", Napi::Function::New(env, StopWindowMonitor));

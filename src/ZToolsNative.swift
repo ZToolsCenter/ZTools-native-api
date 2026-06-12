@@ -11,6 +11,10 @@ public typealias WindowCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
 // 全局监控状态
 private var clipboardMonitorQueue: DispatchQueue?
 private var isClipboardMonitoring = false
+private let clipboardMonitorWakeup = DispatchSemaphore(value: 0)
+private var clipboardPollingIntervalUs: UInt32 = 500_000
+private var clipboardPollingBoostIntervalUs: UInt32 = 50_000
+private var clipboardPollingBoostUntil: UInt64 = 0
 
 // 窗口监控状态
 private var windowMonitorObserver: NSObjectProtocol?
@@ -125,7 +129,12 @@ public func startClipboardMonitor(_ callback: ClipboardCallback?) {
         print("Clipboard monitor started")
 
         while isClipboardMonitoring {
-            usleep(500_000) // 0.5 秒检查一次
+            let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+            let currentIntervalUs = nowMs < clipboardPollingBoostUntil
+                ? clipboardPollingBoostIntervalUs
+                : clipboardPollingIntervalUs
+            let timeout = DispatchTime.now() + .microseconds(Int(currentIntervalUs))
+            _ = clipboardMonitorWakeup.wait(timeout: timeout)
 
             let currentCount = pasteboard.changeCount
             if currentCount != changeCount {
@@ -140,10 +149,26 @@ public func startClipboardMonitor(_ callback: ClipboardCallback?) {
     }
 }
 
+/// 临时提升剪贴板轮询频率
+@_cdecl("setClipboardPollingBoost")
+public func setClipboardPollingBoost(_ intervalMs: Int32, _ durationMs: Int32) {
+    guard intervalMs > 0, durationMs > 0 else {
+        return
+    }
+
+    clipboardPollingBoostIntervalUs = UInt32(intervalMs) * 1000
+    let nextBoostUntil = UInt64(Date().timeIntervalSince1970 * 1000) + UInt64(durationMs)
+    if nextBoostUntil > clipboardPollingBoostUntil {
+        clipboardPollingBoostUntil = nextBoostUntil
+    }
+    clipboardMonitorWakeup.signal()
+}
+
 /// 停止剪贴板监控
 @_cdecl("stopClipboardMonitor")
 public func stopClipboardMonitor() {
     isClipboardMonitoring = false
+    clipboardMonitorWakeup.signal()
     clipboardMonitorQueue = nil
 }
 
