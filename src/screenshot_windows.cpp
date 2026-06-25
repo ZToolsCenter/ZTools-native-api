@@ -115,7 +115,8 @@ enum AnnotationType {
     AT_Circle,
     AT_Arrow,
     AT_Brush,
-    AT_Text
+    AT_Text,
+    AT_Mosaic              // 马赛克（框选区域 或 鼠标涂抹）
 };
 
 struct Annotation {
@@ -124,9 +125,14 @@ struct Annotation {
     int thickness;          // 逻辑像素（矢量=线宽；文字=字号）
     // 绝对虚拟屏幕坐标（与 ctx->mouseX/selection 同坐标系）。
     // 用绝对坐标而非选区相对，保证选区缩放/移动时标注位置固定不动。
-    int x1, y1, x2, y2;     // Rect / Circle / Arrow 的起止（绝对坐标）；AT_Text 的 x1/y1 为文字锚点
-    std::vector<POINT> pts; // Brush 自由路径（绝对坐标）
+    int x1, y1, x2, y2;     // Rect / Circle / Arrow 的起止（绝对坐标）；AT_Text 的 x1/y1 为文字锚点；
+                            // AT_Mosaic 框选模式的矩形起止（绝对坐标）
+    std::vector<POINT> pts; // Brush 自由路径（绝对坐标）；AT_Mosaic 涂抹模式的路径（绝对坐标）
     std::wstring text;      // AT_Text 的文字内容
+    // ---- AT_Mosaic 专用 ----
+    bool mosaicRect;        // true=框选区域马赛克；false=鼠标涂抹马赛克
+    int mosaicSize;         // 马赛克块大小（逻辑像素）
+    int brushRadius;        // 涂抹半径（逻辑像素，仅涂抹模式有效）
 };
 
 // 粗细预设（逻辑像素，实际绘制粗细，渲染时乘 dpiScale）
@@ -142,6 +148,16 @@ static const int SC_FONT_SIZES[] = { 16, 24, 36 };
 static const int SC_FONT_COUNT = sizeof(SC_FONT_SIZES) / sizeof(SC_FONT_SIZES[0]);
 static const int SC_DEFAULT_FONT_IDX = 1;  // 默认中号
 static const wchar_t* SC_FONT_FACE = L"微软雅黑";
+
+// 马赛克块大小预设（逻辑像素），马赛克工具子菜单显示
+static const int SC_MOSAIC_SIZES[] = { 6, 10, 16 };
+static const int SC_MOSAIC_COUNT = sizeof(SC_MOSAIC_SIZES) / sizeof(SC_MOSAIC_SIZES[0]);
+static const int SC_DEFAULT_MOSAIC_IDX = 1;  // 默认中等块
+// 涂抹半径预设（逻辑像素），马赛克涂抹模式使用，与画笔粗细预设共用同一组子菜单第二组无效，
+// 这里单独定义便于扩展。半径越大涂抹范围越宽。
+static const int SC_MOSAIC_RADIUS[] = { 12, 22, 36 };
+static const int SC_MOSAIC_RADIUS_COUNT = sizeof(SC_MOSAIC_RADIUS) / sizeof(SC_MOSAIC_RADIUS[0]);
+static const int SC_DEFAULT_MOSAIC_RADIUS_IDX = 1;  // 默认中等半径
 
 // 颜色预设
 static const COLORREF SC_COLOR_PRESETS[] = {
@@ -483,14 +499,11 @@ static void CalcPopupSize(const SCPopupMetrics& m, int& outW, int& outH) {
     outH = m.cell + m.pad * 2 + m.border * 2;
 }
 
-// 计算子菜单位置：贴工具栏下方，放不下则上方，左右钳制到虚拟屏幕内。
-// toolbarRect / out 均为相对虚拟屏幕坐标（与工具栏一致）。
-static void CalcPopupPosition(const RECT& toolbarRect,
-                              int virtualW, int virtualH,
-                              const SCPopupMetrics& m, RECT& out) {
-    int pw, ph;
-    CalcPopupSize(m, pw, ph);
-
+// 计算子菜单位置（通用）：贴工具栏下方，放不下则上方，左右钳制到虚拟屏幕内。
+// toolbarRect / out 均为相对虚拟屏幕坐标；pw/ph 为子菜单尺寸。
+static void CalcPopupPlacement(const RECT& toolbarRect,
+                               int virtualW, int virtualH,
+                               const SCPopupMetrics& m, int pw, int ph, RECT& out) {
     // 水平：与工具栏左对齐
     int x = toolbarRect.left;
     // 垂直：优先工具栏下方
@@ -506,6 +519,219 @@ static void CalcPopupPosition(const RECT& toolbarRect,
     out.top = y;
     out.right = x + pw;
     out.bottom = y + ph;
+}
+
+// 计算子菜单位置：贴工具栏下方，放不下则上方，左右钳制到虚拟屏幕内。
+// toolbarRect / out 均为相对虚拟屏幕坐标（与工具栏一致）。
+static void CalcPopupPosition(const RECT& toolbarRect,
+                              int virtualW, int virtualH,
+                              const SCPopupMetrics& m, RECT& out) {
+    int pw, ph;
+    CalcPopupSize(m, pw, ph);
+    CalcPopupPlacement(toolbarRect, virtualW, virtualH, m, pw, ph, out);
+}
+
+// 马赛克子菜单几何常量
+// 模式切换组：2 个单元格（涂抹 / 框选）；块大小组：3 个单元格。
+static const int SC_MOSAIC_MODE_COUNT = 2;   // 涂抹、框选
+// 涂抹模式用半径圆点表示，块大小用马赛克方块网格表示（绘制时按预设值缩放）
+
+// 计算马赛克子菜单总宽/高（单行）。
+// 布局：[模式×2] sepGap | 分隔线 | sepGap [块大小×3] sepGap | 分隔线 | sepGap [涂抹半径×3]
+static void CalcMosaicPopupSize(const SCPopupMetrics& m, int& outW, int& outH) {
+    int cellGap = (int)(SC_TOOLBAR_GAP * (m.cell / (double)SC_POPUP_CELL) + 0.5);
+    int modeW = SC_MOSAIC_MODE_COUNT * m.cell + (SC_MOSAIC_MODE_COUNT - 1) * cellGap;
+    int sizeW = SC_MOSAIC_COUNT * m.cell + (SC_MOSAIC_COUNT - 1) * cellGap;
+    int radiusW = SC_MOSAIC_RADIUS_COUNT * m.cell + (SC_MOSAIC_RADIUS_COUNT - 1) * cellGap;
+    // 两组分隔线，每组分隔线宽 = sepGap*2 + 1
+    int contentW = modeW + (m.sepGap * 2 + 1) + sizeW + (m.sepGap * 2 + 1) + radiusW;
+    outW = contentW + m.pad * 2 + m.border * 2;
+    outH = m.cell + m.pad * 2 + m.border * 2;
+}
+
+// 命中测试马赛克子菜单，返回值约定：
+//   +1       = 涂抹模式；+2 = 框选模式
+//   +101..   = 第 N 个块大小（100 + sizeIdx + 1）
+//   +201..   = 第 N 个涂抹半径（200 + radiusIdx + 1）
+//    0 = 未命中
+static int HitTestMosaicPopup(int x, int y, const RECT& popupRect, const SCPopupMetrics& m) {
+    if (!PointInRect(x, y, popupRect)) return 0;
+    int contentLeft = popupRect.left + m.border + m.pad;
+    int contentTop = popupRect.top + m.border + m.pad;
+    int cellGap = (int)(SC_TOOLBAR_GAP * (m.cell / (double)SC_POPUP_CELL) + 0.5);
+    if (y < contentTop || y >= contentTop + m.cell) return 0;
+
+    // 模式组
+    for (int i = 0; i < SC_MOSAIC_MODE_COUNT; i++) {
+        int ix = contentLeft + i * (m.cell + cellGap);
+        if (x >= ix && x < ix + m.cell) return i + 1;  // +1=涂抹 +2=框选
+    }
+    int modeEndX = contentLeft + SC_MOSAIC_MODE_COUNT * m.cell
+        + (SC_MOSAIC_MODE_COUNT - 1) * cellGap;
+    int sizeStartX = modeEndX + m.sepGap * 2 + 1;
+    if (x < sizeStartX) return 0;  // 第一条分隔线区域
+    // 块大小组
+    int sizeEndX = sizeStartX + SC_MOSAIC_COUNT * m.cell
+        + (SC_MOSAIC_COUNT - 1) * cellGap;
+    for (int i = 0; i < SC_MOSAIC_COUNT; i++) {
+        int ix = sizeStartX + i * (m.cell + cellGap);
+        if (x >= ix && x < ix + m.cell) return 100 + i + 1;
+    }
+    // 涂抹半径组
+    int radiusStartX = sizeEndX + m.sepGap * 2 + 1;
+    if (x < radiusStartX) return 0;  // 第二条分隔线区域
+    for (int i = 0; i < SC_MOSAIC_RADIUS_COUNT; i++) {
+        int ix = radiusStartX + i * (m.cell + cellGap);
+        if (x >= ix && x < ix + m.cell) return 200 + i + 1;
+    }
+    return 0;
+}
+
+// 绘制马赛克子菜单（单行）。
+// modeIdx：当前模式（0=涂抹 1=框选）；sizeIdx：当前块大小索引；radiusIdx：涂抹半径索引。
+static void DrawMosaicPopup(HDC hdc, const RECT& popupRect,
+                            int modeIdx, int sizeIdx, int radiusIdx,
+                            const SCPopupMetrics& m) {
+    Gdiplus::GdiplusStartupInput startupInput;
+    ULONG_PTR gdipToken;
+    Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL);
+    {
+        Gdiplus::Graphics graphics(hdc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+        int pw = popupRect.right - popupRect.left;
+        int ph = popupRect.bottom - popupRect.top;
+
+        // 白色圆角背景 + 浅灰边框
+        Gdiplus::SolidBrush whiteBrush(Gdiplus::Color(255, 255, 255, 255));
+        Gdiplus::GraphicsPath bgPath;
+        AddRoundedRect(bgPath, popupRect.left, popupRect.top, pw, ph, m.radius);
+        graphics.FillPath(&whiteBrush, &bgPath);
+        Gdiplus::Pen borderPen(Gdiplus::Color(255, 210, 210, 210), (Gdiplus::REAL)m.border);
+        graphics.DrawPath(&borderPen, &bgPath);
+
+        int contentLeft = popupRect.left + m.border + m.pad;
+        int contentTop = popupRect.top + m.border + m.pad;
+        int midY = contentTop + m.cell / 2;
+        int cellGap = (int)(SC_TOOLBAR_GAP * (m.cell / (double)SC_POPUP_CELL) + 0.5);
+
+        auto drawCellBg = [&](int cellLeft) {
+            Gdiplus::GraphicsPath p;
+            AddRoundedRect(p, cellLeft, contentTop, m.cell, m.cell, m.cell / 4);
+            Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 225, 237, 253));
+            graphics.FillPath(&bgBrush, &p);
+            Gdiplus::Pen edgePen(Gdiplus::Color(90, 160, 160, 160), 1.0f);
+            graphics.DrawPath(&edgePen, &p);
+        };
+        auto cellColor = [&](bool sel) -> Gdiplus::Color {
+            return sel ? Gdiplus::Color(255, 0x3B, 0x8B, 0xF2)
+                       : Gdiplus::Color(255, 0x33, 0x33, 0x33);
+        };
+
+        // 模式组
+        for (int i = 0; i < SC_MOSAIC_MODE_COUNT; i++) {
+            int cellLeft = contentLeft + i * (m.cell + cellGap);
+            bool sel = (i == modeIdx);
+            if (sel) drawCellBg(cellLeft);
+            int cx = cellLeft + m.cell / 2;
+            Gdiplus::Color c = cellColor(sel);
+            if (i == 0) {
+                // 涂抹模式：画一个画笔/毛刷图标（一条波浪线 + 圆头）
+                Gdiplus::Pen pen(c, (Gdiplus::REAL)2.0f);
+                pen.SetLineJoin(Gdiplus::LineJoinRound);
+                pen.SetStartCap(Gdiplus::LineCapRound);
+                pen.SetEndCap(Gdiplus::LineCapRound);
+                int r = (int)(m.cell * 0.22);
+                // 自由曲线（模拟涂抹轨迹）
+                Gdiplus::PointF curve[] = {
+                    Gdiplus::PointF((float)(cx - m.cell * 0.28), (float)(midY + m.cell * 0.18)),
+                    Gdiplus::PointF((float)(cx - m.cell * 0.10), (float)(midY - m.cell * 0.18)),
+                    Gdiplus::PointF((float)(cx + m.cell * 0.10), (float)(midY + m.cell * 0.18)),
+                    Gdiplus::PointF((float)(cx + m.cell * 0.28), (float)(midY - m.cell * 0.18)),
+                };
+                graphics.DrawLines(&pen, curve, 4);
+            } else {
+                // 框选模式：画一个虚线矩形
+                Gdiplus::Pen pen(c, (Gdiplus::REAL)2.0f);
+                int r = (int)(m.cell * 0.24);
+                graphics.DrawRectangle(&pen, cx - r, midY - r, r * 2, r * 2);
+            }
+        }
+
+        // 分隔线
+        int modeEndX = contentLeft + SC_MOSAIC_MODE_COUNT * m.cell
+            + (SC_MOSAIC_MODE_COUNT - 1) * cellGap;
+        int sepX = modeEndX + m.sepGap;
+        Gdiplus::Pen sepPen(Gdiplus::Color(255, 220, 220, 220), 1.0f);
+        graphics.DrawLine(&sepPen, sepX, midY - m.sepH / 2, sepX, midY + m.sepH / 2);
+
+        // 块大小组：每个单元格画一个 N×N 的马赛克方块网格，块越大网格越粗
+        int sizeStartX = sepX + m.sepGap + 1;
+        for (int i = 0; i < SC_MOSAIC_COUNT; i++) {
+            int cellLeft = sizeStartX + i * (m.cell + cellGap);
+            bool sel = (i == sizeIdx);
+            if (sel) drawCellBg(cellLeft);
+            Gdiplus::Color c = cellColor(sel);
+            int cx = cellLeft + m.cell / 2;
+            // 网格区域边长（占单元格约 0.6）
+            int gridHalf = (int)(m.cell * 0.26);
+            int gridSize = gridHalf * 2;
+            int gx = cx - gridHalf;
+            int gy = midY - gridHalf;
+            // 块数随预设递增：i=0 -> 2x2, i=1 -> 3x3, i=2 -> 4x4
+            int n = 2 + i;
+            int cellSz = gridSize / n;
+            if (cellSz < 1) cellSz = 1;
+            Gdiplus::SolidBrush b(c);
+            // 交错填充模拟马赛克质感（棋盘格）
+            for (int ry = 0; ry < n; ry++) {
+                for (int rx = 0; rx < n; rx++) {
+                    if (((rx + ry) & 1) == 0) {
+                        graphics.FillRectangle(&b, gx + rx * cellSz, gy + ry * cellSz,
+                                               cellSz, cellSz);
+                    }
+                }
+            }
+            // 网格描边（未填充格用半透明）
+            Gdiplus::Pen gridPen(Gdiplus::Color(sel ? 200 : 120,
+                                                c.GetRed(), c.GetGreen(), c.GetBlue()),
+                                 1.0f);
+            for (int k = 0; k <= n; k++) {
+                graphics.DrawLine(&gridPen, gx + k * cellSz, gy,
+                                  gx + k * cellSz, gy + n * cellSz);
+                graphics.DrawLine(&gridPen, gx, gy + k * cellSz,
+                                  gx + n * cellSz, gy + k * cellSz);
+            }
+        }
+
+        // 第二条分隔线
+        int sizeEndX = sizeStartX + SC_MOSAIC_COUNT * m.cell
+            + (SC_MOSAIC_COUNT - 1) * cellGap;
+        int sep2X = sizeEndX + m.sepGap;
+        graphics.DrawLine(&sepPen, sep2X, midY - m.sepH / 2, sep2X, midY + m.sepH / 2);
+
+        // 涂抹半径组：用不同直径的圆点表示半径大小（类似画笔粗细）。
+        // 仅涂抹模式下有意义；框选模式下置灰但仍可点击（切换后立即生效）。
+        int radiusStartX = sep2X + m.sepGap + 1;
+        bool radiusEnabled = (modeIdx == 0);
+        for (int i = 0; i < SC_MOSAIC_RADIUS_COUNT; i++) {
+            int cellLeft = radiusStartX + i * (m.cell + cellGap);
+            bool sel = (i == radiusIdx) && radiusEnabled;
+            if (sel) drawCellBg(cellLeft);
+            Gdiplus::Color c = cellColor(sel);
+            int cx = cellLeft + m.cell / 2;
+            // 圆点直径随预设递增：小/中/大
+            int dotD = (int)(SC_MOSAIC_RADIUS[i] * 0.5 * (m.cell / (double)SC_POPUP_CELL) + 0.5);
+            if (dotD < 5) dotD = 5;
+            if (dotD > m.cell - 4) dotD = m.cell - 4;
+            int r = dotD / 2;
+            Gdiplus::Color drawC = radiusEnabled ? c
+                : Gdiplus::Color(160, c.GetRed(), c.GetGreen(), c.GetBlue());
+            Gdiplus::SolidBrush brush(drawC);
+            graphics.FillEllipse(&brush, cx - r, midY - r, r * 2, r * 2);
+        }
+    }
+    Gdiplus::GdiplusShutdown(gdipToken);
 }
 
 // 命中测试子菜单，返回值约定：
@@ -713,6 +939,26 @@ struct CaptureContext {
     int drawColorIdx;                      // 当前选中颜色索引
     int drawThickIdx;                      // 当前选中粗细索引（矢量工具）
     int fontSizeIdx;                       // 当前选中字号索引（文字工具）
+    // 马赛克工具属性
+    int mosaicSizeIdx;                     // 当前选中马赛克块大小索引
+    int mosaicRadiusIdx;                   // 当前选中涂抹半径索引
+    bool mosaicRectMode;                   // true=框选区域模式；false=涂抹模式
+    // 涂抹模式光标：用系统光标机制（SetCursor）显示半径圆，由 OS 跟随鼠标，
+    // 无 WM_PAINT 重绘延迟（之前的 overlay 圆走 MOUSEMOVE→InvalidateRect→WM_PAINT 链路，
+    // 全屏重绘开销大导致不跟手）。按半径预设预生成彩色光标并缓存。
+    HCURSOR mosaicBrushCursors[3];         // 对应 SC_MOSAIC_RADIUS_COUNT 个半径预设的光标
+    bool mosaicBrushCursorsInited;
+    // ---- 马赛克渲染（reveal-mask 模型，消除不连续感）----
+    // 预先把整张截图按当前块大小马赛克化得到 mosaicBase（逻辑像素，与 backDC 同尺寸）。
+    // 马赛克标注只是「蒙版」：涂抹=路径圆形区域、框选=矩形区域，揭示其背后的 mosaicBase。
+    // 这样任意区域、任意顺序叠加都连续无缝；切换块大小时只需重建 base，已揭示区域自动更新。
+    // mosaicBase 覆盖整虚拟屏幕（绝对坐标），与选区无关，resize/move 无需重建。
+    HDC mosaicBaseDC;
+    HBITMAP mosaicBaseBitmap;
+    int mosaicBaseW, mosaicBaseH;          // base 尺寸（= 虚拟屏幕逻辑尺寸）
+    int mosaicBaseBlockPx;                 // 生成 base 时的块大小（检测变更触发重建）
+    // 涂抹模式增量绘制：记录上一帧最后绘制的路径点索引（reveal 模型下未使用，保留扩展）。
+    int mosaicDrawLastIdx;
     // 粗细/颜色子菜单
     bool popupOpen;
     RECT popupRect;
@@ -1619,7 +1865,298 @@ static void DrawOneAnnotation(Gdiplus::Graphics& graphics, const Annotation& a,
     }
 }
 
-// 覆盖层渲染：所有已提交标注 + 正在绘制的标注。
+// ==================== 马赛克渲染 ====================
+// 马赛克原理：从原始屏幕位图（srcDC = memDC，物理像素）取目标区域，按 mosaicSize 分块，
+// 每块用「缩小到 1 像素再放大」得到平均色块（StretchBlt 降采样），形成马赛克效果。
+// 目标 DC（targetDC）为逻辑像素（backDC / finalDC），源 DC（srcDC）为物理像素（memDC），
+// 二者通过 dpiScale 换算：srcX = (absX - virtualX) * dpiScale。
+
+// 对单个矩形区域做马赛克化并绘制到 targetDC。
+// dstX0/dstY0/dstW/dstH：目标逻辑像素矩形（已应用偏移到 targetDC 局部坐标）；
+// srcAbsX0/srcAbsY0：该矩形左上角的绝对虚拟屏幕坐标（用于在 memDC 取源像素）；
+// blockPx：马赛克块大小（逻辑像素）；srcDC/virtualX/virtualY/dpiScale：源参数。
+static void MosaicBlitRect(HDC targetDC, HDC srcDC,
+                           int dstX0, int dstY0, int dstW, int dstH,
+                           int srcAbsX0, int srcAbsY0,
+                           int blockPx, int virtualX, int virtualY, double dpiScale) {
+    if (dstW <= 0 || dstH <= 0 || blockPx < 1) return;
+
+    // 临时 1x1 DC：用作缩小缓冲（取块平均色）
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return;
+    HDC onePxDC = CreateCompatibleDC(screenDC);
+    HBITMAP onePxBmp = CreateCompatibleBitmap(screenDC, 1, 1);
+    HGDIOBJ oldOne = SelectObject(onePxDC, onePxBmp);
+    ReleaseDC(NULL, screenDC);
+
+    SetStretchBltMode(onePxDC, HALFTONE);
+    SetBrushOrgEx(onePxDC, 0, 0, NULL);
+    int oldTargetMode = GetStretchBltMode(targetDC);
+    SetStretchBltMode(targetDC, COLORONCOLOR);  // 放大时取最近邻，保持块色纯净
+
+    // 按块遍历（逻辑像素步进）
+    for (int by = 0; by < dstH; by += blockPx) {
+        for (int bx = 0; bx < dstW; bx += blockPx) {
+            int dstBlockX = dstX0 + bx;
+            int dstBlockY = dstY0 + by;
+            int bw = (std::min)(blockPx, dstW - bx);
+            int bh = (std::min)(blockPx, dstH - by);
+
+            // 源像素坐标（物理）
+            int srcAbsX = srcAbsX0 + bx;
+            int srcAbsY = srcAbsY0 + by;
+            int sx = (int)((srcAbsX - virtualX) * dpiScale + 0.5);
+            int sy = (int)((srcAbsY - virtualY) * dpiScale + 0.5);
+            int sw = (int)(bw * dpiScale + 0.5);
+            int sh = (int)(bh * dpiScale + 0.5);
+            if (sw < 1) sw = 1;
+            if (sh < 1) sh = 1;
+
+            // 缩小到 1px（取整块平均色）
+            if (StretchBlt(onePxDC, 0, 0, 1, 1, srcDC, sx, sy, sw, sh, SRCCOPY)) {
+                // 放大回目标块
+                StretchBlt(targetDC, dstBlockX, dstBlockY, bw, bh,
+                           onePxDC, 0, 0, 1, 1, SRCCOPY);
+            }
+        }
+    }
+    SetStretchBltMode(targetDC, oldTargetMode);
+
+    SelectObject(onePxDC, oldOne);
+    DeleteObject(onePxBmp);
+    DeleteDC(onePxDC);
+}
+
+
+// ==================== 马赛克渲染（reveal-mask 模型） ====================
+// 核心：预先把整张选区按当前块大小做一次完整马赛克化得到 mosaicBase（逻辑像素）。
+// 马赛克标注只是「蒙版」——涂抹=路径圆形区域、框选=矩形区域——揭示其背后的 mosaicBase。
+// 任意区域、任意顺序叠加都连续无缝；切换块大小只需重建 base，已揭示区域自动更新。
+// 不再对每个标注单独像素化，故无「松开后再处理一遍」的不连续感。
+
+// 释放马赛克 base 资源
+static void FreeMosaicBase(CaptureContext* ctx) {
+    if (ctx->mosaicBaseDC) { DeleteDC(ctx->mosaicBaseDC); ctx->mosaicBaseDC = NULL; }
+    if (ctx->mosaicBaseBitmap) { DeleteObject(ctx->mosaicBaseBitmap); ctx->mosaicBaseBitmap = NULL; }
+    ctx->mosaicBaseW = 0;
+    ctx->mosaicBaseH = 0;
+    ctx->mosaicBaseBlockPx = 0;
+}
+
+// 用 GDI+ 把单色位图转为带透明通道的 32bpp HBITMAP（用于光标）。
+static HBITMAP ColorBitmapFromBitmap(Gdiplus::Bitmap& bmp) {
+    HBITMAP hBmp = NULL;
+    Gdiplus::Color bg(0, 0, 0, 0);  // 透明背景
+    bmp.GetHBITMAP(bg, &hBmp);
+    return hBmp;
+}
+
+// 生成单个涂抹光标：半径圆（白底 + 深色描边 + 中心十字）。
+// size 为光标位图边长（逻辑像素）；hotspot 在中心。
+static HCURSOR CreateMosaicBrushCursor(int radius) {
+    int pad = 3;
+    int size = (radius + pad) * 2;
+    if (size < 16) size = 16;
+
+    Gdiplus::GdiplusStartupInput si;
+    ULONG_PTR token = 0;
+    HCURSOR result = NULL;
+    if (Gdiplus::GdiplusStartup(&token, &si, NULL) != Gdiplus::Ok) return NULL;
+    {
+        Gdiplus::Bitmap bmp(size, size, PixelFormat32bppARGB);
+        {
+            Gdiplus::Graphics g(&bmp);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            int cx = size / 2;
+            int cy = size / 2;
+            // 外圈：白色描边底（保证暗背景可见）
+            Gdiplus::Pen whitePen(Gdiplus::Color(255, 255, 255, 255), 3.0f);
+            g.DrawEllipse(&whitePen, cx - radius, cy - radius, radius * 2, radius * 2);
+            // 内圈：深色虚线描边
+            Gdiplus::Pen darkPen(Gdiplus::Color(255, 30, 30, 30), 1.5f);
+            darkPen.SetDashStyle(Gdiplus::DashStyleDash);
+            g.DrawEllipse(&darkPen, cx - radius, cy - radius, radius * 2, radius * 2);
+            // 中心十字（准星）
+            Gdiplus::Pen crossPen(Gdiplus::Color(255, 30, 30, 30), 1.0f);
+            int cl = (std::min)(6, radius);
+            g.DrawLine(&crossPen, cx - cl, cy, cx + cl, cy);
+            g.DrawLine(&crossPen, cx, cy - cl, cx, cy + cl);
+        }
+        HBITMAP hColor = ColorBitmapFromBitmap(bmp);
+
+        // 掩码位图（全黑，使用彩色光标时掩码可忽略，但 CreateIcon 要求非空）
+        HDC screenDC = GetDC(NULL);
+        HDC maskDC = CreateCompatibleDC(screenDC);
+        HBITMAP hMask = CreateCompatibleBitmap(screenDC, size, size);
+        HGDIOBJ oldMask = SelectObject(maskDC, hMask);
+        PatBlt(maskDC, 0, 0, size, size, BLACKNESS);
+        SelectObject(maskDC, oldMask);
+        DeleteDC(maskDC);
+        ReleaseDC(NULL, screenDC);
+
+        ICONINFO ii = {0};
+        ii.fIcon = FALSE;
+        ii.xHotspot = size / 2;
+        ii.yHotspot = size / 2;
+        ii.hbmMask = hMask;
+        ii.hbmColor = hColor;
+        result = CreateIconIndirect(&ii);
+        DeleteObject(hMask);
+        DeleteObject(hColor);
+    }
+    Gdiplus::GdiplusShutdown(token);
+    return result;
+}
+
+// 初始化涂抹光标缓存（按 DPI 缩放半径）。
+static void InitMosaicBrushCursors(CaptureContext* ctx) {
+    if (ctx->mosaicBrushCursorsInited) return;
+    for (int i = 0; i < SC_MOSAIC_RADIUS_COUNT; i++) {
+        ctx->mosaicBrushCursors[i] = CreateMosaicBrushCursor(SC_MOSAIC_RADIUS[i]);
+    }
+    ctx->mosaicBrushCursorsInited = true;
+}
+
+static void FreeMosaicBrushCursors(CaptureContext* ctx) {
+    for (int i = 0; i < SC_MOSAIC_RADIUS_COUNT; i++) {
+        if (ctx->mosaicBrushCursors[i]) { DestroyIcon(ctx->mosaicBrushCursors[i]); ctx->mosaicBrushCursors[i] = NULL; }
+    }
+    ctx->mosaicBrushCursorsInited = false;
+}
+
+// 生成马赛克 base：把整张虚拟屏幕原始底图按 blockPx 马赛克化，存为离屏位图。
+// base 用绝对（虚拟屏幕）坐标、尺寸 = virtualW×virtualH（与 backDC 一致），与选区无关。
+// 这样选区 resize/move 时 base 无需重建（标注蒙版用绝对坐标，任意选区下都正确对位），
+// 仅在块大小变化或初次生成时重建。代价是占一份全屏位图内存（与 backDC/memDC 同级）。
+static void RebuildMosaicBase(CaptureContext* ctx) {
+    int w = ctx->virtualW;
+    int h = ctx->virtualH;
+    if (w <= 0 || h <= 0) { FreeMosaicBase(ctx); return; }
+
+    int blockPx = SC_MOSAIC_SIZES[ctx->mosaicSizeIdx];
+    if (blockPx < 2) blockPx = 2;
+
+    // 尺寸/块大小变化才重建位图
+    if (w != ctx->mosaicBaseW || h != ctx->mosaicBaseH
+        || blockPx != ctx->mosaicBaseBlockPx || !ctx->mosaicBaseDC) {
+        FreeMosaicBase(ctx);
+        HDC screenDC = GetDC(NULL);
+        if (!screenDC) return;
+        ctx->mosaicBaseDC = CreateCompatibleDC(screenDC);
+        ctx->mosaicBaseBitmap = CreateCompatibleBitmap(screenDC, w, h);
+        ReleaseDC(NULL, screenDC);
+        if (!ctx->mosaicBaseDC || !ctx->mosaicBaseBitmap) { FreeMosaicBase(ctx); return; }
+        SelectObject(ctx->mosaicBaseDC, ctx->mosaicBaseBitmap);
+        ctx->mosaicBaseW = w;
+        ctx->mosaicBaseH = h;
+        ctx->mosaicBaseBlockPx = blockPx;
+    }
+
+    // 整虚拟屏幕按 blockPx 马赛克化：base 原点 = 虚拟屏幕左上角，源绝对坐标 = virtualX/virtualY。
+    MosaicBlitRect(ctx->mosaicBaseDC, ctx->memDC, 0, 0, w, h,
+                   ctx->virtualX, ctx->virtualY, blockPx,
+                   ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+}
+
+// 检查 base 是否需要重建（仅块大小变化 / 未生成）。
+// base 覆盖整屏且用绝对坐标，选区变化不影响 base，故 resize/move 无需重建。
+static bool MosaicBaseNeedsRebuild(const CaptureContext* ctx) {
+    int blockPx = SC_MOSAIC_SIZES[ctx->mosaicSizeIdx];
+    if (blockPx < 2) blockPx = 2;
+    bool blockChanged = (blockPx != ctx->mosaicBaseBlockPx);
+    bool sizeChanged = (ctx->mosaicBaseW != ctx->virtualW || ctx->mosaicBaseH != ctx->virtualH);
+    return blockChanged || sizeChanged || !ctx->mosaicBaseDC;
+}
+
+// 把单条马赛克标注对应的「蒙版区域」构建为 HRGN（选区相对坐标）。
+// ox/oy：绝对坐标 → 目标局部坐标的偏移（= -sel.left/-sel.top，因为 base/overlay 都是选区相对）。
+static HRGN BuildMosaicMaskRegion(const Annotation& a, float ox, float oy) {
+    if (a.mosaicRect) {
+        int absL = (std::min)(a.x1, a.x2);
+        int absT = (std::min)(a.y1, a.y2);
+        int absR = (std::max)(a.x1, a.x2);
+        int absB = (std::max)(a.y1, a.y2);
+        return CreateRectRgn((int)(absL + ox + 0.5f), (int)(absT + oy + 0.5f),
+                             (int)(absR + ox + 0.5f), (int)(absB + oy + 0.5f));
+    } else {
+        // 涂抹：把整条路径变为连续的「胶囊」区域（保证快速移动时不留空隙）。
+        // 做法：沿相邻点之间的线段以不超过 radius/2 的步长插值取点，每个点画一个圆并并入区域，
+        // 相邻圆重叠从而形成无缝的粗笔触轨迹。
+        int radius = a.brushRadius;
+        if (radius < 1) radius = 1;
+        HRGN rgn = CreateRectRgn(0, 0, 0, 0);
+        if (a.pts.empty()) return rgn;
+        // 步长：半径的一半，保证相邻圆重叠 ≥50%，无视觉缝隙
+        double step = (std::max)(1.0, radius * 0.5);
+
+        auto addCircle = [&](double cx, double cy) {
+            int ix = (int)(cx + 0.5);
+            int iy = (int)(cy + 0.5);
+            HRGN circle = CreateEllipticRgn(ix - radius, iy - radius,
+                                            ix + radius, iy + radius);
+            CombineRgn(rgn, rgn, circle, RGN_OR);
+            DeleteObject(circle);
+        };
+
+        // 第一个点
+        addCircle(a.pts[0].x + ox, a.pts[0].y + oy);
+        for (size_t i = 1; i < a.pts.size(); i++) {
+            double x0 = a.pts[i - 1].x + ox;
+            double y0 = a.pts[i - 1].y + oy;
+            double x1 = a.pts[i].x + ox;
+            double y1 = a.pts[i].y + oy;
+            double dx = x1 - x0, dy = y1 - y0;
+            double segLen = std::sqrt(dx * dx + dy * dy);
+            if (segLen < 0.5) {
+                addCircle(x1, y1);
+                continue;
+            }
+            int n = (int)(segLen / step + 0.5);
+            if (n < 1) n = 1;
+            for (int k = 1; k <= n; k++) {
+                double t = (double)k / n;
+                addCircle(x0 + dx * t, y0 + dy * t);
+            }
+        }
+        return rgn;
+    }
+}
+
+// 揭示马赛克：把 mosaicBase 中由 masks（已提交标注）+ curDrawing（正在绘制）覆盖的区域
+// BitBlt 到 targetDC（覆盖层 backDC）。
+// 全屏 base 用虚拟屏幕绝对坐标（原点=虚拟左上角，与 backDC 同坐标系），
+// 故 base 与 targetDC 1:1 对应，蒙版用绝对坐标（ox/oy=0）直接作为裁剪区，BitBlt 同位置拷贝。
+// ox/oy：标注坐标 → 目标局部坐标偏移（覆盖层=0；导出 finalDC 时=-rect.left/-rect.top）。
+static void RevealMosaicToTarget(HDC targetDC, HDC mosaicBase,
+                                 const std::vector<Annotation>& annotations,
+                                 const Annotation* curDrawing,
+                                 float ox, float oy) {
+    // 合并所有马赛克标注的蒙版区域（目标局部坐标）
+    HRGN mask = CreateRectRgn(0, 0, 0, 0);
+    bool any = false;
+    for (const Annotation& a : annotations) {
+        if (a.type != AT_Mosaic) continue;
+        HRGN r = BuildMosaicMaskRegion(a, ox, oy);
+        CombineRgn(mask, mask, r, RGN_OR);
+        DeleteObject(r);
+        any = true;
+    }
+    if (curDrawing && curDrawing->type == AT_Mosaic) {
+        HRGN r = BuildMosaicMaskRegion(*curDrawing, ox, oy);
+        CombineRgn(mask, mask, r, RGN_OR);
+        DeleteObject(r);
+        any = true;
+    }
+    if (any) {
+        SelectClipRgn(targetDC, mask);
+        // base 与 targetDC 同坐标系，1:1 拷贝
+        BitBlt(targetDC, 0, 0, 0x7FFF, 0x7FFF, mosaicBase, 0, 0, SRCCOPY);
+        SelectClipRgn(targetDC, NULL);
+    }
+    DeleteObject(mask);
+}
+
+// 覆盖层渲染矢量/文字标注（不含马赛克，马赛克由 reveal-mask 单独处理）。
 // selRel：选区在 backDC 局部坐标的矩形；标注为绝对虚拟屏幕坐标，偏移 = -virtualX/-virtualY。
 // 用 SetClip 限制到选区内部，避免画到遮罩区。
 static void DrawAnnotations(HDC hdc, const RECT& selRel, int virtualX, int virtualY,
@@ -1641,17 +2178,24 @@ static void DrawAnnotations(HDC hdc, const RECT& selRel, int virtualX, int virtu
         float oy = (float)-virtualY;
 
         for (const Annotation& a : annotations) {
+            if (a.type == AT_Mosaic) continue;  // 马赛克单独渲染
             DrawOneAnnotation(graphics, a, ox, oy);
         }
-        if (curDrawing) {
+        if (curDrawing && curDrawing->type != AT_Mosaic) {
             DrawOneAnnotation(graphics, *curDrawing, ox, oy);
         }
     }
     Gdiplus::GdiplusShutdown(gdipToken);
 }
 
+
 // 合成标注进最终 PNG：finalDC 原点 = 选区左上角，故偏移 = -rect.left/-rect.top。
-static void CompositeAnnotations(HDC finalDC, const std::vector<Annotation>& annotations, const RECT& rect) {
+// srcDC = memDC（原始屏幕位图，物理像素），用于马赛克像素化取源。
+// mosaicBlockPx：马赛克块大小（与编辑器当前全局块大小保持一致，保证导出与所见一致）。
+static void CompositeAnnotations(HDC finalDC, HDC srcDC,
+                                 const std::vector<Annotation>& annotations,
+                                 const RECT& rect, int virtualX, int virtualY,
+                                 double dpiScale, int mosaicBlockPx) {
     if (annotations.empty()) return;
     Gdiplus::GdiplusStartupInput startupInput;
     ULONG_PTR gdipToken;
@@ -1662,10 +2206,39 @@ static void CompositeAnnotations(HDC finalDC, const std::vector<Annotation>& ann
         float ox = (float)-rect.left;
         float oy = (float)-rect.top;
         for (const Annotation& a : annotations) {
+            if (a.type == AT_Mosaic) continue;  // 马赛克单独渲染
             DrawOneAnnotation(graphics, a, ox, oy);
         }
     }
     Gdiplus::GdiplusShutdown(gdipToken);
+
+    // 马赛克标注单独渲染（reveal-mask 模型：生成整选区 base 再揭示蒙版区域）
+    bool hasMosaic = false;
+    for (const Annotation& a : annotations) {
+        if (a.type == AT_Mosaic) { hasMosaic = true; break; }
+    }
+    if (hasMosaic) {
+        int blockPx = mosaicBlockPx;
+        if (blockPx < 2) blockPx = 2;
+        int w = rect.right - rect.left;
+        int h = rect.bottom - rect.top;
+        HDC screenDC = GetDC(NULL);
+        if (screenDC) {
+            HDC baseDC = CreateCompatibleDC(screenDC);
+            HBITMAP baseBmp = CreateCompatibleBitmap(screenDC, w, h);
+            HGDIOBJ oldBase = SelectObject(baseDC, baseBmp);
+            MosaicBlitRect(baseDC, srcDC, 0, 0, w, h,
+                           rect.left, rect.top, blockPx, virtualX, virtualY, dpiScale);
+            // 揭示蒙版区域（finalDC 原点 = 选区左上角，base 同为选区相对，ox=-rect.left）
+            float ox = (float)-rect.left;
+            float oy = (float)-rect.top;
+            RevealMosaicToTarget(finalDC, baseDC, annotations, nullptr, ox, oy);
+            SelectObject(baseDC, oldBase);
+            DeleteObject(baseBmp);
+            DeleteDC(baseDC);
+            ReleaseDC(NULL, screenDC);
+        }
+    }
 }
 
 // 将 HBITMAP 转换为 PNG base64 字符串
@@ -1761,7 +2334,8 @@ static ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
     }
 
     // 合成标注进最终图像（finalDC 原点 = 选区原点，标注为绝对坐标，偏移 = -rect.left/top）
-    CompositeAnnotations(finalDC, anns, rect);
+    CompositeAnnotations(finalDC, memDC, anns, rect, vx, vy, dpiScale,
+                         SC_MOSAIC_SIZES[g_captureCtx ? g_captureCtx->mosaicSizeIdx : SC_DEFAULT_MOSAIC_IDX]);
 
     // 生成 base64
     result->base64 = BitmapToBase64Png(finalBmp);
@@ -1886,7 +2460,8 @@ static bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
         finalBmp = scaledBmp;
         finalDC = scaledDC;
     }
-    CompositeAnnotations(finalDC, anns, rect);
+    CompositeAnnotations(finalDC, memDC, anns, rect, vx, vy, dpiScale,
+                         SC_MOSAIC_SIZES[g_captureCtx ? g_captureCtx->mosaicSizeIdx : SC_DEFAULT_MOSAIC_IDX]);
 
     // 用 GDI+ 保存为 PNG 文件
     bool ok = false;
@@ -1986,6 +2561,19 @@ static bool CalcAnnotationsBounds(const std::vector<Annotation>& anns, RECT& out
     for (const Annotation& a : anns) {
         if (a.type == AT_Brush) {
             for (const POINT& p : a.pts) expand(p.x, p.y);
+        } else if (a.type == AT_Mosaic) {
+            if (a.mosaicRect) {
+                // 框选模式：矩形角点
+                expand(a.x1, a.y1);
+                expand(a.x2, a.y2);
+            } else {
+                // 涂抹模式：路径包围盒 + 半径
+                int r = a.brushRadius;
+                for (const POINT& p : a.pts) {
+                    expand(p.x - r, p.y - r);
+                    expand(p.x + r, p.y + r);
+                }
+            }
         } else if (a.type == AT_Text) {
             // 复用 MeasureTextAnnotation：与选中时的外边框（含 padding）完全一致，
             // 保证 resize 选区时文字包围盒约束 = 视觉选中边框，不会被裁掉。
@@ -2289,11 +2877,51 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing || ctx->state == CS_Resizing) {
                 const Annotation* cur = ctx->hasCurDrawing ? &ctx->curDrawing : nullptr;
                 DrawAnnotations(backDC, curSelRect, ctx->virtualX, ctx->virtualY, ctx->annotations, cur);
+                // 马赛克（reveal-mask 模型）：先确保 base（整选区马赛克）已生成，
+                // 再把所有马赛克标注（含正在绘制的）的蒙版区域从 base 揭示到 backDC。
+                // base 预计算后每帧只做带区域裁剪的 BitBlt，无逐标注像素化，连续无闪烁。
+                if (MosaicBaseNeedsRebuild(ctx)) RebuildMosaicBase(ctx);
+                if (ctx->mosaicBaseDC) {
+                    // base 与 backDC 同为虚拟屏幕绝对坐标，蒙版 ox/oy = 0
+                    RevealMosaicToTarget(backDC, ctx->mosaicBaseDC,
+                                         ctx->annotations, cur, 0.0f, 0.0f);
+                }
+                // 正在拖拽的矩形马赛克：叠加虚线边框提示当前框选范围（backDC 绝对坐标）。
+                // 涂抹模式不画矩形边框（其范围由预览圆体现）。
+                if (ctx->state == CS_Drawing && ctx->hasCurDrawing
+                    && ctx->curDrawing.type == AT_Mosaic && ctx->curDrawing.mosaicRect) {
+                    int rx1 = (std::min)(ctx->curDrawing.x1, ctx->curDrawing.x2);
+                    int ry1 = (std::min)(ctx->curDrawing.y1, ctx->curDrawing.y2);
+                    int rx2 = (std::max)(ctx->curDrawing.x1, ctx->curDrawing.x2);
+                    int ry2 = (std::max)(ctx->curDrawing.y1, ctx->curDrawing.y2);
+                    Gdiplus::GdiplusStartupInput startupInput;
+                    ULONG_PTR bToken = 0;
+                    if (Gdiplus::GdiplusStartup(&bToken, &startupInput, NULL) == Gdiplus::Ok) {
+                        {
+                            Gdiplus::Graphics graphics(backDC);
+                            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                            // 虚线笔：白色底 + 深色虚线，保证在任意背景上可见
+                            Gdiplus::Pen whitePen(Gdiplus::Color(255, 255, 255, 255), 3.0f);
+                            graphics.DrawRectangle(&whitePen, (float)rx1, (float)ry1,
+                                                   (float)(rx2 - rx1), (float)(ry2 - ry1));
+                            Gdiplus::Pen dashPen(Gdiplus::Color(255, 0x1E, 0x88, 0xE5), 1.5f);
+                            dashPen.SetDashStyle(Gdiplus::DashStyleDash);
+                            graphics.DrawRectangle(&dashPen, (float)rx1, (float)ry1,
+                                                   (float)(rx2 - rx1), (float)(ry2 - ry1));
+                        }
+                        Gdiplus::GdiplusShutdown(bToken);
+                    }
+                }
             }
             // 文字编辑态：绘制输入光标和选中文字标注的边框
             if (ctx->state == CS_TextEditing) {
                 // 绘制已提交的标注
                 DrawAnnotations(backDC, curSelRect, ctx->virtualX, ctx->virtualY, ctx->annotations, nullptr);
+                if (MosaicBaseNeedsRebuild(ctx)) RebuildMosaicBase(ctx);
+                if (ctx->mosaicBaseDC) {
+                    RevealMosaicToTarget(backDC, ctx->mosaicBaseDC,
+                                         ctx->annotations, nullptr, 0.0f, 0.0f);
+                }
 
                 // 绘制当前输入的文字和光标（统一用 GDI+，与提交态 DrawString 完全一致，
                 // 避免旧 GDI TextOutW 导致的文字偏靠下、右侧间距偏大的问题）
@@ -2486,8 +3114,19 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 }
                 DrawToolbar(backDC, curToolbarRect, ctx->hoverToolbarBtn, ctx->activeTool,
                     ctx->gdi, ctx->toolbarMetrics, ctx->iconCache);
+                // 马赛克子菜单：模式切换 + 块大小
+                if (ctx->popupOpen && ctx->activeTool == TB_Mosaic) {
+                    int mpw, mph;
+                    CalcMosaicPopupSize(ctx->popupMetrics, mpw, mph);
+                    CalcPopupPlacement(curToolbarRect, ctx->virtualW, ctx->virtualH,
+                        ctx->popupMetrics, mpw, mph, curPopupRect);
+                    ctx->popupRect = curPopupRect;
+                    int modeIdx = ctx->mosaicRectMode ? 1 : 0;
+                    DrawMosaicPopup(backDC, curPopupRect, modeIdx, ctx->mosaicSizeIdx,
+                        ctx->mosaicRadiusIdx, ctx->popupMetrics);
+                }
                 // 粗细/颜色子菜单：文字工具激活时始终显示（含文字编辑态）
-                if (ctx->popupOpen && (IsVectorTool(ctx->activeTool) || ctx->activeTool == TB_Text)) {
+                else if (ctx->popupOpen && (IsVectorTool(ctx->activeTool) || ctx->activeTool == TB_Text)) {
                     CalcPopupPosition(curToolbarRect, ctx->virtualW, ctx->virtualH,
                         ctx->popupMetrics, curPopupRect);
                     ctx->popupRect = curPopupRect;
@@ -2792,8 +3431,21 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
-                // 其它工具（马赛克/翻译）：仅切换激活态占位，关闭子菜单
-                if (b == TB_Mosaic || b == TB_Translate) {
+                // 马赛克工具：切换激活态 + 打开/关闭子菜单（模式+块大小）
+                if (b == TB_Mosaic) {
+                    if (ctx->activeTool == b) {
+                        // 再次点同一工具：关闭工具与子菜单
+                        ctx->activeTool = -1;
+                        ctx->popupOpen = false;
+                    } else {
+                        ctx->activeTool = b;
+                        ctx->popupOpen = true;
+                    }
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                // 翻译工具：仅切换激活态占位，关闭子菜单
+                if (b == TB_Translate) {
                     ctx->activeTool = (ctx->activeTool == b) ? -1 : b;
                     ctx->popupOpen = false;
                     InvalidateRect(hwnd, NULL, FALSE);
@@ -2853,6 +3505,31 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 return 0;
             }
 
+            // 命中马赛克子菜单（模式切换 + 块大小 + 涂抹半径）
+            if (ctx->popupOpen && ctx->activeTool == TB_Mosaic) {
+                int hit = HitTestMosaicPopup(mxRel, myRel, ctx->popupRect, ctx->popupMetrics);
+                if (hit == 1) {
+                    ctx->mosaicRectMode = false;  // 涂抹模式
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                if (hit == 2) {
+                    ctx->mosaicRectMode = true;   // 框选模式
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                if (hit >= 101 && hit < 200) {
+                    ctx->mosaicSizeIdx = hit - 101;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+                if (hit >= 201) {
+                    ctx->mosaicRadiusIdx = hit - 201;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+            }
+
             // 命中粗细/颜色子菜单
             if (ctx->popupOpen) {
                 int hit = HitTestPopup(mxRel, myRel, ctx->popupRect, ctx->popupMetrics);
@@ -2896,6 +3573,30 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 ctx->curDrawing.x2 = ctx->curDrawing.x1;
                 ctx->curDrawing.y2 = ctx->curDrawing.y1;
                 if (ctx->curDrawing.type == AT_Brush) {
+                    POINT p = { ctx->curDrawing.x1, ctx->curDrawing.y1 };
+                    ctx->curDrawing.pts.push_back(p);
+                }
+                ctx->state = CS_Drawing;
+                ctx->needFullRedraw = true;
+                return 0;
+            }
+
+            // 马赛克工具激活时，点击选区内部 -> 开始马赛克绘制
+            // 子菜单保持打开，绘制中可继续看到当前模式/块大小。
+            if (ctx->activeTool == TB_Mosaic && PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
+                ctx->hasCurDrawing = true;
+                ctx->curDrawing = {};
+                ctx->curDrawing.type = AT_Mosaic;
+                ctx->curDrawing.color = 0;  // 马赛克无颜色
+                ctx->curDrawing.mosaicRect = ctx->mosaicRectMode;
+                ctx->curDrawing.mosaicSize = SC_MOSAIC_SIZES[ctx->mosaicSizeIdx];
+                ctx->curDrawing.brushRadius = SC_MOSAIC_RADIUS[ctx->mosaicRadiusIdx];
+                ctx->curDrawing.x1 = ctx->mouseX;
+                ctx->curDrawing.y1 = ctx->mouseY;
+                ctx->curDrawing.x2 = ctx->curDrawing.x1;
+                ctx->curDrawing.y2 = ctx->curDrawing.y1;
+                if (!ctx->mosaicRectMode) {
+                    // 涂抹模式：记录路径起点（揭示由 WM_PAINT 统一处理）
                     POINT p = { ctx->curDrawing.x1, ctx->curDrawing.y1 };
                     ctx->curDrawing.pts.push_back(p);
                 }
@@ -3099,6 +3800,11 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 if (ctx->curDrawing.type == AT_Brush) {
                     POINT p = { ax, ay };
                     ctx->curDrawing.pts.push_back(p);
+                } else if (ctx->curDrawing.type == AT_Mosaic && !ctx->curDrawing.mosaicRect) {
+                    // 马赛克涂抹模式：记录路径点。揭示由 WM_PAINT 统一处理（reveal-mask 模型，
+                    // 每帧从预计算的 base 揭示蒙版区域，无需增量绘制）。
+                    POINT p = { ax, ay };
+                    ctx->curDrawing.pts.push_back(p);
                 } else {
                     ctx->curDrawing.x2 = ax;
                     ctx->curDrawing.y2 = ay;
@@ -3131,7 +3837,8 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             int myRel = ctx->mouseY - ctx->virtualY;
             int tb = HitTestToolbar(mxRel, myRel, ctx->toolbarRect, ctx->toolbarMetrics);
             int ht = HitTestTextAnnotations(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
-            if (moved || h != ctx->resizeHandle || tb != ctx->hoverToolbarBtn || ht != ctx->hoveredTextAnnotation) {
+            if (moved || h != ctx->resizeHandle || tb != ctx->hoverToolbarBtn
+                || ht != ctx->hoveredTextAnnotation) {
                 ctx->resizeHandle = h;
                 ctx->hoverToolbarBtn = tb;
                 ctx->hoveredTextAnnotation = ht;
@@ -3192,6 +3899,15 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (ctx->hasCurDrawing) {
                 if (ctx->curDrawing.type == AT_Brush) {
                     valid = ctx->curDrawing.pts.size() >= 2;
+                } else if (ctx->curDrawing.type == AT_Mosaic) {
+                    if (ctx->curDrawing.mosaicRect) {
+                        // 框选模式：需要有效矩形尺寸
+                        valid = (abs(ctx->curDrawing.x2 - ctx->curDrawing.x1) >= 2
+                              || abs(ctx->curDrawing.y2 - ctx->curDrawing.y1) >= 2);
+                    } else {
+                        // 涂抹模式：至少 1 个点（单击也能产生一个马赛克圆）
+                        valid = ctx->curDrawing.pts.size() >= 1;
+                    }
                 } else {
                     valid = (abs(ctx->curDrawing.x2 - ctx->curDrawing.x1) >= 2
                           || abs(ctx->curDrawing.y2 - ctx->curDrawing.y1) >= 2);
@@ -3200,9 +3916,11 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (valid) {
                 ctx->annotations.push_back(ctx->curDrawing);
                 ctx->redoStack.clear();  // 新标注清空重做栈
+                // reveal-mask 模型：base 与标注无关，下一帧 WM_PAINT 自动把新蒙版揭示出来。
             }
             ctx->hasCurDrawing = false;
             ctx->curDrawing = {};
+            ctx->mosaicDrawLastIdx = 0;
             ctx->state = CS_Confirmed;
             ctx->needFullRedraw = true;
         } else if (ctx->state == CS_TextEditing) {
@@ -3394,6 +4112,28 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
     }
 
     case WM_SETCURSOR: {
+        // 马赛克涂抹模式（确认态/绘制态）：用预生成的半径圆光标（OS 跟随，无重绘延迟）
+        if (ctx->activeTool == TB_Mosaic && !ctx->mosaicRectMode
+            && (ctx->state == CS_Confirmed || ctx->state == CS_Drawing)
+            && ctx->mosaicBrushCursorsInited
+            && ctx->mosaicRadiusIdx >= 0 && ctx->mosaicRadiusIdx < SC_MOSAIC_RADIUS_COUNT
+            && ctx->mosaicBrushCursors[ctx->mosaicRadiusIdx]) {
+            // 工具栏/子菜单上仍用箭头/手型
+            int mxRel = ctx->mouseX - ctx->virtualX;
+            int myRel = ctx->mouseY - ctx->virtualY;
+            if (PointInRect(mxRel, myRel, ctx->toolbarRect)) {
+                SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
+                return TRUE;
+            }
+            if (ctx->popupOpen && PointInRect(mxRel, myRel, ctx->popupRect)) {
+                SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
+                return TRUE;
+            }
+            if (PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
+                SetCursor(ctx->mosaicBrushCursors[ctx->mosaicRadiusIdx]);
+                return TRUE;
+            }
+        }
         // 文字编辑中：I-beam 光标
         if (ctx->state == CS_TextEditing) {
             SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));
@@ -3439,11 +4179,12 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 return TRUE;
             }
             // 选区内部：
-            //   矢量/文字工具激活 -> 十字；
+            //   矢量/文字/马赛克工具激活 -> 十字；
             //   已有标注内容 -> 箭头（禁止整体拖动）；
             //   否则 -> 移动光标
             if (PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
-                if (IsVectorTool(ctx->activeTool) || ctx->activeTool == TB_Text) {
+                if (IsVectorTool(ctx->activeTool) || ctx->activeTool == TB_Text
+                    || ctx->activeTool == TB_Mosaic) {
                     SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_CROSS));
                 } else if (!ctx->annotations.empty()) {
                     SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
@@ -3552,6 +4293,10 @@ static void ScreenshotCaptureThread() {
     // 工具栏几何（按 DPI 缩放）+ 图标位图缓存（按 DPI 预渲染）
     ctx.toolbarMetrics = CalcToolbarMetrics(dpiScale);
     ctx.iconCache.Init(ctx.toolbarMetrics.iconSize);
+    // 涂抹光标缓存（按半径预生成，DPI 缩放半径）
+    for (int i = 0; i < SC_MOSAIC_RADIUS_COUNT; i++) ctx.mosaicBrushCursors[i] = NULL;
+    ctx.mosaicBrushCursorsInited = false;
+    InitMosaicBrushCursors(&ctx);
     // 子菜单几何（按 DPI 缩放）+ 标注绘制默认值
     ctx.popupMetrics = CalcPopupMetrics(dpiScale);
     ctx.popupOpen = false;
@@ -3559,6 +4304,15 @@ static void ScreenshotCaptureThread() {
     ctx.drawColorIdx = SC_DEFAULT_COLOR_IDX;
     ctx.drawThickIdx = SC_DEFAULT_THICK_IDX;
     ctx.fontSizeIdx = SC_DEFAULT_FONT_IDX;
+    ctx.mosaicSizeIdx = SC_DEFAULT_MOSAIC_IDX;
+    ctx.mosaicRadiusIdx = SC_DEFAULT_MOSAIC_RADIUS_IDX;
+    ctx.mosaicRectMode = false;  // 默认涂抹模式
+    ctx.mosaicBaseDC = NULL;
+    ctx.mosaicBaseBitmap = NULL;
+    ctx.mosaicBaseW = 0;
+    ctx.mosaicBaseH = 0;
+    ctx.mosaicBaseBlockPx = 0;
+    ctx.mosaicDrawLastIdx = 0;
     ctx.hasCurDrawing = false;
     // 文字编辑初始化
     ctx.textBuf.clear();
@@ -3670,6 +4424,8 @@ static void ScreenshotCaptureThread() {
     g_captureCtx = nullptr;
     gdi.Cleanup();
     ctx.iconCache.Cleanup();
+    FreeMosaicBase(&ctx);
+    FreeMosaicBrushCursors(&ctx);
     DeleteDC(backDC); DeleteObject(backBmp);
     DeleteDC(memDC); DeleteObject(screenBitmap);
     UnregisterClassW(L"ZToolsScreenshotOverlay", GetModuleHandle(NULL));
