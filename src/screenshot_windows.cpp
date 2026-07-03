@@ -83,7 +83,9 @@ enum ResizeHandle {
     RH_TopLeft = 4,
     RH_TopRight = 5,
     RH_BottomLeft = 6,
-    RH_BottomRight = 7
+    RH_BottomRight = 7,
+    RH_ArrowStart = 8,   // 箭头起点端点手柄（仅箭头用，拖动改起点）
+    RH_ArrowEnd = 9      // 箭头终点端点手柄（仅箭头用，拖动改终点）
 };
 
 // 工具栏按钮
@@ -133,6 +135,16 @@ struct Annotation {
     bool mosaicRect;        // true=框选区域马赛克；false=鼠标涂抹马赛克
     int mosaicSize;         // 马赛克块大小（逻辑像素）
     int brushRadius;        // 涂抹半径（逻辑像素，仅涂抹模式有效）
+
+    // ---- 文字测量缓存（仅 AT_Text 有效）----
+    // 缓存"相对锚点的字形偏移与尺寸"（与 GDI+ MeasureString 同源）。
+    // 有效性条件 = (text, fontPx) 未变；锚点(x1,y1)变化不影响缓存值（外部加偏移即可），
+    // 故 TransformAnnotationByBox 的 AT_Text 分支（仅平移锚点）无需失效缓存。
+    // textCacheValid=false 表示未计算或已失效，下次 MeasureTextAnnotation 会重算并回填。
+    bool textCacheValid;
+    int textCacheFontPx;        // 生成缓存时的 fontPx（= thickness），用于校验
+    float textCacheOffX, textCacheOffY;  // 字形左上角相对锚点的偏移
+    float textCacheW, textCacheH;        // 字形紧凑宽高
 };
 
 // 粗细预设（逻辑像素，实际绘制粗细，渲染时乘 dpiScale）
@@ -186,6 +198,20 @@ static AnnotationType ToolToAnnotationType(int btn) {
         case TB_Arrow:  return AT_Arrow;
         case TB_Brush:  return AT_Brush;
         default:        return AT_Rect;
+    }
+}
+
+// AnnotationType -> ToolButton（ToolToAnnotationType 的逆映射）。
+// 用途：选中已有标注时，工具栏回显该标注对应的工具按钮（高亮 + 打开粗细/颜色子菜单）。
+// AT_Mosaic 无对应工具按钮（马赛克标注不可选中），返回 -1。
+static int AnnotationTypeToTool(AnnotationType t) {
+    switch (t) {
+        case AT_Rect:   return TB_Rect;
+        case AT_Circle: return TB_Circle;
+        case AT_Arrow:  return TB_Arrow;
+        case AT_Brush:  return TB_Brush;
+        case AT_Text:   return TB_Text;
+        default:        return -1;  // AT_Mosaic 等无对应工具按钮
     }
 }
 
@@ -254,6 +280,15 @@ struct SCGdiResources {
     // 选区外遮罩缓冲（虚拟屏幕大小，纯黑 + 常量 alpha），用于 AlphaBlend
     HDC maskDC;
     HBITMAP maskBitmap;
+    // ---- P2 性能优化：固定样式 Pen/Brush 会话级缓存，避免每帧 Create/Delete ----
+    // 工具栏分隔线笔（DrawToolbar）。
+    HPEN toolbarSepPen;         // PS_SOLID, 1, RGB(230,230,230)
+    // 文字选择高亮画刷（AlphaBlend 半透明选区底色）。
+    HBRUSH textSelBrush;        // RGB(51,153,255)
+    // 悬停/选中标注边框：蓝色虚线笔（悬停文字/非文字标注 + 选中非文字标注共用）。
+    HPEN annHoverPen;           // PS_DASH, 1, RGB(0,136,255)
+    // 选中文字标注边框：蓝色实线粗笔（与 selectionPen 的宽度 1 区别）。
+    HPEN annTextSelPen;         // PS_SOLID, 2, RGB(0,136,255)
 
     void Init() {
         bgBrush = CreateSolidBrush(RGB(52, 52, 53));
@@ -269,6 +304,11 @@ struct SCGdiResources {
         smallFont = CreateFontIndirectW(&lf);
         maskDC = NULL;
         maskBitmap = NULL;
+        // P2：预建固定样式 Pen/Brush，会话内复用。
+        toolbarSepPen = CreatePen(PS_SOLID, 1, RGB(230, 230, 230));
+        textSelBrush = CreateSolidBrush(RGB(51, 153, 255));
+        annHoverPen = CreatePen(PS_DASH, 1, RGB(0, 136, 255));
+        annTextSelPen = CreatePen(PS_SOLID, 2, RGB(0, 136, 255));
     }
 
     // 创建遮罩缓冲（纯黑位图，配合常量 alpha 实现 40%+ 半透明遮罩）
@@ -303,6 +343,11 @@ struct SCGdiResources {
         if (smallFont) { DeleteObject(smallFont); smallFont = NULL; }
         if (maskBitmap) { DeleteObject(maskBitmap); maskBitmap = NULL; }
         if (maskDC) { DeleteDC(maskDC); maskDC = NULL; }
+        // P2：释放缓存的固定样式 Pen/Brush。
+        if (toolbarSepPen) { DeleteObject(toolbarSepPen); toolbarSepPen = NULL; }
+        if (textSelBrush) { DeleteObject(textSelBrush); textSelBrush = NULL; }
+        if (annHoverPen) { DeleteObject(annHoverPen); annHoverPen = NULL; }
+        if (annTextSelPen) { DeleteObject(annTextSelPen); annTextSelPen = NULL; }
     }
 };
 
@@ -592,9 +637,7 @@ static int HitTestMosaicPopup(int x, int y, const RECT& popupRect, const SCPopup
 static void DrawMosaicPopup(HDC hdc, const RECT& popupRect,
                             int modeIdx, int sizeIdx, int radiusIdx,
                             const SCPopupMetrics& m) {
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR gdipToken;
-    Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL);
+    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用（Graphics 按 hdc 新建）。
     {
         Gdiplus::Graphics graphics(hdc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -731,7 +774,6 @@ static void DrawMosaicPopup(HDC hdc, const RECT& popupRect,
             graphics.FillEllipse(&brush, cx - r, midY - r, r * 2, r * 2);
         }
     }
-    Gdiplus::GdiplusShutdown(gdipToken);
 }
 
 // 命中测试子菜单，返回值约定：
@@ -774,9 +816,7 @@ static int HitTestPopup(int x, int y, const RECT& popupRect, const SCPopupMetric
 static void DrawPopup(HDC hdc, const RECT& popupRect,
                       int colorIdx, int firstIdx, bool isTextTool,
                       const SCPopupMetrics& m) {
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR gdipToken;
-    Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL);
+    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用（Graphics 按 hdc 新建）。
     {
         Gdiplus::Graphics graphics(hdc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -879,7 +919,6 @@ static void DrawPopup(HDC hdc, const RECT& popupRect,
             graphics.DrawEllipse(&outline, cx - r, midY - r, r * 2, r * 2);
         }
     }
-    Gdiplus::GdiplusShutdown(gdipToken);
 }
 
 // 截图上下文
@@ -904,6 +943,13 @@ struct CaptureContext {
     RECT lastHighlightRect;
     RECT lastToolbarRect;
     RECT lastPopupRect;
+    // P1 局部刷新用：上帧光标/被操作标注/正在绘制标注的包围盒（供 InvalidateRect 计算旧位置）
+    RECT lastCaretRect;             // 上帧文字光标矩形（backDC 坐标），hasLastCaret=false 表示无效
+    bool hasLastCaret;
+    RECT lastAnnotationBox;         // 上帧被拖拽/缩放标注的包围盒（绝对虚拟屏幕坐标）
+    bool hasLastAnnotationBox;
+    RECT lastDrawingBox;            // 上帧 curDrawing 包围盒（绝对虚拟屏幕坐标）
+    bool hasLastDrawingBox;
     bool needFullRedraw;
     // DPI
     double dpiScale;
@@ -977,10 +1023,120 @@ struct CaptureContext {
     int selectedTextAnnotation;            // 已选中的文字标注索引（-1 表示无，持久保持直到点空白）
     int draggingTextAnnotation;            // 正在拖动的文字标注索引（-1 表示无）
     int textDragStartX, textDragStartY;    // 文字拖动起始位置
+    // ---- 非文字标注的选中/拖拽/缩放（与文字机制互斥：选中非文字时清文字选中，反之亦然）----
+    int hoveredAnnotation;                 // 悬浮命中的非文字标注索引（-1=无，用于虚线框/光标即时反馈）
+    int selectedAnnotation;                // 已选中的非文字标注索引（-1=无，持久保持直到点空白/进入其他操作）
+    int draggingAnnotation;                // 正在拖拽的非文字标注索引（-1=无）
+    int resizingAnnotation;                // 正在缩放的非文字标注索引（-1=无）
+    int annotationResizeHandle;            // 当前缩放手柄（RH_None=无；CS_Resizing 时为四角之一）
+    int annotationDragStartX, annotationDragStartY;  // 鼠标按下位置（绝对坐标，拖拽/缩放共用）
+    Annotation dragStartAnnotation;                   // 按下时标注快照（拖拽时还原+平移）
+    RECT annotationResizeStartBox;                    // 按下时包围盒（缩放时基准）
+
+    // ---- GDI+ 会话级资源（性能优化：会话内单次 Startup/Shutdown）----
+    // 原实现每个绘制/测量函数各自 GdiplusStartup/Shutdown，每帧 WM_PAINT 触发 6~10 次昂贵的
+    // GDI+ 初始化，是拖拽卡顿的主因。由于所有 GDI+ 调用均在 ScreenshotCaptureThread 单线程内，
+    // 改为会话开始 Startup 一次、结束 Shutdown 一次。FontFamily(SC_FONT_FACE) 与
+    // StringFormat(总是 Near/Near) 为常量；Font 仅依赖 fontPx（文字字号仅 SC_FONT_SIZES 三档），
+    // 均缓存复用。Graphics 仍每次按 hdc 新建（必须，因为绑定不同 DC）。
+    ULONG_PTR gdipToken;                  // GDI+ 启动令牌（0 = 未初始化）
+    Gdiplus::GdiplusStartupInput gdipStartupInput;
+    bool gdipInited;                      // GDI+ 是否已 Startup
+    Gdiplus::FontFamily* gdipFontFamily;  // SC_FONT_FACE，会话内唯一
+    Gdiplus::StringFormat* gdipStrFmt;    // Near/Near，会话内唯一
+    Gdiplus::Font* gdipFonts[3];          // 按 SC_FONT_SIZES 预建的 Font（索引对齐 SC_FONT_COUNT）
 };
 
 // 截图上下文指针（窗口过程使用）
 static CaptureContext* g_captureCtx = nullptr;
+
+// ==================== GDI+ 会话级资源管理（性能优化） ====================
+// 所有 GDI+ 调用均在 ScreenshotCaptureThread 单线程内，故可在会话开始 Startup 一次、
+// 结束 Shutdown 一次，避免每个绘制/测量函数反复 Startup/Shutdown（每帧 WM_PAINT 触发 6~10 次）。
+
+// 前置声明：InitGdipResources 在分配失败时复用 Shutdown 清理。
+static void ShutdownGdipResources(CaptureContext* ctx);
+
+// 初始化会话级 GDI+ 资源：Startup + 预建可复用的 FontFamily/StringFormat/Font。
+// 必须在任何 GDI+ 调用（含 InitMosaicBrushCursors）之前调用。
+// 成功返回 true；失败（Startup 失败）返回 false，调用方应中止会话。
+static bool InitGdipResources(CaptureContext* ctx) {
+    ctx->gdipToken = 0;
+    ctx->gdipInited = false;
+    ctx->gdipFontFamily = nullptr;
+    ctx->gdipStrFmt = nullptr;
+    for (int i = 0; i < SC_FONT_COUNT; i++) ctx->gdipFonts[i] = nullptr;
+
+    if (Gdiplus::GdiplusStartup(&ctx->gdipToken, &ctx->gdipStartupInput, NULL) != Gdiplus::Ok) {
+        return false;
+    }
+    ctx->gdipInited = true;
+
+    // 注意：GDI+ 类继承自 GdiplusBase，其 operator new 不接受 std::nothrow 参数，
+    // 故用普通 new（GDI+ 对象通过 GetLastStatus() 而非空指针报告失败）。
+    ctx->gdipFontFamily = new Gdiplus::FontFamily(SC_FONT_FACE);
+    ctx->gdipStrFmt = new Gdiplus::StringFormat();
+    if (!ctx->gdipFontFamily || !ctx->gdipStrFmt
+        || ctx->gdipFontFamily->GetLastStatus() != Gdiplus::Ok) {
+        ShutdownGdipResources(ctx); return false;
+    }
+    ctx->gdipStrFmt->SetAlignment(Gdiplus::StringAlignmentNear);
+    ctx->gdipStrFmt->SetLineAlignment(Gdiplus::StringAlignmentNear);
+
+    // 按文字字号预设预建 Font（与 SC_FONT_SIZES 一一对应）
+    for (int i = 0; i < SC_FONT_COUNT; i++) {
+        ctx->gdipFonts[i] = new Gdiplus::Font(
+            ctx->gdipFontFamily, (Gdiplus::REAL)SC_FONT_SIZES[i],
+            Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        if (!ctx->gdipFonts[i] || ctx->gdipFonts[i]->GetLastStatus() != Gdiplus::Ok) {
+            ShutdownGdipResources(ctx); return false;
+        }
+    }
+    return true;
+}
+
+// 释放会话级 GDI+ 资源：先 delete 所有 GDI+ 对象，再 Shutdown（对象须在 Shutdown 前析构）。
+// 安全可重入：重复调用无副作用。
+static void ShutdownGdipResources(CaptureContext* ctx) {
+    // Font 先于 FontFamily 析构（Font 内部引用 FontFamily）
+    for (int i = 0; i < SC_FONT_COUNT; i++) {
+        delete ctx->gdipFonts[i];
+        ctx->gdipFonts[i] = nullptr;
+    }
+    delete ctx->gdipStrFmt;
+    ctx->gdipStrFmt = nullptr;
+    delete ctx->gdipFontFamily;
+    ctx->gdipFontFamily = nullptr;
+
+    if (ctx->gdipInited) {
+        Gdiplus::GdiplusShutdown(ctx->gdipToken);
+        ctx->gdipInited = false;
+        ctx->gdipToken = 0;
+    }
+}
+
+// 取 fontPx 对应的缓存 Font。文字标注字号仅取自 SC_FONT_SIZES，故优先查缓存表；
+// 若 fontPx 不在预设表内（理论上不会发生），用 thread_local 临时对象兜底，避免泄漏。
+// 返回的 Font 所有权归会话/兜底存储，调用方不得 delete。
+static Gdiplus::Font* GetGdipFont(CaptureContext* ctx, int fontPx) {
+    for (int i = 0; i < SC_FONT_COUNT; i++) {
+        if (SC_FONT_SIZES[i] == fontPx && ctx->gdipFonts[i]) {
+            return ctx->gdipFonts[i];
+        }
+    }
+    // 兜底：thread_local 临时 Font（仅当前线程有效，覆盖极少见的非预设字号）
+    static thread_local Gdiplus::Font* sFallback = nullptr;
+    static thread_local int sFallbackPx = -1;
+    static thread_local Gdiplus::FontFamily* sFallbackFam = nullptr;
+    if (!sFallbackFam) sFallbackFam = new Gdiplus::FontFamily(SC_FONT_FACE);
+    if (!sFallback || sFallbackPx != fontPx) {
+        delete sFallback;
+        sFallbackPx = fontPx;
+        sFallback = new Gdiplus::Font(sFallbackFam, (Gdiplus::REAL)fontPx,
+                                      Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    }
+    return sFallback;
+}
 
 // Base64 编码表
 static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1278,6 +1434,22 @@ static RECT InflateRectBy(const RECT& r, int margin) {
     return { r.left - margin, r.top - margin, r.right + margin, r.bottom + margin };
 }
 
+// 矩形是否有效（宽高 > 0）
+static bool IsValidRect(const RECT& r) {
+    return r.right > r.left && r.bottom > r.top;
+}
+
+// 两矩形并集的外包矩形（安全处理零矩形：若一方无效则返回另一方）。
+// 用于计算"旧位置 ∪ 新位置"的脏区域外包。
+static RECT UnionRectSafe(const RECT& a, const RECT& b) {
+    bool va = IsValidRect(a), vb = IsValidRect(b);
+    if (!va && !vb) return {0, 0, 0, 0};
+    if (!va) return b;
+    if (!vb) return a;
+    return { (std::min)(a.left, b.left), (std::min)(a.top, b.top),
+             (std::max)(a.right, b.right), (std::max)(a.bottom, b.bottom) };
+}
+
 // ---- 绘制函数 ----
 
 // 绘制放大镜 + 鼠标信息面板
@@ -1543,6 +1715,10 @@ static LPCWSTR HandleCursor(int handle) {
         case RH_TopRight:
         case RH_BottomLeft:
             return (LPCWSTR)IDC_SIZENESW;
+        case RH_ArrowStart:
+        case RH_ArrowEnd:
+            // 箭头端点拖拽：固定四向箭头，与悬停态一致
+            return (LPCWSTR)IDC_SIZEALL;
         default:
             return (LPCWSTR)IDC_ARROW;
     }
@@ -1613,7 +1789,7 @@ static void DrawToolbarIcon(HDC hdc, int cx, int cy, int btn, bool active,
 }
 
 // 绘制选区调整手柄（8 个），传入相对坐标矩形
-static void DrawResizeHandles(HDC hdc, const RECT& selRel, const SCGdiResources& gdi) {
+static void DrawResizeHandles(HDC hdc, const RECT& selRel) {
     int hs = SC_HANDLE_SIZE;
     int half = hs / 2;
     int cx = (selRel.left + selRel.right) / 2;
@@ -1628,15 +1804,19 @@ static void DrawResizeHandles(HDC hdc, const RECT& selRel, const SCGdiResources&
         { selRel.left,  selRel.bottom },
         { selRel.right, selRel.bottom },
     };
-    HGDIOBJ oldPen = SelectObject(hdc, CreatePen(PS_SOLID, 1, RGB(255, 255, 255)));
-    HGDIOBJ oldBrush = SelectObject(hdc, CreateSolidBrush(RGB(0, 136, 255)));
+    // GDI+ 抗锯齿绘制：方块边缘像素半透明过渡，消除 GDI Rectangle 的硬锯齿。
+    // 颜色沿用原 GDI 资源：蓝色填充 RGB(0,136,255) + 白色 1px 描边 RGB(255,255,255)。
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::SolidBrush fillBrush(Gdiplus::Color(255, 0, 136, 255));
+    Gdiplus::Pen borderPen(Gdiplus::Color(255, 255, 255, 255), 1.0f);
+    Gdiplus::GraphicsPath path;
     for (auto& p : pts) {
-        Rectangle(hdc, p[0] - half, p[1] - half, p[0] + half, p[1] + half);
+        // hs×hs 匹配原 GDI Rectangle(l,t,r,b) 的 [l,r-1]×[t,b-1] 像素范围（2*half=hs）。
+        path.AddRectangle(Gdiplus::Rect(p[0] - half, p[1] - half, hs, hs));
     }
-    HGDIOBJ pen = SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-    HGDIOBJ brush = SelectObject(hdc, oldBrush);
-    DeleteObject(brush);
+    graphics.FillPath(&fillBrush, &path);
+    graphics.DrawPath(&borderPen, &path);
 }
 
 // 绘制确认态选区边框（细蓝框）
@@ -1672,9 +1852,7 @@ static void DrawToolbar(HDC hdc, const RECT& toolbarRect,
 
     // ---- 第一遍：GDI+ 抗锯齿绘制工具栏圆角背景 + 按钮圆角高亮 ----
     // GDI 的 RoundRect/FillRect 不支持抗锯齿，圆角边缘有锯齿，故改用 GDI+。
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR gdipToken;
-    Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL);
+    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用。
     {
         Gdiplus::Graphics graphics(hdc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -1716,7 +1894,6 @@ static void DrawToolbar(HDC hdc, const RECT& toolbarRect,
             graphics.FillPath(&hlBrush, &hlPath);
         }
     }
-    Gdiplus::GdiplusShutdown(gdipToken);
 
     // ---- 第二遍：GDI 绘制分隔线 + 图标（位图直接 AlphaBlend，无需 AA）----
     for (int i = 0; i < TB_Count; i++) {
@@ -1729,12 +1906,10 @@ static void DrawToolbar(HDC hdc, const RECT& toolbarRect,
             // 分隔线
             int sx = bx + m.btn / 2;
             int sepInset = m.btn / 8 + 2;
-            HGDIOBJ sepPen = CreatePen(PS_SOLID, 1, RGB(230, 230, 230));
-            HGDIOBJ op = SelectObject(hdc, sepPen);
+            HGDIOBJ op = SelectObject(hdc, gdi.toolbarSepPen);
             MoveToEx(hdc, sx, btnRect.top + sepInset, NULL);
             LineTo(hdc, sx, btnRect.bottom - sepInset);
             SelectObject(hdc, op);
-            DeleteObject(sepPen);
             continue;
         }
 
@@ -1822,16 +1997,45 @@ static void DrawOneAnnotation(Gdiplus::Graphics& graphics, const Annotation& a,
             float sy = a.y1 + oy;
             float ex = a.x2 + ox;
             float ey = a.y2 + oy;
-            // 线段终点回退一段，避免与箭头头重叠
             float dx = ex - sx, dy = ey - sy;
             float len = std::sqrt(dx * dx + dy * dy);
-            float back = thick * 3.0f + 6.0f;
-            if (len > back + 2) {
-                float ex2 = ex - dx / len * back;
-                float ey2 = ey - dy / len * back;
-                graphics.DrawLine(&pen, sx, sy, ex2, ey2);
-            }
-            DrawArrowHead(graphics, brush, sx, sy, ex, ey, thick, 0, 0);
+            if (len < 1.0f) break;
+            // 箭头几何：机翼状——底边内凹（向尖端方向凹入 notch），两翼后掠，
+            // 从箭身末端张开，呈「细尾→锥杆→张开两翼→尖」的箭矢形态。
+            float headLen = thick * 4.0f + 8.0f;
+            float headHalfW = thick * 2.4f + 5.0f;
+            float notch = headLen * 0.4f;        // 内凹深度：底边中点向尖端凹入
+            if (headLen > len) headLen = len * 0.6f;
+            float ux = dx / len, uy = dy / len;
+            float nx = -uy, ny = ux;
+            // 箭头底部中心（沿箭头方向后退 headLen）与内凹点
+            float baseX = ex - ux * headLen;
+            float baseY = ey - uy * headLen;
+            float notchX = baseX + ux * notch;
+            float notchY = baseY + uy * notch;
+            // 箭身：起点细、终点粗的锥形。终点延伸至内凹点并略超出（overlap），
+            // 由箭头覆盖重叠区，避免抗锯齿在拼接处留细缝；终点宽 < 两翼宽，
+            // 使两翼从箭身末端明显张开、内凹缺口清晰可见。
+            float startHalfW = (std::max)(thick * 0.5f, 0.75f);
+            float endHalfW = headHalfW * 0.55f;
+            float overlap = 1.5f;
+            float bodyEndX = notchX + ux * overlap;
+            float bodyEndY = notchY + uy * overlap;
+            Gdiplus::PointF body[4] = {
+                Gdiplus::PointF(sx + nx * startHalfW, sy + ny * startHalfW),
+                Gdiplus::PointF(sx - nx * startHalfW, sy - ny * startHalfW),
+                Gdiplus::PointF(bodyEndX - nx * endHalfW, bodyEndY - ny * endHalfW),
+                Gdiplus::PointF(bodyEndX + nx * endHalfW, bodyEndY + ny * endHalfW),
+            };
+            graphics.FillPolygon(&brush, body, 4);
+            // 机翼状箭头：尖 → 右翼 → 内凹点 → 左翼（底边内凹而非平直三角）
+            Gdiplus::PointF head[4] = {
+                Gdiplus::PointF(ex, ey),
+                Gdiplus::PointF(baseX + nx * headHalfW, baseY + ny * headHalfW),
+                Gdiplus::PointF(notchX, notchY),
+                Gdiplus::PointF(baseX - nx * headHalfW, baseY - ny * headHalfW),
+            };
+            graphics.FillPolygon(&brush, head, 4);
             break;
         }
         case AT_Brush: {
@@ -1958,10 +2162,8 @@ static HCURSOR CreateMosaicBrushCursor(int radius) {
     int size = (radius + pad) * 2;
     if (size < 16) size = 16;
 
-    Gdiplus::GdiplusStartupInput si;
-    ULONG_PTR token = 0;
     HCURSOR result = NULL;
-    if (Gdiplus::GdiplusStartup(&token, &si, NULL) != Gdiplus::Ok) return NULL;
+    // GDI+ 已由会话级 InitGdipResources 启动（在 InitMosaicBrushCursors 调用前完成）。
     {
         Gdiplus::Bitmap bmp(size, size, PixelFormat32bppARGB);
         {
@@ -2004,7 +2206,6 @@ static HCURSOR CreateMosaicBrushCursor(int radius) {
         DeleteObject(hMask);
         DeleteObject(hColor);
     }
-    Gdiplus::GdiplusShutdown(token);
     return result;
 }
 
@@ -2148,10 +2349,15 @@ static void RevealMosaicToTarget(HDC targetDC, HDC mosaicBase,
         any = true;
     }
     if (any) {
-        SelectClipRgn(targetDC, mask);
+        // 用 SaveDC 保护调用方的裁剪区（P1 局部帧时为 dirtyRect）：
+        // 此处设置 mask 裁剪区做马赛克揭示 BitBlt，结束后 RestoreDC 恢复，
+        // 避免清除调用方的 dirtyRect 裁剪区导致后续绘制越界。
+        int saved = SaveDC(targetDC);
+        // mask 与现有裁剪区（dirtyRect）求交，揭示只发生在 dirtyRect∩蒙版 区域
+        ExtSelectClipRgn(targetDC, mask, RGN_AND);
         // base 与 targetDC 同坐标系，1:1 拷贝
         BitBlt(targetDC, 0, 0, 0x7FFF, 0x7FFF, mosaicBase, 0, 0, SRCCOPY);
-        SelectClipRgn(targetDC, NULL);
+        if (saved) RestoreDC(targetDC, saved);
     }
     DeleteObject(mask);
 }
@@ -2162,9 +2368,7 @@ static void RevealMosaicToTarget(HDC targetDC, HDC mosaicBase,
 static void DrawAnnotations(HDC hdc, const RECT& selRel, int virtualX, int virtualY,
                             const std::vector<Annotation>& annotations,
                             const Annotation* curDrawing) {
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR gdipToken;
-    Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL);
+    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用（Graphics 按 hdc 新建）。
     {
         Gdiplus::Graphics graphics(hdc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -2172,7 +2376,9 @@ static void DrawAnnotations(HDC hdc, const RECT& selRel, int virtualX, int virtu
         Gdiplus::Rect clipRect(selRel.left, selRel.top,
                                selRel.right - selRel.left,
                                selRel.bottom - selRel.top);
-        graphics.SetClip(clipRect);
+        // 限制绘制范围在选区内（与选区矩形求交；局部帧时还会与 backDC 裁剪区 dirtyRect 求交，
+        // 因 Graphics(backDC) 继承 GDI 裁剪区，CombineModeIntersect 保证标注不超出 dirtyRect∩选区）。
+        graphics.SetClip(clipRect, Gdiplus::CombineModeIntersect);
 
         float ox = (float)-virtualX;
         float oy = (float)-virtualY;
@@ -2185,7 +2391,6 @@ static void DrawAnnotations(HDC hdc, const RECT& selRel, int virtualX, int virtu
             DrawOneAnnotation(graphics, *curDrawing, ox, oy);
         }
     }
-    Gdiplus::GdiplusShutdown(gdipToken);
 }
 
 
@@ -2197,9 +2402,7 @@ static void CompositeAnnotations(HDC finalDC, HDC srcDC,
                                  const RECT& rect, int virtualX, int virtualY,
                                  double dpiScale, int mosaicBlockPx) {
     if (annotations.empty()) return;
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR gdipToken;
-    Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL);
+    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用。
     {
         Gdiplus::Graphics graphics(finalDC);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -2210,7 +2413,6 @@ static void CompositeAnnotations(HDC finalDC, HDC srcDC,
             DrawOneAnnotation(graphics, a, ox, oy);
         }
     }
-    Gdiplus::GdiplusShutdown(gdipToken);
 
     // 马赛克标注单独渲染（reveal-mask 模型：生成整选区 base 再揭示蒙版区域）
     bool hasMosaic = false;
@@ -2243,10 +2445,7 @@ static void CompositeAnnotations(HDC finalDC, HDC srcDC,
 
 // 将 HBITMAP 转换为 PNG base64 字符串
 static std::string BitmapToBase64Png(HBITMAP hBitmap) {
-    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    ULONG_PTR gdiplusToken;
-    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-
+    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用。
     std::string result;
     {
         Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(hBitmap, NULL);
@@ -2270,7 +2469,6 @@ static std::string BitmapToBase64Png(HBITMAP hBitmap) {
             delete bmp;
         }
     }
-    Gdiplus::GdiplusShutdown(gdiplusToken);
     return result;
 }
 
@@ -2463,22 +2661,17 @@ static bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
     CompositeAnnotations(finalDC, memDC, anns, rect, vx, vy, dpiScale,
                          SC_MOSAIC_SIZES[g_captureCtx ? g_captureCtx->mosaicSizeIdx : SC_DEFAULT_MOSAIC_IDX]);
 
-    // 用 GDI+ 保存为 PNG 文件
+    // 用 GDI+ 保存为 PNG 文件（GDI+ 已由会话级 InitGdipResources 启动）
     bool ok = false;
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR token = 0;
-    if (Gdiplus::GdiplusStartup(&token, &startupInput, NULL) == Gdiplus::Ok) {
-        {
-            Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(finalBmp, NULL);
-            if (bmp) {
-                CLSID pngClsid;
-                if (GetPngEncoderClsid(&pngClsid) >= 0) {
-                    ok = (bmp->Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok);
-                }
-                delete bmp;
+    {
+        Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(finalBmp, NULL);
+        if (bmp) {
+            CLSID pngClsid;
+            if (GetPngEncoderClsid(&pngClsid) >= 0) {
+                ok = (bmp->Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok);
             }
+            delete bmp;
         }
-        Gdiplus::GdiplusShutdown(token);
     }
 
     DeleteDC(finalDC);
@@ -2548,8 +2741,10 @@ static void EnterConfirmed(CaptureContext* ctx, const RECT& sel) {
 // 用于限制选区缩放：选区不可缩小到裁掉已添加内容。
 // 返回 false 表示无标注（无约束）。hdc 用于测量文字宽高。
 // 前置声明：文字包围盒复用 MeasureTextAnnotation（定义在下方）。
-static RECT MeasureTextAnnotation(HDC hdc, const Annotation& a);
-static bool CalcAnnotationsBounds(const std::vector<Annotation>& anns, RECT& out, HDC hdc) {
+// 参数为非常量引用：命中失败时会回填文字测量缓存（textCache* 字段）。
+static RECT MeasureTextAnnotation(HDC hdc, Annotation& a);
+// 非常量引用：AT_Text 分支会经 MeasureTextAnnotation 回填文字测量缓存。
+static bool CalcAnnotationsBounds(std::vector<Annotation>& anns, RECT& out, HDC hdc) {
     if (anns.empty()) return false;
     int minL = INT_MAX, minT = INT_MAX, maxR = INT_MIN, maxB = INT_MIN;
     auto expand = [&](int x, int y) {
@@ -2558,7 +2753,7 @@ static bool CalcAnnotationsBounds(const std::vector<Annotation>& anns, RECT& out
         if (x > maxR) maxR = x;
         if (y > maxB) maxB = y;
     };
-    for (const Annotation& a : anns) {
+    for (Annotation& a : anns) {
         if (a.type == AT_Brush) {
             for (const POINT& p : a.pts) expand(p.x, p.y);
         } else if (a.type == AT_Mosaic) {
@@ -2598,8 +2793,11 @@ static bool CalcAnnotationsBounds(const std::vector<Annotation>& anns, RECT& out
 //   - 字形左上角相对锚点 (x1,y1) 有内部偏移 (offX, offY)
 //   - 宽高为紧凑字形范围（不含 GDI GetTextExtentPoint32W 的尾部 overhang）
 //   - 边框左右 padding 对称，完整包住文字
-// 注意：GDI+ 对象须在 GdiplusShutdown 之前析构（内层 {} 保证）。
-static RECT MeasureTextAnnotation(HDC hdc, const Annotation& a) {
+// 性能：测量结果只依赖 (text, fontPx)，与锚点无关，故缓存"相对锚点的偏移/尺寸"。
+//   命中缓存（textCacheValid && textCacheFontPx == fontPx）时直接复用，跳过 GDI+ 测量；
+//   锚点变化（TransformAnnotationByBox 平移）不影响缓存有效性。
+//   缓存对象（FontFamily/StringFormat/Font）取自会话级 InitGdipResources（经 g_captureCtx）。
+static RECT MeasureTextAnnotation(HDC hdc, Annotation& a) {
     RECT rect = { a.x1, a.y1, a.x1, a.y1 };
     if (a.type != AT_Text || a.text.empty()) return rect;
 
@@ -2607,27 +2805,32 @@ static RECT MeasureTextAnnotation(HDC hdc, const Annotation& a) {
     if (fontPx < 8) fontPx = 8;
 
     float offX = 0, offY = 0, w = 0, h = 0;
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR token = 0;
-    if (Gdiplus::GdiplusStartup(&token, &startupInput, NULL) == Gdiplus::Ok) {
-        {
-            Gdiplus::Graphics graphics(hdc);
-            graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-            Gdiplus::FontFamily fontFamily(SC_FONT_FACE);
-            Gdiplus::Font font(&fontFamily, (Gdiplus::REAL)fontPx, Gdiplus::FontStyleRegular,
-                                Gdiplus::UnitPixel);
-            Gdiplus::StringFormat sf;
-            sf.SetAlignment(Gdiplus::StringAlignmentNear);
-            sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
-            Gdiplus::RectF origin(0, 0, 0, 0);
-            Gdiplus::RectF bounds;
-            graphics.MeasureString(a.text.c_str(), (INT)a.text.size(), &font, origin, &sf, &bounds);
-            offX = bounds.X;
-            offY = bounds.Y;
-            w = bounds.Width;
-            h = bounds.Height;
-        }
-        Gdiplus::GdiplusShutdown(token);
+    // 缓存命中：直接复用相对锚点的偏移/尺寸（与 fontPx 校验）
+    if (a.textCacheValid && a.textCacheFontPx == fontPx) {
+        offX = a.textCacheOffX;
+        offY = a.textCacheOffY;
+        w = a.textCacheW;
+        h = a.textCacheH;
+    } else if (g_captureCtx && g_captureCtx->gdipInited
+               && g_captureCtx->gdipFontFamily && g_captureCtx->gdipStrFmt) {
+        // 缓存未命中：做一次 GDI+ 测量并回填缓存
+        Gdiplus::Graphics graphics(hdc);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+        Gdiplus::Font* font = GetGdipFont(g_captureCtx, fontPx);
+        Gdiplus::StringFormat* sf = g_captureCtx->gdipStrFmt;
+        Gdiplus::RectF origin(0, 0, 0, 0);
+        Gdiplus::RectF bounds;
+        graphics.MeasureString(a.text.c_str(), (INT)a.text.size(), font, origin, sf, &bounds);
+        offX = bounds.X;
+        offY = bounds.Y;
+        w = bounds.Width;
+        h = bounds.Height;
+        a.textCacheValid = true;
+        a.textCacheFontPx = fontPx;
+        a.textCacheOffX = offX;
+        a.textCacheOffY = offY;
+        a.textCacheW = w;
+        a.textCacheH = h;
     }
 
     const int padding = 4;
@@ -2644,7 +2847,8 @@ static RECT MeasureTextAnnotation(HDC hdc, const Annotation& a) {
 }
 
 // 命中测试文字标注，返回标注索引（-1 表示未命中）
-static int HitTestTextAnnotations(const std::vector<Annotation>& anns, int x, int y, HDC hdc) {
+// 非常量引用：MeasureTextAnnotation 会回填文字测量缓存。
+static int HitTestTextAnnotations(std::vector<Annotation>& anns, int x, int y, HDC hdc) {
     for (int i = (int)anns.size() - 1; i >= 0; i--) {
         if (anns[i].type == AT_Text) {
             RECT rect = MeasureTextAnnotation(hdc, anns[i]);
@@ -2654,6 +2858,265 @@ static int HitTestTextAnnotations(const std::vector<Annotation>& anns, int x, in
         }
     }
     return -1;
+}
+
+// ==================== 通用标注几何（选中/拖拽/缩放） ====================
+// 以下函数把「仅文字标注」具备的 hover/选中/拖拽/缩放能力推广到所有标注类型。
+// 坐标系与 Annotation 一致：绝对虚拟屏幕坐标（与 ctx->mouseX/selection 同帧）。
+
+// 点 (px,py) 到线段 (ax,ay)-(bx,by) 的最短距离（像素）。
+// 用于画笔/箭头/马赛克涂抹等线条型标注的命中检测。
+static double PointToSegmentDist(double px, double py, double ax, double ay, double bx, double by) {
+    double dx = bx - ax, dy = by - ay;
+    double lenSq = dx * dx + dy * dy;
+    double t = 0;
+    if (lenSq > 1e-9) {
+        t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+        if (t < 0) t = 0;
+        else if (t > 1) t = 1;
+    }
+    double cx = ax + t * dx;
+    double cy = ay + t * dy;
+    double ex = px - cx, ey = py - cy;
+    return std::sqrt(ex * ex + ey * ey);
+}
+
+// 点 (px,py) 到折线 pts 的最短距离（像素）。
+static double PointToPolylineDist(double px, double py, const std::vector<POINT>& pts) {
+    if (pts.empty()) return 1e18;
+    if (pts.size() == 1) {
+        double ex = px - pts[0].x, ey = py - pts[0].y;
+        return std::sqrt(ex * ex + ey * ey);
+    }
+    double best = 1e18;
+    for (size_t i = 0; i + 1 < pts.size(); i++) {
+        double d = PointToSegmentDist(px, py, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+// 计算单个标注的包围盒（绝对虚拟屏幕坐标）。
+// 返回的矩形完整包住标注可见区域（含线宽/半径/文字 padding），用于选中框与四角 resize 手柄定位。
+// hdc 仅在 AT_Text 时用于 GDI+ 测量文字宽高。
+// 非常量引用：AT_Text 分支会经 MeasureTextAnnotation 回填文字测量缓存。
+static RECT MeasureAnnotationBounds(Annotation& a, HDC hdc) {
+    RECT r = { 0, 0, 0, 0 };
+    auto setBox = [&](int x1, int y1, int x2, int y2) {
+        r.left = (std::min)(x1, x2);
+        r.top = (std::min)(y1, y2);
+        r.right = (std::max)(x1, x2);
+        r.bottom = (std::max)(y1, y2);
+    };
+    switch (a.type) {
+        case AT_Rect:
+        case AT_Circle:
+        case AT_Arrow:
+        case AT_Mosaic:
+            if (a.type == AT_Mosaic && !a.mosaicRect) {
+                // 涂抹模式：路径包围盒 + 半径
+                if (a.pts.empty()) { r = { 0,0,0,0 }; return r; }
+                int rad = a.brushRadius;
+                int minL = INT_MAX, minT = INT_MAX, maxR = INT_MIN, maxB = INT_MIN;
+                for (const POINT& p : a.pts) {
+                    if (p.x < minL) minL = p.x;
+                    if (p.x > maxR) maxR = p.x;
+                    if (p.y < minT) minT = p.y;
+                    if (p.y > maxB) maxB = p.y;
+                }
+                r.left = minL - rad; r.top = minT - rad;
+                r.right = maxR + rad; r.bottom = maxB + rad;
+                return r;
+            }
+            // Rect/Circle/Arrow/MosaicRect：以两个对角点为包围盒
+            setBox(a.x1, a.y1, a.x2, a.y2);
+            return r;
+        case AT_Brush: {
+            if (a.pts.empty()) { r = { 0,0,0,0 }; return r; }
+            int minL = INT_MAX, minT = INT_MAX, maxR = INT_MIN, maxB = INT_MIN;
+            for (const POINT& p : a.pts) {
+                if (p.x < minL) minL = p.x;
+                if (p.x > maxR) maxR = p.x;
+                if (p.y < minT) minT = p.y;
+                if (p.y > maxB) maxB = p.y;
+            }
+            r.left = minL; r.top = minT; r.right = maxR; r.bottom = maxB;
+            return r;
+        }
+        case AT_Text:
+            return MeasureTextAnnotation(hdc, a);
+    }
+    return r;
+}
+
+// 命中测试任意标注，返回索引（-1 表示未命中）。
+// 从顶层（数组末尾，绘制最上层）向底层遍历，命中第一个即返回（与视觉 z-order 一致）。
+// 容差按线宽自适应：细线给 6px 余量，粗线给半个线宽，避免细线难以点中。
+// 非常量引用：AT_Text/AT_Mosaic 分支会回填文字测量缓存。
+static int HitTestAnnotation(std::vector<Annotation>& anns, int x, int y, HDC hdc) {
+    for (int i = (int)anns.size() - 1; i >= 0; i--) {
+        Annotation& a = anns[i];
+        // 马赛克区域（框选/涂抹）不可选中、不可拖拽，直接跳过命中测试。
+        if (a.type == AT_Mosaic) continue;
+        double tol = (std::max)(6.0, a.thickness / 2.0 + 2.0);
+        switch (a.type) {
+            case AT_Rect: {
+                // 仅命中矩形四条边轮廓（空心框），内部空白不选中。
+                // 到任一边线段的最短距离 ≤ tol 即命中（容差向外扩散几像素辅助探测）。
+                double d1 = PointToSegmentDist((double)x, (double)y, a.x1, a.y1, a.x2, a.y1);
+                double d2 = PointToSegmentDist((double)x, (double)y, a.x2, a.y2, a.x1, a.y2);
+                double d3 = PointToSegmentDist((double)x, (double)y, a.x1, a.y2, a.x1, a.y1);
+                double d4 = PointToSegmentDist((double)x, (double)y, a.x2, a.y1, a.x2, a.y2);
+                double dm = (std::min)((std::min)(d1, d2), (std::min)(d3, d4));
+                if (dm <= tol) return i;
+                break;
+            }
+            case AT_Circle: {
+                // 椭圆（由包围盒定义）轮廓命中：用归一化径向距离近似。
+                // r = hypot((x-cx)/a, (y-cy)/b)，r≈1 即落在椭圆上。
+                double cx = (a.x1 + a.x2) * 0.5;
+                double cy = (a.y1 + a.y2) * 0.5;
+                double aax = std::fabs((double)a.x2 - a.x1) * 0.5;
+                double aay = std::fabs((double)a.y2 - a.y1) * 0.5;
+                if (aax < 0.5 && aay < 0.5) {
+                    // 退化为点：直接点距
+                    double ex = x - cx, ey = y - cy;
+                    if (std::sqrt(ex * ex + ey * ey) <= tol) return i;
+                } else if (aax < 0.5) {
+                    // 退化为竖直线段
+                    if (PointToSegmentDist((double)x, (double)y, cx, a.y1, cx, a.y2) <= tol) return i;
+                } else if (aay < 0.5) {
+                    // 退化为水平线段
+                    if (PointToSegmentDist((double)x, (double)y, a.x1, cy, a.x2, cy) <= tol) return i;
+                } else {
+                    double r = std::sqrt(((x - cx) / aax) * ((x - cx) / aax)
+                                         + ((y - cy) / aay) * ((y - cy) / aay));
+                    // (r-1)*min(a,b) 把归一化距离换算回像素（用短半轴近似像素半径，保守且足够命中探测）
+                    double minAxis = (std::min)(aax, aay);
+                    if (std::fabs(r - 1.0) * minAxis <= tol) return i;
+                }
+                break;
+            }
+            case AT_Arrow: {
+                if (PointToSegmentDist((double)x, (double)y, a.x1, a.y1, a.x2, a.y2) <= tol)
+                    return i;
+                break;
+            }
+            case AT_Brush: {
+                if (PointToPolylineDist((double)x, (double)y, a.pts) <= tol) return i;
+                break;
+            }
+            case AT_Mosaic: {
+                if (a.mosaicRect) {
+                    RECT box = MeasureAnnotationBounds(a, hdc);
+                    if (PointInRect(x, y, box)) return i;
+                } else {
+                    // 涂抹：路径 + 半径
+                    if (PointToPolylineDist((double)x, (double)y, a.pts) <= a.brushRadius) return i;
+                }
+                break;
+            }
+            case AT_Text: {
+                RECT box = MeasureTextAnnotation(hdc, a);
+                if (PointInRect(x, y, box)) return i;
+                break;
+            }
+        }
+    }
+    return -1;
+}
+
+// 命中测试标注包围盒的 8 个手柄（4 角 + 4 边中点），返回 ResizeHandle 或 RH_None。
+// 容差沿用选区手柄的 SC_HANDLE_SIZE，保证与选区手柄一致的可点击范围。
+static int HitTestAnnotationHandle(int x, int y, const RECT& box) {
+    int hs = SC_HANDLE_SIZE;
+    int cx = (box.left + box.right) / 2;
+    int cy = (box.top + box.bottom) / 2;
+    struct { int hx, hy; int handle; } tests[] = {
+        { box.left,  box.top,    RH_TopLeft },
+        { box.right, box.top,    RH_TopRight },
+        { box.left,  box.bottom, RH_BottomLeft },
+        { box.right, box.bottom, RH_BottomRight },
+        { cx,        box.top,    RH_Top },
+        { cx,        box.bottom, RH_Bottom },
+        { box.left,  cy,         RH_Left },
+        { box.right, cy,         RH_Right },
+    };
+    for (auto& t : tests) {
+        RECT hitBox = { t.hx - hs, t.hy - hs, t.hx + hs, t.hy + hs };
+        if (PointInRect(x, y, hitBox)) return t.handle;
+    }
+    return RH_None;
+}
+
+// 命中测试箭头的起点/终点端点手柄，返回 RH_ArrowStart / RH_ArrowEnd / RH_None。
+// 箭头只允许拖拽两个端点（而非四角包围盒缩放），故单独命中 a.x1,y1 / a.x2,y2。
+// 容差沿用 SC_HANDLE_SIZE，与其它标注手柄可点击范围一致。
+static int HitTestArrowEndpoints(int x, int y, const Annotation& a) {
+    int hs = SC_HANDLE_SIZE;
+    struct { int hx, hy; int handle; } tests[] = {
+        { a.x1, a.y1, RH_ArrowStart },
+        { a.x2, a.y2, RH_ArrowEnd   },
+    };
+    for (auto& t : tests) {
+        RECT hitBox = { t.hx - hs, t.hy - hs, t.hx + hs, t.hy + hs };
+        if (PointInRect(x, y, hitBox)) return t.handle;
+    }
+    return RH_None;
+}
+
+// 按标注类型返回其缩放手柄命中（统一入口，供 LButtonDown/MouseMove/SETCURSOR 复用）：
+//   箭头 = 起点/终点 2 端点；矩形/圆 = 包围盒 8 手柄（4 角 + 4 边中点）；
+//   画笔/马赛克 = 无手柄（RH_None，不可缩放，画笔仅可整体拖动）。
+// hdc 仅用于测量文字包围盒（此处文字不会进入，但签名与 HitTestAnnotation 对齐便于扩展）。
+static int HitTestAnnotationResizeHandle(const Annotation& a, int x, int y, HDC hdc) {
+    switch (a.type) {
+        case AT_Arrow:
+            return HitTestArrowEndpoints(x, y, a);
+        case AT_Rect:
+        case AT_Circle: {
+            RECT box = MeasureAnnotationBounds(const_cast<Annotation&>(a), hdc);
+            return HitTestAnnotationHandle(x, y, box);
+        }
+        default:
+            // AT_Brush / AT_Mosaic / AT_Text 无缩放手柄
+            return RH_None;
+    }
+}
+
+// 按包围盒变换（平移 + 等比/非等比缩放）映射标注所有坐标。
+// oldBox -> newBox：标注内每个点 p 映射为 newBox.left + (p-oldBox.left)*sx 等。
+// 用于四角 resize（画笔/涂抹路径按包围盒整体缩放，保持形状比例）。
+// sx/sy 防 0：旧宽/高为 0 时退化为平移。
+static void TransformAnnotationByBox(Annotation& a, const RECT& oldBox, const RECT& newBox) {
+    double oldW = oldBox.right - oldBox.left;
+    double oldH = oldBox.bottom - oldBox.top;
+    double newW = newBox.right - newBox.left;
+    double newH = newBox.bottom - newBox.top;
+    double sx = (oldW > 0.5) ? newW / oldW : 1.0;
+    double sy = (oldH > 0.5) ? newH / oldH : 1.0;
+    auto mapX = [&](int v) { return (int)(newBox.left + (v - oldBox.left) * sx + 0.5); };
+    auto mapY = [&](int v) { return (int)(newBox.top + (v - oldBox.top) * sy + 0.5); };
+    switch (a.type) {
+        case AT_Rect:
+        case AT_Circle:
+        case AT_Arrow:
+        case AT_Mosaic:
+            if (a.type == AT_Mosaic && !a.mosaicRect) {
+                for (POINT& p : a.pts) { p.x = mapX(p.x); p.y = mapY(p.y); }
+            } else {
+                a.x1 = mapX(a.x1); a.y1 = mapY(a.y1);
+                a.x2 = mapX(a.x2); a.y2 = mapY(a.y2);
+            }
+            break;
+        case AT_Brush:
+            for (POINT& p : a.pts) { p.x = mapX(p.x); p.y = mapY(p.y); }
+            break;
+        case AT_Text:
+            // 文字不经过此路径（走原 draggingTextAnnotation 平移），此处兜底平移锚点
+            a.x1 = mapX(a.x1); a.y1 = mapY(a.y1);
+            break;
+    }
 }
 
 // ==================== GDI+ 文字测量（与提交态渲染同源） ====================
@@ -2673,60 +3136,69 @@ static void MeasureTextGdip(HDC hdc, const std::wstring& text, int fontPx,
         outH = (float)fontPx;
         return;
     }
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR token = 0;
-    if (Gdiplus::GdiplusStartup(&token, &startupInput, NULL) != Gdiplus::Ok) return;
-    {
-        Gdiplus::Graphics graphics(hdc);
-        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-        Gdiplus::FontFamily fontFamily(SC_FONT_FACE);
-        Gdiplus::Font font(&fontFamily, (Gdiplus::REAL)fontPx, Gdiplus::FontStyleRegular,
-                            Gdiplus::UnitPixel);
-        Gdiplus::StringFormat sf;
-        sf.SetAlignment(Gdiplus::StringAlignmentNear);
-        sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
-        // MeasureString 返回与 DrawString 一致的布局包围盒（含 GDI+ 的字体内部间距）。
-        Gdiplus::RectF origin(0, 0, 0, 0);
-        Gdiplus::RectF bounds;
-        graphics.MeasureString(text.c_str(), (INT)text.size(), &font, origin, &sf, &bounds);
-        outOffsetX = bounds.X;
-        outOffsetY = bounds.Y;
-        outW = bounds.Width;
-        outH = bounds.Height;
-    }
-    Gdiplus::GdiplusShutdown(token);
+    // GDI+ 已由会话级 InitGdipResources 启动；FontFamily/StringFormat/Font 复用会话缓存。
+    if (!g_captureCtx || !g_captureCtx->gdipInited
+        || !g_captureCtx->gdipFontFamily || !g_captureCtx->gdipStrFmt) return;
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    Gdiplus::Font* font = GetGdipFont(g_captureCtx, fontPx);
+    Gdiplus::StringFormat* sf = g_captureCtx->gdipStrFmt;
+    // MeasureString 返回与 DrawString 一致的布局包围盒（含 GDI+ 的字体内部间距）。
+    Gdiplus::RectF origin(0, 0, 0, 0);
+    Gdiplus::RectF bounds;
+    graphics.MeasureString(text.c_str(), (INT)text.size(), font, origin, sf, &bounds);
+    outOffsetX = bounds.X;
+    outOffsetY = bounds.Y;
+    outW = bounds.Width;
+    outH = bounds.Height;
 }
 
 // 测量逐字符累计宽度（用于光标定位/选中高亮）。
 // widths[i] 表示前 i 个字符（text[0..i-1]）的累计紧凑宽度，widths[0]=0。
 // 与 DrawString 渲染进度一致，光标 x = textX + widths[i]。
+// P2 优化：原实现逐前缀循环调 MeasureString（O(n²)），改用 MeasureCharacterRanges
+// 一次测出各前缀边界（O(n)）。MeasureCharacterRanges 会通过 SetMeasurableCharacterRanges
+// 修改 StringFormat，故不能就地改会话共享的 ctx->gdipStrFmt，这里栈上复制一份使用。
 static void MeasureCharWidthsGdip(HDC hdc, const std::wstring& text, int fontPx,
                                    std::vector<float>& widths) {
     widths.assign(text.size() + 1, 0.0f);
     if (text.empty()) return;
-    Gdiplus::GdiplusStartupInput startupInput;
-    ULONG_PTR token = 0;
-    if (Gdiplus::GdiplusStartup(&token, &startupInput, NULL) != Gdiplus::Ok) return;
-    {
-        Gdiplus::Graphics graphics(hdc);
-        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-        Gdiplus::FontFamily fontFamily(SC_FONT_FACE);
-        Gdiplus::Font font(&fontFamily, (Gdiplus::REAL)fontPx, Gdiplus::FontStyleRegular,
-                            Gdiplus::UnitPixel);
-        Gdiplus::StringFormat sf;
-        sf.SetAlignment(Gdiplus::StringAlignmentNear);
-        sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
-        Gdiplus::RectF origin(0, 0, 0, 0);
-        Gdiplus::RectF bounds;
-        std::wstring sub;
-        sub.reserve(text.size());
-        for (size_t i = 1; i <= text.size(); i++) {
-            sub.assign(text, 0, i);
-            graphics.MeasureString(sub.c_str(), (INT)sub.size(), &font, origin, &sf, &bounds);
-            widths[i] = bounds.X + bounds.Width;
+    // GDI+ 已由会话级 InitGdipResources 启动；FontFamily/StringFormat/Font 复用会话缓存。
+    if (!g_captureCtx || !g_captureCtx->gdipInited
+        || !g_captureCtx->gdipFontFamily || !g_captureCtx->gdipStrFmt) return;
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    Gdiplus::Font* font = GetGdipFont(g_captureCtx, fontPx);
+    // 复制会话级 StringFormat（Near/Near），在其上设置可测范围，避免污染共享对象。
+    Gdiplus::StringFormat localSf(g_captureCtx->gdipStrFmt);
+
+    const int n = (int)text.size();
+    // 布局矩形足够大以容纳整串，避免 Near/Near 文本换行或裁剪。
+    Gdiplus::RectF layoutRect(0, 0, 1000000.0f, 1000000.0f);
+
+    // SetMeasurableCharacterRanges 单次可设范围数受 GDI+ 内部缓冲限制，分批处理。
+    const int kBatch = 16;
+    Gdiplus::CharacterRange ranges[kBatch];
+    Gdiplus::Region regions[kBatch];
+    for (int start = 1; start <= n; start += kBatch) {
+        int cnt = (n - start + 1 < kBatch) ? (n - start + 1) : kBatch;
+        for (int j = 0; j < cnt; j++) {
+            int i = start + j;              // 前缀长度 i (1..n)
+            ranges[j].First = 0;
+            ranges[j].Length = i;
+        }
+        if (localSf.SetMeasurableCharacterRanges(cnt, ranges) != Gdiplus::Ok) continue;
+        if (graphics.MeasureCharacterRanges(text.c_str(), n, font, layoutRect,
+                                             &localSf, cnt, regions) != Gdiplus::Ok) continue;
+        for (int j = 0; j < cnt; j++) {
+            int i = start + j;
+            Gdiplus::RectF bounds;
+            // 前 i 个字符区域的右边缘 = 原 MeasureString(prefix) 的 bounds.X + bounds.Width。
+            if (regions[j].GetBounds(&bounds, &graphics) == Gdiplus::Ok) {
+                widths[i] = bounds.GetRight();
+            }
         }
     }
-    Gdiplus::GdiplusShutdown(token);
 }
 
 // 根据鼠标位置计算光标在文字中的位置（字符索引）
@@ -2748,6 +3220,83 @@ static int CalcCaretPosFromMouse(HDC hdc, const std::wstring& text, int fontPx, 
         }
     }
     return bestPos;
+}
+
+// P1 脏区域辅助：使"被拖拽/缩放标注的旧位置 ∪ 新位置"区域无效。
+// 用于 resizingAnnotation/draggingAnnotation/draggingTextAnnotation 的 MOUSEMOVE。
+// curBox 为当前帧标注包围盒（绝对虚拟屏幕坐标，由调用方用 MeasureAnnotationBounds 算）；
+// 与上帧缓存的 lastAnnotationBox 求并集后转 backDC 坐标并扩大。lastAnnotationBox 由 WM_PAINT 更新。
+// 扩大量需覆盖选中态的 resize 手柄：手柄圆心贴在包围盒边缘，半径 = SC_HANDLE_SIZE/2，
+// 故 inflate 量取 SC_HANDLE_SIZE/2 + 余量，确保旧/新手柄范围都在脏区内，避免拖拽时残留手柄痕迹。
+static void InvalidateAnnotationOp(HWND hwnd, CaptureContext* ctx, const RECT& curBox) {
+    RECT b;
+    if (ctx->hasLastAnnotationBox) {
+        b = UnionRectSafe(ctx->lastAnnotationBox, curBox);
+    } else {
+        b = curBox;
+    }
+    b.left -= ctx->virtualX; b.top -= ctx->virtualY;
+    b.right -= ctx->virtualX; b.bottom -= ctx->virtualY;
+    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;  // 手柄半径 + 描边/抗锯齿余量
+    InvalidateRect(hwnd, &InflateRectBy(b, handleMargin), FALSE);
+}
+
+// 选中/取消选中覆盖物时的精确脏区计算。
+// 根据当前 selectedAnnotation / selectedTextAnnotation 的包围盒算出需重绘的脏区
+// （含 resize 手柄半径余量），可选合并工具栏 + popup 旧位置（切换不同类型工具时）。
+// 调用时机：必须在调用方清空 selected*/hovered* 之前调用，否则读不到旧选中项的包围盒。
+// 坐标基准：返回 backDC/客户区坐标（已减 virtualX/Y），可直接用于 InvalidateRect(hwnd, &r, FALSE)。
+// 参数 includeToolbar：true 时并集工具栏矩形和 popup 矩形（覆盖 activeTool 切换导致的高亮按钮
+//   位移 + popup 打开/关闭/切换），用于「切换到不同类型工具」场景。
+// 返回值可能为无效矩形（{0,0,0,0}）：表示当前无任何选中项，调用方据此决定是否全屏重绘兜底。
+static RECT CalcSelectionDirty(CaptureContext* ctx, bool includeToolbar) {
+    RECT dirty = {0, 0, 0, 0};
+    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;  // 与 InvalidateAnnotationOp 一致的手柄半径余量
+
+    // 非文字标注选中项的包围盒
+    if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
+        RECT r = MeasureAnnotationBounds(ctx->annotations[ctx->selectedAnnotation], ctx->backDC);
+        r.left -= ctx->virtualX; r.top -= ctx->virtualY;
+        r.right -= ctx->virtualX; r.bottom -= ctx->virtualY;
+        dirty = UnionRectSafe(dirty, InflateRectBy(r, handleMargin));
+    }
+    // 文字标注选中项的包围盒（MeasureTextAnnotation 含文字 padding）
+    if (ctx->selectedTextAnnotation >= 0 && ctx->selectedTextAnnotation < (int)ctx->annotations.size()) {
+        RECT r = MeasureTextAnnotation(ctx->backDC, ctx->annotations[ctx->selectedTextAnnotation]);
+        r.left -= ctx->virtualX; r.top -= ctx->virtualY;
+        r.right -= ctx->virtualX; r.bottom -= ctx->virtualY;
+        dirty = UnionRectSafe(dirty, InflateRectBy(r, handleMargin));
+    }
+    // 切换不同类型工具：activeTool 变化后高亮按钮位移，popup 可能打开/关闭/切换类型，
+    // 将整条工具栏和当前 popup 都纳入脏区（宁大勿小，避免按钮高亮残影）。
+    if (includeToolbar) {
+        if (IsValidRect(ctx->toolbarRect)) {
+            dirty = UnionRectSafe(dirty, InflateRectBy(ctx->toolbarRect, 4));
+        }
+        if (IsValidRect(ctx->popupRect)) {
+            dirty = UnionRectSafe(dirty, InflateRectBy(ctx->popupRect, 4));
+        }
+    }
+    return dirty;
+}
+
+// P1 脏区域辅助：使文字行区域无效（用于文字编辑态的键盘输入/删除/光标移动）。
+// 文字行 y 范围取自上帧光标高度（lastCaretRect），x 范围覆盖整个选区宽度
+// （文字必然在选区内，选区宽度是文字行可能宽度的安全上界）。lastCaret 无效时全屏。
+// 坐标基准：backDC 坐标 = 客户区坐标（已减 virtualX/Y），与 InvalidateRect 一致。
+static void InvalidateTextLine(HWND hwnd, CaptureContext* ctx) {
+    if (!ctx->hasLastCaret) {
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+    // 文字行矩形：选区宽度 × 光标行高（backDC 坐标）
+    RECT line = {
+        ctx->selection.left - ctx->virtualX,
+        ctx->lastCaretRect.top,
+        ctx->selection.right - ctx->virtualX,
+        ctx->lastCaretRect.bottom
+    };
+    InvalidateRect(hwnd, &InflateRectBy(line, 4), FALSE);
 }
 
 // 截图覆盖层窗口过程（双缓冲渲染）
@@ -2800,16 +3349,32 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         int physW = (int)(ctx->virtualW * ds + 0.5);
         int physH = (int)(ctx->virtualH * ds + 0.5);
 
-        // 选区外遮罩覆盖整个虚拟屏幕，选区每次移动都会改变外部遮罩边界，
-        // 此时局部脏区域优化失效，必须整屏恢复背景 + 重绘遮罩。
-        if (ctx->state == CS_Selecting || ctx->state == CS_Confirmed ||
-            ctx->state == CS_Resizing || ctx->state == CS_Moving ||
-            ctx->state == CS_Drawing || ctx->state == CS_TextEditing) {
+        // P1 脏区域优化：仅"选区正在移动/缩放"的状态（Selecting/Resizing/Moving）
+        // 因遮罩边界大范围变化，必须整屏恢复背景。其余 confirmedMode 状态（Confirmed/Drawing/
+        // TextEditing）选区静止，可用 ps.rcPaint 局部刷新（由各调用点 InvalidateRect 传精确矩形）。
+        if (ctx->state == CS_Selecting || ctx->state == CS_Resizing || ctx->state == CS_Moving) {
             ctx->needFullRedraw = true;
         }
 
-        // 恢复背景
-        if (ctx->needFullRedraw) {
+        // 本帧脏区域：fullFrame 时为全屏，否则取 ps.rcPaint（由 InvalidateRect 矩形决定）。
+        // 客户区坐标 = backDC 坐标（窗口原点 = 虚拟屏幕左上角），可直接用于背景恢复与裁剪。
+        bool fullFrame = ctx->needFullRedraw;
+        RECT dirtyRect;
+        HRGN dirtyRgn = NULL;
+        if (fullFrame) {
+            dirtyRect = { 0, 0, ctx->virtualW, ctx->virtualH };
+        } else {
+            // ps.rcPaint 在 InvalidateRect(NULL) 时为整个客户区（等价全屏），传矩形时为该矩形。
+            dirtyRect = ps.rcPaint;
+            // 限定到虚拟屏幕范围内（防御性：ps.rcPaint 理论上不会超出客户区=虚拟屏幕）
+            if (dirtyRect.left < 0) dirtyRect.left = 0;
+            if (dirtyRect.top < 0) dirtyRect.top = 0;
+            if (dirtyRect.right > ctx->virtualW) dirtyRect.right = ctx->virtualW;
+            if (dirtyRect.bottom > ctx->virtualH) dirtyRect.bottom = ctx->virtualH;
+        }
+
+        // 恢复背景：fullFrame 全屏恢复；局部帧只恢复 dirtyRect（其余区域保留上帧最终画面）。
+        if (fullFrame) {
             if (ds > 1.01 || ds < 0.99) {
                 StretchBlt(backDC, 0, 0, ctx->virtualW, ctx->virtualH,
                     ctx->memDC, 0, 0, physW, physH, SRCCOPY);
@@ -2819,18 +3384,14 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             }
             ctx->needFullRedraw = false;
         } else {
-            // 脏区域恢复
-            RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastPanelRect, 2), ds);
-            if (ctx->lastSelectionRect.right > ctx->lastSelectionRect.left)
-                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastSelectionRect, 5), ds);
-            if (ctx->lastLabelRect.right > ctx->lastLabelRect.left)
-                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastLabelRect, 2), ds);
-            if (ctx->lastHighlightRect.right > ctx->lastHighlightRect.left)
-                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastHighlightRect, 5), ds);
-            if (ctx->lastToolbarRect.right > ctx->lastToolbarRect.left)
-                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastToolbarRect, 2), ds);
-            if (ctx->lastPopupRect.right > ctx->lastPopupRect.left)
-                RestoreDirtyRegion(backDC, ctx->memDC, InflateRectBy(ctx->lastPopupRect, 2), ds);
+            // 局部恢复脏区域为原始背景（后续渲染管线会对该区域重画遮罩/标注等，
+            // 因 AlphaBlend 作用于已恢复的清晰背景，结果与全屏渲染一致）。
+            RestoreDirtyRegion(backDC, ctx->memDC, dirtyRect, ds);
+            // 设置裁剪区：后续所有 GDI/GDI+ 绘制自动限制在 dirtyRect 内，
+            // 避免重绘未变化区域（GDI+ Graphics(backDC) 会继承此裁剪区）。
+            dirtyRgn = CreateRectRgn(dirtyRect.left, dirtyRect.top,
+                                     dirtyRect.right, dirtyRect.bottom);
+            SelectClipRgn(backDC, dirtyRgn);
         }
 
         // 绘制窗口高亮（Idle 状态）
@@ -2870,13 +3431,20 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             DrawConfirmedBorder(backDC, curSelRect, ctx->gdi);
             // 调整手柄（拖拽选区/调整选区/文字编辑时不绘制，避免遮挡；确认态/绘制标注时绘制）
             if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing) {
-                DrawResizeHandles(backDC, curSelRect, ctx->gdi);
+                DrawResizeHandles(backDC, curSelRect);
             }
             // 已提交标注 + 正在绘制的标注（绘制范围 clip 在选区内）
             // 调整选区时也保持显示，便于看清内容是否会被裁掉。
             if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing || ctx->state == CS_Resizing) {
                 const Annotation* cur = ctx->hasCurDrawing ? &ctx->curDrawing : nullptr;
                 DrawAnnotations(backDC, curSelRect, ctx->virtualX, ctx->virtualY, ctx->annotations, cur);
+                // 缓存正在绘制标注的包围盒（绝对虚拟屏幕坐标），供 CS_Drawing 局部刷新计算旧位置
+                if (ctx->state == CS_Drawing && ctx->hasCurDrawing) {
+                    ctx->lastDrawingBox = MeasureAnnotationBounds(ctx->curDrawing, backDC);
+                    ctx->hasLastDrawingBox = true;
+                } else if (ctx->state != CS_Drawing) {
+                    ctx->hasLastDrawingBox = false;
+                }
                 // 马赛克（reveal-mask 模型）：先确保 base（整选区马赛克）已生成，
                 // 再把所有马赛克标注（含正在绘制的）的蒙版区域从 base 揭示到 backDC。
                 // base 预计算后每帧只做带区域裁剪的 BitBlt，无逐标注像素化，连续无闪烁。
@@ -2894,22 +3462,18 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     int ry1 = (std::min)(ctx->curDrawing.y1, ctx->curDrawing.y2);
                     int rx2 = (std::max)(ctx->curDrawing.x1, ctx->curDrawing.x2);
                     int ry2 = (std::max)(ctx->curDrawing.y1, ctx->curDrawing.y2);
-                    Gdiplus::GdiplusStartupInput startupInput;
-                    ULONG_PTR bToken = 0;
-                    if (Gdiplus::GdiplusStartup(&bToken, &startupInput, NULL) == Gdiplus::Ok) {
-                        {
-                            Gdiplus::Graphics graphics(backDC);
-                            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-                            // 虚线笔：白色底 + 深色虚线，保证在任意背景上可见
-                            Gdiplus::Pen whitePen(Gdiplus::Color(255, 255, 255, 255), 3.0f);
-                            graphics.DrawRectangle(&whitePen, (float)rx1, (float)ry1,
-                                                   (float)(rx2 - rx1), (float)(ry2 - ry1));
-                            Gdiplus::Pen dashPen(Gdiplus::Color(255, 0x1E, 0x88, 0xE5), 1.5f);
-                            dashPen.SetDashStyle(Gdiplus::DashStyleDash);
-                            graphics.DrawRectangle(&dashPen, (float)rx1, (float)ry1,
-                                                   (float)(rx2 - rx1), (float)(ry2 - ry1));
-                        }
-                        Gdiplus::GdiplusShutdown(bToken);
+                    // GDI+ 已由会话级 InitGdipResources 启动，此处直接使用。
+                    {
+                        Gdiplus::Graphics graphics(backDC);
+                        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        // 虚线笔：白色底 + 深色虚线，保证在任意背景上可见
+                        Gdiplus::Pen whitePen(Gdiplus::Color(255, 255, 255, 255), 3.0f);
+                        graphics.DrawRectangle(&whitePen, (float)rx1, (float)ry1,
+                                               (float)(rx2 - rx1), (float)(ry2 - ry1));
+                        Gdiplus::Pen dashPen(Gdiplus::Color(255, 0x1E, 0x88, 0xE5), 1.5f);
+                        dashPen.SetDashStyle(Gdiplus::DashStyleDash);
+                        graphics.DrawRectangle(&dashPen, (float)rx1, (float)ry1,
+                                               (float)(rx2 - rx1), (float)(ry2 - ry1));
                     }
                 }
             }
@@ -2934,63 +3498,54 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 int textX = ctx->textAnchorX - ctx->virtualX;
                 int textY = ctx->textAnchorY - ctx->virtualY;
 
-                // 单次 GDI+ 启动：完成测量（整体包围盒 + 逐字符宽度）与文字绘制
-                // 关键：所有 GDI+ 对象（Graphics/Font/Brush 等）必须在 GdiplusShutdown 之前析构，
-                // 否则对象析构时访问已关闭的 GDI+ 内部状态会崩溃。故用内层 {} 包住对象生命周期，
-                // Shutdown 放在 } 之后（与 DrawAnnotations 的正确模式一致）。
+                // 单次 GDI+ 作用域：完成测量（整体包围盒 + 逐字符宽度）与文字绘制。
+                // GDI+ 已由会话级 InitGdipResources 启动；FontFamily/StringFormat/Font 复用会话缓存。
+                // 关键：测量与绘制必须在同一 Graphics 作用域内（注释 3245-3247），故仍用内层 {} 包住。
                 float offX = 0, offY = 0, textW = 0, textH = 0;
                 std::vector<float> charWidths;
-                Gdiplus::GdiplusStartupInput startupInput;
-                ULONG_PTR gdipToken = 0;
-                if (Gdiplus::GdiplusStartup(&gdipToken, &startupInput, NULL) == Gdiplus::Ok) {
-                    {
-                        Gdiplus::Graphics graphics(backDC);
-                        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-                        Gdiplus::FontFamily fontFamily(SC_FONT_FACE);
-                        Gdiplus::Font font(&fontFamily, (Gdiplus::REAL)fontPx,
-                                            Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-                        Gdiplus::StringFormat sf;
-                        sf.SetAlignment(Gdiplus::StringAlignmentNear);
-                        sf.SetLineAlignment(Gdiplus::StringAlignmentNear);
+                {
+                    Gdiplus::Graphics graphics(backDC);
+                    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+                    // 复用会话缓存的 FontFamily/StringFormat/Font（指针非空，InitGdipResources 保证）
+                    Gdiplus::Font* font = GetGdipFont(ctx, fontPx);
+                    Gdiplus::StringFormat* sf = ctx->gdipStrFmt;
 
-                        // 整体紧凑包围盒
-                        Gdiplus::RectF origin(0, 0, 0, 0);
-                        Gdiplus::RectF bounds;
-                        if (!ctx->textBuf.empty()) {
-                            graphics.MeasureString(ctx->textBuf.c_str(), (INT)ctx->textBuf.size(),
-                                                   &font, origin, &sf, &bounds);
-                            offX = bounds.X;
-                            offY = bounds.Y;
-                            textW = bounds.Width;
-                            textH = bounds.Height;
-                        } else {
-                            textH = (float)fontPx;
-                        }
-                        // 逐字符累计宽度（与 DrawString 渲染进度一致）
-                        charWidths.assign(ctx->textBuf.size() + 1, 0.0f);
-                        if (!ctx->textBuf.empty()) {
-                            std::wstring sub;
-                            sub.reserve(ctx->textBuf.size());
-                            for (size_t i = 1; i <= ctx->textBuf.size(); i++) {
-                                sub.assign(ctx->textBuf, 0, i);
-                                graphics.MeasureString(sub.c_str(), (INT)sub.size(),
-                                                       &font, origin, &sf, &bounds);
-                                charWidths[i] = bounds.X + bounds.Width;
-                            }
-                        }
-
-                        // 绘制文字（与提交态一致：顶部左对齐到锚点）
-                        if (!ctx->textBuf.empty()) {
-                            Gdiplus::SolidBrush textBrush(Gdiplus::Color(GetRValue(textColor),
-                                                                         GetGValue(textColor),
-                                                                         GetBValue(textColor)));
-                            Gdiplus::RectF layoutRect((float)textX, (float)textY, 10000.0f,
-                                                      (float)(fontPx * 2));
-                            graphics.DrawString(ctx->textBuf.c_str(), -1, &font, layoutRect,
-                                                &sf, &textBrush);
+                    // 整体紧凑包围盒
+                    Gdiplus::RectF origin(0, 0, 0, 0);
+                    Gdiplus::RectF bounds;
+                    if (!ctx->textBuf.empty()) {
+                        graphics.MeasureString(ctx->textBuf.c_str(), (INT)ctx->textBuf.size(),
+                                               font, origin, sf, &bounds);
+                        offX = bounds.X;
+                        offY = bounds.Y;
+                        textW = bounds.Width;
+                        textH = bounds.Height;
+                    } else {
+                        textH = (float)fontPx;
+                    }
+                    // 逐字符累计宽度（与 DrawString 渲染进度一致）
+                    charWidths.assign(ctx->textBuf.size() + 1, 0.0f);
+                    if (!ctx->textBuf.empty()) {
+                        std::wstring sub;
+                        sub.reserve(ctx->textBuf.size());
+                        for (size_t i = 1; i <= ctx->textBuf.size(); i++) {
+                            sub.assign(ctx->textBuf, 0, i);
+                            graphics.MeasureString(sub.c_str(), (INT)sub.size(),
+                                                   font, origin, sf, &bounds);
+                            charWidths[i] = bounds.X + bounds.Width;
                         }
                     }
-                    Gdiplus::GdiplusShutdown(gdipToken);
+
+                    // 绘制文字（与提交态一致：顶部左对齐到锚点）
+                    if (!ctx->textBuf.empty()) {
+                        Gdiplus::SolidBrush textBrush(Gdiplus::Color(GetRValue(textColor),
+                                                                     GetGValue(textColor),
+                                                                     GetBValue(textColor)));
+                        Gdiplus::RectF layoutRect((float)textX, (float)textY, 10000.0f,
+                                                  (float)(fontPx * 2));
+                        graphics.DrawString(ctx->textBuf.c_str(), -1, font, layoutRect,
+                                            sf, &textBrush);
+                    }
                 }
 
                 // 字形可见区域的左上角（含 GDI+ 内部偏移）
@@ -3030,71 +3585,134 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     int selY = (int)floorf(glyphTop);
                     int selH = (int)ceilf(glyphH);
                     if (selW > 0 && selH > 0) {
-                        HBRUSH selBrush = CreateSolidBrush(RGB(51, 153, 255));
                         BLENDFUNCTION blend = { AC_SRC_OVER, 0, 100, 0 };
                         HDC tempDC = CreateCompatibleDC(backDC);
                         HBITMAP tempBmp = CreateCompatibleBitmap(backDC, selW, selH);
                         SelectObject(tempDC, tempBmp);
                         RECT tempRect = {0, 0, selW, selH};
-                        FillRect(tempDC, &tempRect, selBrush);
+                        FillRect(tempDC, &tempRect, ctx->gdi.textSelBrush);
                         AlphaBlend(backDC, selLeft, selY, selW, selH, tempDC, 0, 0, selW, selH, blend);
-                        DeleteObject(selBrush);
                         DeleteDC(tempDC);
                         DeleteObject(tempBmp);
                     }
                 }
 
                 // 绘制光标（闪烁效果，基于 GDI+ 字符宽度，高度对齐字形）
-                if (ctx->textCaretVisible && ctx->textCaretPos >= 0
-                    && ctx->textCaretPos < (int)charWidths.size()) {
+                // 始终缓存光标几何（即使本帧不可见），供光标闪烁/方向键的 InvalidateRect 局部刷新。
+                if (ctx->textCaretPos >= 0 && ctx->textCaretPos < (int)charWidths.size()) {
                     float caretXF = (float)textX + charWidths[ctx->textCaretPos];
                     int caretX = (int)floorf(caretXF);
                     int caretY2 = (int)floorf(glyphTop);
                     int caretH = (int)ceilf(glyphH);
-                    HPEN caretPen = CreatePen(PS_SOLID, 2, textColor);
-                    HGDIOBJ oldPenC = SelectObject(backDC, caretPen);
-                    MoveToEx(backDC, caretX, caretY2, NULL);
-                    LineTo(backDC, caretX, caretY2 + caretH);
-                    SelectObject(backDC, oldPenC);
-                    DeleteObject(caretPen);
+                    // 缓存光标矩形（backDC 坐标，含 2px 宽度），供局部刷新
+                    ctx->lastCaretRect = { caretX - 1, caretY2, caretX + 3, caretY2 + caretH };
+                    ctx->hasLastCaret = true;
+                    if (ctx->textCaretVisible) {
+                        HPEN caretPen = CreatePen(PS_SOLID, 2, textColor);
+                        HGDIOBJ oldPenC = SelectObject(backDC, caretPen);
+                        MoveToEx(backDC, caretX, caretY2, NULL);
+                        LineTo(backDC, caretX, caretY2 + caretH);
+                        SelectObject(backDC, oldPenC);
+                        DeleteObject(caretPen);
+                    }
                 }
             }
-            // 确认态和文字编辑态：文字标注的选中/悬停边框
+            // 确认态和文字编辑态：文字标注的选中边框
             // - selectedTextAnnotation：已选中的标注（点击后持久保持），实线高亮边框
-            // - hoveredTextAnnotation：仅鼠标悬浮反馈，虚线边框（仅在与选中不同时绘制）
+            // 注：文字悬浮辅助边框已移除（确认态下悬浮高亮与选中边框语义重叠且干扰视觉）。
             if (ctx->state == CS_Confirmed || ctx->state == CS_TextEditing) {
                 // 已选中：实线蓝色边框（醒目）
                 if (ctx->selectedTextAnnotation >= 0
                     && ctx->selectedTextAnnotation < (int)ctx->annotations.size()) {
                     RECT annRect = MeasureTextAnnotation(backDC, ctx->annotations[ctx->selectedTextAnnotation]);
+                    // 缓存选中文字标注包围盒（绝对坐标），供拖动时局部刷新算旧位置
+                    ctx->lastAnnotationBox = annRect;
+                    ctx->hasLastAnnotationBox = true;
                     annRect.left -= ctx->virtualX;
                     annRect.top -= ctx->virtualY;
                     annRect.right -= ctx->virtualX;
                     annRect.bottom -= ctx->virtualY;
-                    HPEN selPen = CreatePen(PS_SOLID, 2, RGB(0, 136, 255));
-                    HGDIOBJ oldPenS = SelectObject(backDC, selPen);
+                    HGDIOBJ oldPenS = SelectObject(backDC, ctx->gdi.annTextSelPen);
                     HGDIOBJ oldBrushS = SelectObject(backDC, GetStockObject(NULL_BRUSH));
                     Rectangle(backDC, annRect.left, annRect.top, annRect.right, annRect.bottom);
                     SelectObject(backDC, oldBrushS);
                     SelectObject(backDC, oldPenS);
-                    DeleteObject(selPen);
                 }
-                // 悬停：虚线边框（仅当悬浮的不是已选中项时绘制）
-                if (ctx->hoveredTextAnnotation >= 0
-                    && ctx->hoveredTextAnnotation < (int)ctx->annotations.size()
-                    && ctx->hoveredTextAnnotation != ctx->selectedTextAnnotation) {
-                    RECT annRect = MeasureTextAnnotation(backDC, ctx->annotations[ctx->hoveredTextAnnotation]);
-                    annRect.left -= ctx->virtualX;
-                    annRect.top -= ctx->virtualY;
-                    annRect.right -= ctx->virtualX;
-                    annRect.bottom -= ctx->virtualY;
-                    HPEN selPen = CreatePen(PS_DASH, 1, RGB(0, 136, 255));
-                    HGDIOBJ oldPenS = SelectObject(backDC, selPen);
-                    HGDIOBJ oldBrushS = SelectObject(backDC, GetStockObject(NULL_BRUSH));
-                    Rectangle(backDC, annRect.left, annRect.top, annRect.right, annRect.bottom);
-                    SelectObject(backDC, oldBrushS);
-                    SelectObject(backDC, oldPenS);
-                    DeleteObject(selPen);
+                // 注：文字悬浮辅助边框已移除（确认态下悬浮高亮与选中边框语义重叠且干扰视觉）。
+            }
+            // 非文字标注的选中/悬浮边框（确认态/文字编辑态）
+            // - selectedAnnotation：已选中，按工具类型差异化渲染（见下方分支）
+            // 注：鼠标悬浮辅助包围盒已移除（确认态下悬浮高亮与选中边框语义重叠且干扰视觉）。
+            if (ctx->state == CS_Confirmed || ctx->state == CS_TextEditing) {
+                // 选中态（按工具类型差异化）：
+                //   矩形：无包围盒 + 8 手柄（4 角 + 4 边中点）
+                //   圆形：蓝色虚线包围盒 + 8 手柄（4 角 + 4 边中点）
+                //   箭头：无包围盒 + 2 端点手柄
+                //   画笔：蓝色虚线包围盒 + 无手柄（仅可整体拖动）
+                // 手柄统一为白色圆形 + 红色描边（GDI+ 抗锯齿绘制，见下方）。
+                if (ctx->selectedAnnotation >= 0
+                    && ctx->selectedAnnotation < (int)ctx->annotations.size()
+                    && ctx->annotations[ctx->selectedAnnotation].type != AT_Text) {
+                    RECT box = MeasureAnnotationBounds(ctx->annotations[ctx->selectedAnnotation], backDC);
+                    // 缓存选中标注包围盒（绝对坐标），供拖拽/缩放时局部刷新算旧位置
+                    ctx->lastAnnotationBox = box;
+                    ctx->hasLastAnnotationBox = true;
+                    box.left -= ctx->virtualX; box.top -= ctx->virtualY;
+                    box.right -= ctx->virtualX; box.bottom -= ctx->virtualY;
+                    const Annotation& selA = ctx->annotations[ctx->selectedAnnotation];
+
+                    // 包围盒：仅圆形/画笔画蓝色虚线框；矩形/箭头不画。
+                    if (selA.type == AT_Circle || selA.type == AT_Brush) {
+                        HGDIOBJ oldPenA = SelectObject(backDC, ctx->gdi.annHoverPen);
+                        HGDIOBJ oldBrushA = SelectObject(backDC, GetStockObject(NULL_BRUSH));
+                        Rectangle(backDC, box.left, box.top, box.right, box.bottom);
+                        SelectObject(backDC, oldBrushA);
+                        SelectObject(backDC, oldPenA);
+                    }
+
+                    // 收集手柄坐标（backDC 局部坐标）。画笔无手柄；箭头取 2 端点；
+                    // 矩形/圆形取 8 个（4 角 + 4 边中点）。
+                    int handles[8][2];
+                    int handleCount = 0;
+                    if (selA.type == AT_Arrow) {
+                        handles[0][0] = selA.x1 - ctx->virtualX;
+                        handles[0][1] = selA.y1 - ctx->virtualY;
+                        handles[1][0] = selA.x2 - ctx->virtualX;
+                        handles[1][1] = selA.y2 - ctx->virtualY;
+                        handleCount = 2;
+                    } else if (selA.type == AT_Rect || selA.type == AT_Circle) {
+                        int cx = (box.left + box.right) / 2;
+                        int cy = (box.top + box.bottom) / 2;
+                        // 4 角
+                        handles[0][0] = box.left;  handles[0][1] = box.top;
+                        handles[1][0] = box.right; handles[1][1] = box.top;
+                        handles[2][0] = box.left;  handles[2][1] = box.bottom;
+                        handles[3][0] = box.right; handles[3][1] = box.bottom;
+                        // 4 边中点
+                        handles[4][0] = cx;        handles[4][1] = box.top;
+                        handles[5][0] = cx;        handles[5][1] = box.bottom;
+                        handles[6][0] = box.left;  handles[6][1] = cy;
+                        handles[7][0] = box.right; handles[7][1] = cy;
+                        handleCount = 8;
+                    }
+                    // 白色圆形手柄（红色描边），半径 = SC_HANDLE_SIZE/2，与原方块视觉大小一致。
+                    // GDI+ 抗锯齿绘制（GDI Ellipse 边缘有硬锯齿）：白色填充 + 红色 1px 描边。
+                    if (handleCount > 0) {
+                        int half = SC_HANDLE_SIZE / 2;
+                        Gdiplus::Graphics graphics(backDC);
+                        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        Gdiplus::SolidBrush cBrush(Gdiplus::Color(255, 255, 255, 255));
+                        Gdiplus::Pen cPen(Gdiplus::Color(255, 229, 57, 53), 1.0f);
+                        Gdiplus::GraphicsPath handlePath;
+                        for (int i = 0; i < handleCount; i++) {
+                            // 直径 2*half 与原 GDI Ellipse(x-half,y-half,x+half,y+half)
+                            // 的像素覆盖一致（GDI 右下边 exclusive，直径 = 2*half）。
+                            handlePath.AddEllipse(handles[i][0] - half, handles[i][1] - half,
+                                                  2 * half, 2 * half);
+                        }
+                        graphics.FillPath(&cBrush, &handlePath);
+                        graphics.DrawPath(&cPen, &handlePath);
+                    }
                 }
             }
             // 悬浮工具栏 + 粗细/颜色子菜单
@@ -3197,8 +3815,16 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         ctx->lastToolbarRect = curToolbarRect;
         ctx->lastPopupRect = curPopupRect;
 
-        // 后台缓冲 -> 窗口
-        BitBlt(hdc, 0, 0, ctx->virtualW, ctx->virtualH, backDC, 0, 0, SRCCOPY);
+        // 取消裁剪区（局部帧设置的），避免影响后续 GDI 操作
+        if (dirtyRgn) {
+            SelectClipRgn(backDC, NULL);
+            DeleteObject(dirtyRgn);
+        }
+
+        // 后台缓冲 -> 窗口（局部帧只拷脏区域，fullFrame 拷全屏）
+        BitBlt(hdc, dirtyRect.left, dirtyRect.top,
+               dirtyRect.right - dirtyRect.left, dirtyRect.bottom - dirtyRect.top,
+               backDC, dirtyRect.left, dirtyRect.top, SRCCOPY);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -3383,6 +4009,43 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
 
             // 点击工具栏按钮（实时命中）
             if (b >= 0 && b != TB_Separator1 && b != TB_Separator2) {
+                // 选中态保留规则（与 Figma/PowerPoint 一致）：
+                //   - 点击"与已选中标注同类型"的绘制工具按钮（含文字）-> 保留选中，仅切换子菜单开合
+                //     （例：选中矩形后点矩形按钮 -> 关闭/重开粗细颜色子菜单，矩形仍选中）。
+                //   - 点击"不同类型"的绘制工具按钮 -> 切换到该绘制工具，取消当前选中
+                //     （子菜单参数将用于后续绘制，不再作用于旧选中元素，避免参数错配）。
+                //   - 点击确认/取消/保存/撤销/重做等"与选中元素无关"的按钮 -> 取消所有选中。
+                bool isDrawToolBtn = IsVectorTool(b) || b == TB_Mosaic || b == TB_Text;
+                bool matchesSelection = false;
+                if (isDrawToolBtn) {
+                    if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()
+                        && AnnotationTypeToTool(ctx->annotations[ctx->selectedAnnotation].type) == b) {
+                        matchesSelection = true;
+                    }
+                    if (ctx->selectedTextAnnotation >= 0 && ctx->selectedTextAnnotation < (int)ctx->annotations.size()
+                        && b == TB_Text) {
+                        matchesSelection = true;
+                    }
+                }
+                bool hadAnnSel = (ctx->selectedAnnotation >= 0);
+                bool hadTextSel = (ctx->selectedTextAnnotation >= 0);
+                if (!matchesSelection) {
+                    // 不匹配选中项：取消所有选中（切换到其它工具或执行无关操作）。
+                    // 切换到不同类型工具时 activeTool 必变，高亮按钮位移 + popup 可能切换，
+                    // 故脏区须含工具栏+popup（includeToolbar=true）。需在清状态前算脏区。
+                    RECT dirty = CalcSelectionDirty(ctx, true /*includeToolbar*/);
+                    ctx->selectedAnnotation = -1;
+                    ctx->hoveredAnnotation = -1;
+                    ctx->selectedTextAnnotation = -1;
+                    ctx->hoveredTextAnnotation = -1;
+                    if (hadAnnSel || hadTextSel) {
+                        if (IsValidRect(dirty)) {
+                            InvalidateRect(hwnd, &dirty, FALSE);
+                        } else {
+                            InvalidateRect(hwnd, NULL, FALSE);
+                        }
+                    }
+                }
                 // 确定：提取选区并完成截图
                 if (b == TB_Confirm) {
                     ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
@@ -3414,6 +4077,17 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     } else {
                         ctx->activeTool = b;
                         ctx->popupOpen = true;
+                        // 匹配选中项时回显该标注的粗细/颜色到子菜单
+                        if (matchesSelection && ctx->selectedAnnotation >= 0
+                            && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
+                            const Annotation& selA = ctx->annotations[ctx->selectedAnnotation];
+                            for (int i = 0; i < SC_THICK_COUNT; i++) {
+                                if (SC_THICK_PRESETS[i] == selA.thickness) { ctx->drawThickIdx = i; break; }
+                            }
+                            for (int i = 0; i < SC_COLOR_COUNT; i++) {
+                                if (SC_COLOR_PRESETS[i] == selA.color) { ctx->drawColorIdx = i; break; }
+                            }
+                        }
                     }
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
@@ -3427,6 +4101,17 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     } else {
                         ctx->activeTool = b;
                         ctx->popupOpen = true;
+                        // 匹配选中文字时回显该标注的字号/颜色到子菜单
+                        if (matchesSelection && ctx->selectedTextAnnotation >= 0
+                            && ctx->selectedTextAnnotation < (int)ctx->annotations.size()) {
+                            const Annotation& selT = ctx->annotations[ctx->selectedTextAnnotation];
+                            for (int i = 0; i < SC_FONT_COUNT; i++) {
+                                if (SC_FONT_SIZES[i] == selT.thickness) { ctx->fontSizeIdx = i; break; }
+                            }
+                            for (int i = 0; i < SC_COLOR_COUNT; i++) {
+                                if (SC_COLOR_PRESETS[i] == selT.color) { ctx->drawColorIdx = i; break; }
+                            }
+                        }
                     }
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
@@ -3444,13 +4129,6 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
-                // 翻译工具：仅切换激活态占位，关闭子菜单
-                if (b == TB_Translate) {
-                    ctx->activeTool = (ctx->activeTool == b) ? -1 : b;
-                    ctx->popupOpen = false;
-                    InvalidateRect(hwnd, NULL, FALSE);
-                    return 0;
-                }
                 // 撤销：弹出最后一条标注到 redo 栈
                 if (b == TB_Undo) {
                     if (!ctx->annotations.empty()) {
@@ -3460,7 +4138,11 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                         if (ctx->selectedTextAnnotation >= (int)ctx->annotations.size()) {
                             ctx->selectedTextAnnotation = -1;
                         }
+                        if (ctx->selectedAnnotation >= (int)ctx->annotations.size()) {
+                            ctx->selectedAnnotation = -1;
+                        }
                         ctx->hoveredTextAnnotation = -1;
+                        ctx->hoveredAnnotation = -1;
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
                     return 0;
@@ -3506,26 +4188,42 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             }
 
             // 命中马赛克子菜单（模式切换 + 块大小 + 涂抹半径）
+            // 马赛克标注本身不可选中，且这些选项只影响后续绘制、不作用于已选中的其它元素，
+            // 故均属于"非拖拽/resize 动作"-> 取消当前选中态。
             if (ctx->popupOpen && ctx->activeTool == TB_Mosaic) {
                 int hit = HitTestMosaicPopup(mxRel, myRel, ctx->popupRect, ctx->popupMetrics);
+                // 清除选中态并在清空前计算脏区（马赛克 popup 不改 activeTool，仅清覆盖物选中）。
+                // 返回 dirty（backDC 坐标）；调用方据 IsValidRect 决定局部或全屏 invalidate。
+                auto clearSel = [&]() {
+                    RECT dirty = CalcSelectionDirty(ctx, false /*includeToolbar*/);
+                    ctx->selectedAnnotation = -1;
+                    ctx->selectedTextAnnotation = -1;
+                    ctx->hoveredAnnotation = -1;
+                    ctx->hoveredTextAnnotation = -1;
+                    return dirty;
+                };
                 if (hit == 1) {
                     ctx->mosaicRectMode = false;  // 涂抹模式
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    { RECT d = clearSel();
+                      if (IsValidRect(d)) InvalidateRect(hwnd, &d, FALSE); else InvalidateRect(hwnd, NULL, FALSE); }
                     return 0;
                 }
                 if (hit == 2) {
                     ctx->mosaicRectMode = true;   // 框选模式
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    { RECT d = clearSel();
+                      if (IsValidRect(d)) InvalidateRect(hwnd, &d, FALSE); else InvalidateRect(hwnd, NULL, FALSE); }
                     return 0;
                 }
                 if (hit >= 101 && hit < 200) {
                     ctx->mosaicSizeIdx = hit - 101;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    { RECT d = clearSel();
+                      if (IsValidRect(d)) InvalidateRect(hwnd, &d, FALSE); else InvalidateRect(hwnd, NULL, FALSE); }
                     return 0;
                 }
                 if (hit >= 201) {
                     ctx->mosaicRadiusIdx = hit - 201;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    { RECT d = clearSel();
+                      if (IsValidRect(d)) InvalidateRect(hwnd, &d, FALSE); else InvalidateRect(hwnd, NULL, FALSE); }
                     return 0;
                 }
             }
@@ -3537,31 +4235,110 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     // 第一组：文字工具时为字号索引，矢量工具时为粗细索引
                     if (ctx->activeTool == TB_Text) {
                         ctx->fontSizeIdx = hit - 1;
-                        // 如果选中了文字标注，修改其字号
+                        // 如果选中了文字标注，修改其字号（选中文字时子菜单改动作用于该标注）
                         if (ctx->selectedTextAnnotation >= 0 && ctx->selectedTextAnnotation < (int)ctx->annotations.size()) {
                             ctx->annotations[ctx->selectedTextAnnotation].thickness = SC_FONT_SIZES[ctx->fontSizeIdx];
                         }
                     } else {
                         ctx->drawThickIdx = hit - 1;
+                        // 矢量工具改粗细：若已选中矢量标注，则作用于该标注（保持选中）；
+                        // 否则作用于后续绘制。
+                        if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
+                            ctx->annotations[ctx->selectedAnnotation].thickness = SC_THICK_PRESETS[ctx->drawThickIdx];
+                        }
                     }
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
                 if (hit < 0) {
                     ctx->drawColorIdx = -hit - 1;
-                    // 如果选中了文字标注，修改其颜色
+                    // 如果选中了文字标注，修改其颜色（选中文字时颜色改动作用于该标注）
                     if (ctx->activeTool == TB_Text && ctx->selectedTextAnnotation >= 0
                         && ctx->selectedTextAnnotation < (int)ctx->annotations.size()) {
                         ctx->annotations[ctx->selectedTextAnnotation].color = SC_COLOR_PRESETS[ctx->drawColorIdx];
+                    }
+                    // 矢量工具改颜色：若已选中矢量标注，则作用于该标注（保持选中）；
+                    // 否则作用于后续绘制。
+                    if (ctx->activeTool != TB_Text && ctx->selectedAnnotation >= 0
+                        && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
+                        ctx->annotations[ctx->selectedAnnotation].color = SC_COLOR_PRESETS[ctx->drawColorIdx];
                     }
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
             }
 
+            // ===== 通用标注交互（选中/拖拽/缩放，优先于绘制工具）=====
+            // 1) 已选中标注的四角 resize 手柄命中 -> 进入缩放
+            //    （须在普通命中之前：手柄贴在选中框角上，可能与标注本体重叠）
+            //    不复用 CS_Resizing（该状态会改 ctx->selection 选区），用 resizingAnnotation 标志
+            //    在 CS_Confirmed 下独立处理，与文字拖拽(draggingTextAnnotation)机制对称。
+            if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
+                Annotation& sel = ctx->annotations[ctx->selectedAnnotation];
+                RECT box = MeasureAnnotationBounds(sel, ctx->backDC);
+                // 按类型命中缩放手柄：箭头=2 端点；矩形/圆=8 手柄；画笔=无（仅可拖动）
+                int handle = HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY, ctx->backDC);
+                if (handle != RH_None) {
+                    ctx->resizingAnnotation = ctx->selectedAnnotation;
+                    ctx->annotationResizeHandle = handle;
+                    ctx->annotationDragStartX = ctx->mouseX;
+                    ctx->annotationDragStartY = ctx->mouseY;
+                    ctx->annotationResizeStartBox = box;
+                    ctx->dragStartAnnotation = ctx->annotations[ctx->selectedAnnotation];
+                    ctx->needFullRedraw = true;
+                    return 0;
+                }
+            }
+            // 2) 任意标注命中 -> 选中并可拖拽（非文字标注走新机制；文字落到下方文字分支）
+            //    工具激活时也优先选中已有对象（与 Figma/PowerPoint 一致），点空白才绘制。
+            int hitAnn = HitTestAnnotation(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
+            if (hitAnn >= 0 && ctx->annotations[hitAnn].type != AT_Text) {
+                // 切换选中目标：脏区 = 旧选中项（清掉其边框/手柄）∪ 新目标（显示新边框/手柄）
+                // ∪ 工具栏+popup（activeTool 可能变化导致高亮按钮位移）。
+                // 须在改 selectedAnnotation 之前算旧选中脏区。
+                const int handleMargin = SC_HANDLE_SIZE / 2 + 4;
+                RECT dirty = CalcSelectionDirty(ctx, true /*includeToolbar*/);
+                RECT newBox = MeasureAnnotationBounds(ctx->annotations[hitAnn], ctx->backDC);
+                newBox.left -= ctx->virtualX; newBox.top -= ctx->virtualY;
+                newBox.right -= ctx->virtualX; newBox.bottom -= ctx->virtualY;
+                dirty = UnionRectSafe(dirty, InflateRectBy(newBox, handleMargin));
+                ctx->selectedAnnotation = hitAnn;
+                ctx->hoveredAnnotation = hitAnn;
+                // 与文字选中互斥：选中非文字时清文字选中
+                ctx->selectedTextAnnotation = -1;
+                ctx->hoveredTextAnnotation = -1;
+                // 工具栏回显：切到该标注对应的工具按钮，并打开粗细/颜色子菜单。
+                // 同步当前粗细/颜色索引为该标注的值，子菜单高亮与选中元素一致（回显参数）。
+                const Annotation& hitA = ctx->annotations[hitAnn];
+                ctx->activeTool = AnnotationTypeToTool(hitA.type);
+                ctx->popupOpen = true;
+                for (int i = 0; i < SC_THICK_COUNT; i++) {
+                    if (SC_THICK_PRESETS[i] == hitA.thickness) { ctx->drawThickIdx = i; break; }
+                }
+                for (int i = 0; i < SC_COLOR_COUNT; i++) {
+                    if (SC_COLOR_PRESETS[i] == hitA.color) { ctx->drawColorIdx = i; break; }
+                }
+                // 进入拖拽模式：按下即可移动（按下未移动时，松开仅保持选中态）
+                ctx->draggingAnnotation = hitAnn;
+                ctx->annotationDragStartX = ctx->mouseX;
+                ctx->annotationDragStartY = ctx->mouseY;
+                ctx->dragStartAnnotation = ctx->annotations[hitAnn];
+                // 触发重绘：needFullRedraw 仅是 WM_PAINT 内的提示，必须有 InvalidateRect 才会触发 WM_PAINT。
+                if (IsValidRect(dirty)) {
+                    InvalidateRect(hwnd, &dirty, FALSE);
+                } else {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+                return 0;
+            }
+
             // 矢量工具激活时，点击选区内部/工具栏外 -> 开始绘制
             // 子菜单保持打开，绘制中可继续看到当前粗细/颜色。
+            // 注意：上面通用标注命中分支已拦截「点中已有标注」的情况，此处仅点空白才进入。
             if (IsVectorTool(ctx->activeTool) && PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
+                // 点空白绘制新标注：清除已有选中态
+                ctx->selectedAnnotation = -1;
+                ctx->hoveredAnnotation = -1;
                 ctx->hasCurDrawing = true;
                 ctx->curDrawing = {};
                 ctx->curDrawing.type = ToolToAnnotationType(ctx->activeTool);
@@ -3584,6 +4361,9 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // 马赛克工具激活时，点击选区内部 -> 开始马赛克绘制
             // 子菜单保持打开，绘制中可继续看到当前模式/块大小。
             if (ctx->activeTool == TB_Mosaic && PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
+                // 点空白绘制新标注：清除已有选中态
+                ctx->selectedAnnotation = -1;
+                ctx->hoveredAnnotation = -1;
                 ctx->hasCurDrawing = true;
                 ctx->curDrawing = {};
                 ctx->curDrawing.type = AT_Mosaic;
@@ -3612,9 +4392,14 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     // 选中文字标注，保持确认态。
                     // selectedTextAnnotation 持久保持选中态（与 hover 解耦），鼠标移开仍高亮，
                     // 直到点击空白或进入其他操作才清除。
+                    // 精确脏区：清掉上一个选中项（可能为非文字/另一文字）的选中边框。
+                    // 须在赋新选中前算脏区，否则读不到旧选中项的包围盒。
+                    RECT dirty = CalcSelectionDirty(ctx, false /*includeToolbar*/);
                     ctx->selectedTextAnnotation = hitText;
                     ctx->hoveredTextAnnotation = hitText;
-                    // 同步当前字号/颜色索引为该标注的值，子菜单高亮一致
+                    // 工具栏回显：切到文字工具按钮（activeTool 已为 TB_Text，此处显式同步），
+                    // 并同步当前字号/颜色索引为该标注的值，子菜单高亮一致。
+                    ctx->activeTool = TB_Text;
                     int curSize = ctx->annotations[hitText].thickness;
                     for (int i = 0; i < SC_FONT_COUNT; i++) {
                         if (SC_FONT_SIZES[i] == curSize) { ctx->fontSizeIdx = i; break; }
@@ -3632,7 +4417,11 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     ctx->textDragStartY = ctx->mouseY;
                     ctx->dragStartX = ctx->annotations[hitText].x1;
                     ctx->dragStartY = ctx->annotations[hitText].y1;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    if (IsValidRect(dirty)) {
+                        InvalidateRect(hwnd, &dirty, FALSE);
+                    } else {
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
                     return 0;
                 }
                 // 点击选区内空白 -> 进入文字编辑态（清除已选中）
@@ -3643,17 +4432,25 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     ctx->textCaretPos = 0;
                     ctx->textSelStart = -1;
                     ctx->textSelEnd = -1;
+                    // 精确脏区：清掉上一个选中项的选中边框/手柄。须在清状态前算。
+                    RECT dirty = CalcSelectionDirty(ctx, false /*includeToolbar*/);
                     ctx->state = CS_TextEditing;
-                    // 进入输入态时清除文字标注选中，避免残留选中边框
+                    // 进入输入态时清除文字/非文字标注选中，避免残留选中边框
                     ctx->hoveredTextAnnotation = -1;
                     ctx->selectedTextAnnotation = -1;
+                    ctx->selectedAnnotation = -1;
+                    ctx->hoveredAnnotation = -1;
                     // 保持子菜单打开，清空绘制标志
                     // ctx->popupOpen 保持不变
                     ctx->hasCurDrawing = false;
                     // 文字工具保持激活，避免工具栏视觉状态丢失
                     // ctx->activeTool 保持为 TB_Text
-                    ctx->needFullRedraw = true;
-                    InvalidateRect(hwnd, NULL, FALSE);
+                    // 不置 needFullRedraw：进入编辑态仅改变选中边框，用局部脏区即可，避免全屏重绘。
+                    if (IsValidRect(dirty)) {
+                        InvalidateRect(hwnd, &dirty, FALSE);
+                    } else {
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
                     return 0;
                 }
             }
@@ -3661,15 +4458,40 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // 无工具激活时：点击已确认文字 -> 拖动文字位置
             int hitText = HitTestTextAnnotations(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
             if (hitText >= 0 && ctx->activeTool == -1) {
+                // 切换选中目标：脏区 = 旧选中项 ∪ 新文字标注盒 ∪ 工具栏+popup
+                // （activeTool 由 -1 变为 TB_Text，工具栏高亮按钮与 popup 都需重绘）。
+                // 须在改 selectedTextAnnotation 之前算旧选中脏区。
+                const int handleMargin = SC_HANDLE_SIZE / 2 + 4;
+                RECT dirty = CalcSelectionDirty(ctx, true /*includeToolbar*/);
+                RECT newBox = MeasureTextAnnotation(ctx->backDC, ctx->annotations[hitText]);
+                newBox.left -= ctx->virtualX; newBox.top -= ctx->virtualY;
+                newBox.right -= ctx->virtualX; newBox.bottom -= ctx->virtualY;
+                dirty = UnionRectSafe(dirty, InflateRectBy(newBox, handleMargin));
                 ctx->draggingTextAnnotation = hitText;
                 // 同步 hovered/selected，拖动期间选中边框即时显示
                 ctx->hoveredTextAnnotation = hitText;
                 ctx->selectedTextAnnotation = hitText;
+                // 工具栏回显：切到文字工具按钮，打开字号/颜色子菜单，同步该标注参数。
+                ctx->activeTool = TB_Text;
+                ctx->popupOpen = true;
+                int curSize = ctx->annotations[hitText].thickness;
+                for (int i = 0; i < SC_FONT_COUNT; i++) {
+                    if (SC_FONT_SIZES[i] == curSize) { ctx->fontSizeIdx = i; break; }
+                }
+                COLORREF curColor = ctx->annotations[hitText].color;
+                for (int i = 0; i < SC_COLOR_COUNT; i++) {
+                    if (SC_COLOR_PRESETS[i] == curColor) { ctx->drawColorIdx = i; break; }
+                }
                 ctx->textDragStartX = ctx->mouseX;
                 ctx->textDragStartY = ctx->mouseY;
                 ctx->dragStartX = ctx->annotations[hitText].x1;
                 ctx->dragStartY = ctx->annotations[hitText].y1;
-                ctx->needFullRedraw = true;
+                // 触发重绘：needFullRedraw 仅是提示，必须有 InvalidateRect 才触发 WM_PAINT。
+                if (IsValidRect(dirty)) {
+                    InvalidateRect(hwnd, &dirty, FALSE);
+                } else {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
                 return 0;
             }
 
@@ -3677,6 +4499,8 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection);
             if (h != RH_None) {
                 ctx->selectedTextAnnotation = -1;  // 进入手柄调整，清除文字选中
+                ctx->selectedAnnotation = -1;      // 清除非文字标注选中
+                ctx->hoveredAnnotation = -1;
                 ctx->resizeHandle = h;
                 ctx->dragStartX = ctx->mouseX;
                 ctx->dragStartY = ctx->mouseY;
@@ -3688,10 +4512,27 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // 点击选区内部 -> 整体拖动（已有标注内容时禁止，避免标注与背景错位）
             if (PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
                 if (!ctx->annotations.empty()) {
-                    // 已有预处理内容：只能通过手柄改范围，不允许整体拖动
+                    // 已有预处理内容：只能通过手柄改范围，不允许整体拖动。
+                    // 点空白（选中态的拖动被禁止）-> 取消当前选中。
+                    if (ctx->selectedAnnotation >= 0 || ctx->selectedTextAnnotation >= 0) {
+                        // 精确脏区：清掉选中项的选中边框/手柄。须在清状态前算。
+                        RECT dirty = CalcSelectionDirty(ctx, false /*includeToolbar*/);
+                        ctx->selectedTextAnnotation = -1;
+                        ctx->selectedAnnotation = -1;
+                        ctx->hoveredAnnotation = -1;
+                        ctx->hoveredTextAnnotation = -1;
+                        if (IsValidRect(dirty)) {
+                            InvalidateRect(hwnd, &dirty, FALSE);
+                        } else {
+                            InvalidateRect(hwnd, NULL, FALSE);
+                        }
+                    }
                     return 0;
                 }
                 ctx->selectedTextAnnotation = -1;  // 进入选区拖动，清除文字选中
+                ctx->selectedAnnotation = -1;      // 清除非文字标注选中
+                ctx->hoveredAnnotation = -1;
+                ctx->hoveredTextAnnotation = -1;
                 ctx->dragStartX = ctx->mouseX;
                 ctx->dragStartY = ctx->mouseY;
                 ctx->dragStartSelection = ctx->selection;
@@ -3699,8 +4540,19 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 ctx->needFullRedraw = true;
                 return 0;
             }
-            // 点击选区外空白：清除文字选中，进入确认态后不可重新框选，忽略点击
-            ctx->selectedTextAnnotation = -1;
+            // 点击选区外空白：清除文字/非文字标注选中，进入确认态后不可重新框选，忽略点击
+            {
+                RECT dirty = CalcSelectionDirty(ctx, false /*includeToolbar*/);
+                ctx->selectedTextAnnotation = -1;
+                ctx->selectedAnnotation = -1;
+                ctx->hoveredAnnotation = -1;
+                ctx->hoveredTextAnnotation = -1;
+                if (IsValidRect(dirty)) {
+                    InvalidateRect(hwnd, &dirty, FALSE);
+                } else {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
             return 0;
         }
         return 0;
@@ -3712,8 +4564,14 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         bool moved = (pt.x != ctx->mouseX || pt.y != ctx->mouseY);
         ctx->mouseX = pt.x;
         ctx->mouseY = pt.y;
-        ctx->currentColor = GetPixelColorFromBitmap(ctx->memDC,
-            ctx->mouseX, ctx->mouseY, ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+        // P2 优化：currentColor 仅用于放大镜信息面板（DrawInfoPanel），而该面板只
+        // 在 CS_Idle/CS_Selecting 态绘制。其余状态读不到 currentColor，故取色惰性化，
+        // 仅在这两种态更新像素色，避免每帧无谓的 GetPixel（DC 锁定读取）开销。
+        // 启动时已取一次初值（见线程函数），其余态保持上次值即可。
+        if (ctx->state == CS_Idle || ctx->state == CS_Selecting) {
+            ctx->currentColor = GetPixelColorFromBitmap(ctx->memDC,
+                ctx->mouseX, ctx->mouseY, ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+        }
 
         if (ctx->state == CS_Selecting) {
             ctx->endX = ctx->mouseX;
@@ -3722,8 +4580,23 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         } else if (ctx->state == CS_Idle) {
             int newHovered = FindWindowAtPoint(ctx->windows, ctx->mouseX, ctx->mouseY);
             ctx->hoveredWindow = newHovered;
-            // 像素信息浮窗跟随鼠标，每次移动都需重绘（与 CS_Selecting 行为一致）
-            InvalidateRect(hwnd, NULL, FALSE);
+            // 像素信息浮窗跟随鼠标：刷新旧面板位置 ∪ 新面板位置（放大镜跟随，两块都需重绘）。
+            // 新面板位置在此预算（与 WM_PAINT 的 CalcPanelPosition 同源）。
+            int npx, npy;
+            CalcPanelPosition(ctx->mouseX, ctx->mouseY,
+                ctx->virtualX, ctx->virtualY, ctx->virtualW, ctx->virtualH, npx, npy);
+            RECT newPanel = { npx - ctx->virtualX, npy - ctx->virtualY,
+                              npx - ctx->virtualX + SC_PANEL_WIDTH, npy - ctx->virtualY + SC_PANEL_HEIGHT };
+            RECT dirty = InflateRectBy(UnionRectSafe(ctx->lastPanelRect, newPanel), 2);
+            // 窗口高亮变化也纳入（hoveredWindow 切换时旧/新高亮框）
+            if (newHovered >= 0 && newHovered < (int)ctx->windows.size()) {
+                RECT hr = ctx->windows[newHovered].rect;
+                hr.left -= ctx->virtualX; hr.top -= ctx->virtualY;
+                hr.right -= ctx->virtualX; hr.bottom -= ctx->virtualY;
+                dirty = UnionRectSafe(dirty, InflateRectBy(hr, 5));
+            }
+            dirty = UnionRectSafe(dirty, InflateRectBy(ctx->lastHighlightRect, 5));
+            InvalidateRect(hwnd, &dirty, FALSE);
         } else if (ctx->state == CS_Resizing) {
             // 根据手柄调整选区边
             RECT& s = ctx->selection;
@@ -3809,7 +4682,21 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     ctx->curDrawing.x2 = ax;
                     ctx->curDrawing.y2 = ay;
                 }
-                InvalidateRect(hwnd, NULL, FALSE);
+                // 局部刷新：上帧 curDrawing 包围盒 ∪ 本帧鼠标点附近（标注都在选区内）。
+                // 坐标转 backDC（减 virtualX/Y）。lastDrawingBox 由 WM_PAINT 每帧更新。
+                RECT mouseBox = { ax - ctx->virtualX - 8, ay - ctx->virtualY - 8,
+                                  ax - ctx->virtualX + 8, ay - ctx->virtualY + 8 };
+                RECT drawDirty;
+                if (ctx->hasLastDrawingBox) {
+                    RECT ldb = { ctx->lastDrawingBox.left - ctx->virtualX,
+                                 ctx->lastDrawingBox.top - ctx->virtualY,
+                                 ctx->lastDrawingBox.right - ctx->virtualX,
+                                 ctx->lastDrawingBox.bottom - ctx->virtualY };
+                    drawDirty = InflateRectBy(UnionRectSafe(ldb, mouseBox), 4);
+                } else {
+                    drawDirty = InflateRectBy(mouseBox, 4);
+                }
+                InvalidateRect(hwnd, &drawDirty, FALSE);
             }
         } else if (ctx->state == CS_TextEditing) {
             // 文字编辑态：拖动选择文字
@@ -3821,28 +4708,153 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
 
                 ctx->textSelEnd = caretPos;
                 ctx->textCaretPos = caretPos;
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
             }
+        } else if (ctx->resizingAnnotation >= 0) {
+            // 非文字标注缩放：四角手柄走包围盒变换；箭头端点手柄仅平移单个端点
+            int idx = ctx->resizingAnnotation;
+            int dx = ctx->mouseX - ctx->annotationDragStartX;
+            int dy = ctx->mouseY - ctx->annotationDragStartY;
+            // 从按下时快照还原再变换，避免累积浮点误差
+            ctx->annotations[idx] = ctx->dragStartAnnotation;
+            Annotation& a = ctx->annotations[idx];
+            if (ctx->annotationResizeHandle == RH_ArrowStart
+                || ctx->annotationResizeHandle == RH_ArrowEnd) {
+                // 箭头端点拖拽：仅移动对应端点，另一端点保持快照值不变
+                if (ctx->annotationResizeHandle == RH_ArrowStart) {
+                    a.x1 = ctx->dragStartAnnotation.x1 + dx;
+                    a.y1 = ctx->dragStartAnnotation.y1 + dy;
+                } else {
+                    a.x2 = ctx->dragStartAnnotation.x2 + dx;
+                    a.y2 = ctx->dragStartAnnotation.y2 + dy;
+                }
+            } else {
+                // 包围盒缩放：4 角 + 4 边中点手柄，根据拖拽手柄更新包围盒，
+                // 再按包围盒变换映射标注坐标（矩形/圆均支持 8 手柄）。
+                const RECT& o = ctx->annotationResizeStartBox;
+                RECT n = o;
+                switch (ctx->annotationResizeHandle) {
+                    case RH_TopLeft:     n.left = o.left + dx; n.top = o.top + dy; break;
+                    case RH_TopRight:    n.right = o.right + dx; n.top = o.top + dy; break;
+                    case RH_BottomLeft:  n.left = o.left + dx; n.bottom = o.bottom + dy; break;
+                    case RH_BottomRight: n.right = o.right + dx; n.bottom = o.bottom + dy; break;
+                    case RH_Left:        n.left = o.left + dx; break;
+                    case RH_Right:       n.right = o.right + dx; break;
+                    case RH_Top:         n.top = o.top + dy; break;
+                    case RH_Bottom:      n.bottom = o.bottom + dy; break;
+                }
+                // 防翻转：保证 right>left、bottom>top（至少 1px）
+                n = NormalizeRect(n);
+                if (n.right - n.left < 2) n.right = n.left + 2;
+                if (n.bottom - n.top < 2) n.bottom = n.top + 2;
+                TransformAnnotationByBox(a, o, n);
+            }
+            InvalidateAnnotationOp(hwnd, ctx, MeasureAnnotationBounds(ctx->annotations[idx], ctx->backDC));
+        } else if (ctx->draggingAnnotation >= 0) {
+            // 非文字标注整体拖拽：对按下时快照做 dx/dy 平移后写回（避免累积误差）
+            int idx = ctx->draggingAnnotation;
+            int dx = ctx->mouseX - ctx->annotationDragStartX;
+            int dy = ctx->mouseY - ctx->annotationDragStartY;
+            ctx->annotations[idx] = ctx->dragStartAnnotation;
+            Annotation& a = ctx->annotations[idx];
+            switch (a.type) {
+                case AT_Rect:
+                case AT_Circle:
+                case AT_Arrow:
+                case AT_Mosaic:
+                    if (a.type == AT_Mosaic && !a.mosaicRect) {
+                        for (POINT& p : a.pts) { p.x += dx; p.y += dy; }
+                    } else {
+                        a.x1 += dx; a.y1 += dy; a.x2 += dx; a.y2 += dy;
+                    }
+                    break;
+                case AT_Brush:
+                    for (POINT& p : a.pts) { p.x += dx; p.y += dy; }
+                    break;
+                case AT_Text:
+                    a.x1 += dx; a.y1 += dy;
+                    break;
+            }
+            InvalidateAnnotationOp(hwnd, ctx, MeasureAnnotationBounds(ctx->annotations[idx], ctx->backDC));
         } else if (ctx->draggingTextAnnotation >= 0) {
             // 拖动文字标注位置
             int dx = ctx->mouseX - ctx->textDragStartX;
             int dy = ctx->mouseY - ctx->textDragStartY;
             ctx->annotations[ctx->draggingTextAnnotation].x1 = ctx->dragStartX + dx;
             ctx->annotations[ctx->draggingTextAnnotation].y1 = ctx->dragStartY + dy;
-            InvalidateRect(hwnd, NULL, FALSE);
+            InvalidateAnnotationOp(hwnd, ctx, MeasureAnnotationBounds(ctx->annotations[ctx->draggingTextAnnotation], ctx->backDC));
         } else if (ctx->state == CS_Confirmed) {
-            // hover 手柄/工具栏/文字标注变化需重绘以更新光标提示与高亮
+            // hover 手柄/工具栏/文字/非文字标注变化需重绘以更新光标提示与高亮
             int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection);
             int mxRel = ctx->mouseX - ctx->virtualX;
             int myRel = ctx->mouseY - ctx->virtualY;
             int tb = HitTestToolbar(mxRel, myRel, ctx->toolbarRect, ctx->toolbarMetrics);
             int ht = HitTestTextAnnotations(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
-            if (moved || h != ctx->resizeHandle || tb != ctx->hoverToolbarBtn
-                || ht != ctx->hoveredTextAnnotation) {
+            // 非文字标注 hover：优先用选中项的手柄命中（箭头=端点；矩形/圆=8 手柄；画笔=无），否则普通命中
+            int ha = -1;
+            if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
+                Annotation& sel = ctx->annotations[ctx->selectedAnnotation];
+                bool onHandle = (HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY,
+                    ctx->backDC) != RH_None);
+                if (onHandle) {
+                    ha = ctx->selectedAnnotation;  // 悬停在手柄上视为悬停选中项（光标由 SETCURSOR 处理）
+                }
+            }
+            if (ha < 0) {
+                ha = HitTestAnnotation(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
+            }
+            // 仅当 hover 状态真正变化时才重绘（去掉纯 moved 无变化的重绘，减少无意义全屏帧）。
+            // 脏区域 = 各变化项的旧位置 ∪ 新位置（工具栏/标注边框高亮变化）。
+            if (h != ctx->resizeHandle || tb != ctx->hoverToolbarBtn
+                || ht != ctx->hoveredTextAnnotation || ha != ctx->hoveredAnnotation) {
+                RECT dirty = {0,0,0,0};
+                // 工具栏 hover 变化：整条工具栏（按钮高亮）
+                if (tb != ctx->hoverToolbarBtn) {
+                    dirty = UnionRectSafe(dirty, InflateRectBy(ctx->toolbarRect, 2));
+                }
+                // 文字标注 hover 变化：旧 ∪ 新 标注盒（backDC 坐标）
+                if (ht != ctx->hoveredTextAnnotation) {
+                    if (ctx->hoveredTextAnnotation >= 0 && ctx->hoveredTextAnnotation < (int)ctx->annotations.size()) {
+                        RECT r = MeasureTextAnnotation(ctx->backDC, ctx->annotations[ctx->hoveredTextAnnotation]);
+                        r.left -= ctx->virtualX; r.top -= ctx->virtualY;
+                        r.right -= ctx->virtualX; r.bottom -= ctx->virtualY;
+                        dirty = UnionRectSafe(dirty, InflateRectBy(r, 3));
+                    }
+                    if (ht >= 0 && ht < (int)ctx->annotations.size()) {
+                        RECT r = MeasureTextAnnotation(ctx->backDC, ctx->annotations[ht]);
+                        r.left -= ctx->virtualX; r.top -= ctx->virtualY;
+                        r.right -= ctx->virtualX; r.bottom -= ctx->virtualY;
+                        dirty = UnionRectSafe(dirty, InflateRectBy(r, 3));
+                    }
+                }
+                // 非文字标注 hover 变化：旧 ∪ 新 标注盒
+                // 选中态标注在 hover 进入/离开时会显示/隐藏 resize 手柄，手柄贴在包围盒边缘外，
+                // inflate 量需覆盖手柄半径（SC_HANDLE_SIZE/2 + 余量），否则手柄痕迹残留。
+                if (ha != ctx->hoveredAnnotation) {
+                    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;
+                    if (ctx->hoveredAnnotation >= 0 && ctx->hoveredAnnotation < (int)ctx->annotations.size()) {
+                        RECT r = MeasureAnnotationBounds(ctx->annotations[ctx->hoveredAnnotation], ctx->backDC);
+                        r.left -= ctx->virtualX; r.top -= ctx->virtualY;
+                        r.right -= ctx->virtualX; r.bottom -= ctx->virtualY;
+                        dirty = UnionRectSafe(dirty, InflateRectBy(r, handleMargin));
+                    }
+                    if (ha >= 0 && ha < (int)ctx->annotations.size()) {
+                        RECT r = MeasureAnnotationBounds(ctx->annotations[ha], ctx->backDC);
+                        r.left -= ctx->virtualX; r.top -= ctx->virtualY;
+                        r.right -= ctx->virtualX; r.bottom -= ctx->virtualY;
+                        dirty = UnionRectSafe(dirty, InflateRectBy(r, handleMargin));
+                    }
+                }
                 ctx->resizeHandle = h;
                 ctx->hoverToolbarBtn = tb;
                 ctx->hoveredTextAnnotation = ht;
-                InvalidateRect(hwnd, NULL, FALSE);
+                ctx->hoveredAnnotation = ha;
+                if (IsValidRect(dirty)) {
+                    InvalidateRect(hwnd, &dirty, FALSE);
+                } else {
+                    // 兜底（理论上不会到这里）
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
             }
         }
         return 0;
@@ -3933,6 +4945,15 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     ctx->textSelEnd = -1;
                 }
             }
+        } else if (ctx->resizingAnnotation >= 0) {
+            // 非文字标注缩放结束：清缩放标志，保持选中态（四角圆点仍显示，可继续调整）
+            ctx->resizingAnnotation = -1;
+            ctx->annotationResizeHandle = RH_None;
+            ctx->needFullRedraw = true;
+        } else if (ctx->draggingAnnotation >= 0) {
+            // 非文字标注拖拽结束：清拖拽标志，保持选中态
+            ctx->draggingAnnotation = -1;
+            ctx->needFullRedraw = true;
         } else if (ctx->draggingTextAnnotation >= 0) {
             // 文字拖动结束
             ctx->draggingTextAnnotation = -1;
@@ -4022,46 +5043,46 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 DestroyWindow(hwnd);
             }
         } else if (wParam == VK_BACK) {
-            // 文字编辑态：退格删除
+            // 文字编辑态：退格删除（文字内容变化，整行重排，刷新文字行区域）
             if (ctx->state == CS_TextEditing && ctx->textCaretPos > 0) {
                 ctx->textBuf.erase(ctx->textCaretPos - 1, 1);
                 ctx->textCaretPos--;
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
                 return 0;
             }
         } else if (wParam == VK_DELETE) {
             // 文字编辑态：Delete 删除
             if (ctx->state == CS_TextEditing && ctx->textCaretPos < (int)ctx->textBuf.size()) {
                 ctx->textBuf.erase(ctx->textCaretPos, 1);
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
                 return 0;
             }
         } else if (wParam == VK_LEFT) {
-            // 文字编辑态：左箭头移动光标
+            // 文字编辑态：左箭头移动光标（仅光标位置变化）
             if (ctx->state == CS_TextEditing && ctx->textCaretPos > 0) {
                 ctx->textCaretPos--;
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
                 return 0;
             }
         } else if (wParam == VK_RIGHT) {
             // 文字编辑态：右箭头移动光标
             if (ctx->state == CS_TextEditing && ctx->textCaretPos < (int)ctx->textBuf.size()) {
                 ctx->textCaretPos++;
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
                 return 0;
             }
         } else if (wParam == VK_HOME) {
             // 文字编辑态：Home 移动到行首
             if (ctx->state == CS_TextEditing) {
                 ctx->textCaretPos = 0;
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
                 return 0;
             }
         } else if (wParam == VK_END) {
             // 文字编辑态：End 移动到行尾
             if (ctx->state == CS_TextEditing) {
                 ctx->textCaretPos = (int)ctx->textBuf.size();
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
                 return 0;
             }
         }
@@ -4085,7 +5106,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                         // 插入到当前光标位置
                         ctx->textBuf.insert(ctx->textCaretPos, result);
                         ctx->textCaretPos += (int)result.size();
-                        InvalidateRect(hwnd, NULL, FALSE);
+                        InvalidateTextLine(hwnd, ctx);
                     }
                     ImmReleaseContext(hwnd, hIMC);
                 }
@@ -4104,7 +5125,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (ch >= 32 && ch != 127) {
                 ctx->textBuf.insert(ctx->textCaretPos, 1, ch);
                 ctx->textCaretPos++;
-                InvalidateRect(hwnd, NULL, FALSE);
+                InvalidateTextLine(hwnd, ctx);
             }
             return 0;
         }
@@ -4144,6 +5165,16 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_CROSS));
             return TRUE;
         }
+        // 非文字标注缩放中：对应四角 resize 光标
+        if (ctx->resizingAnnotation >= 0) {
+            SetCursor(LoadCursorW(NULL, HandleCursor(ctx->annotationResizeHandle)));
+            return TRUE;
+        }
+        // 非文字标注拖拽中：四向箭头光标
+        if (ctx->draggingAnnotation >= 0) {
+            SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
+            return TRUE;
+        }
         // 拖动文字标注中：四向箭头光标
         if (ctx->draggingTextAnnotation >= 0) {
             SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
@@ -4167,6 +5198,26 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (h != RH_None) {
                 SetCursor(LoadCursorW(NULL, HandleCursor(h)));
                 return TRUE;
+            }
+            // 已选中的非文字标注手柄 -> 对应 resize 光标（缩放入口）
+            //   箭头=起点/终点端点手柄（固定四向箭头）；矩形/圆=8 手柄（方向自适应）；画笔=无
+            // 独立命中测试，不依赖 hovered 缓存（RDP 节流下缓存会滞后）
+            if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()
+                && ctx->annotations[ctx->selectedAnnotation].type != AT_Text) {
+                Annotation& sel = ctx->annotations[ctx->selectedAnnotation];
+                int handle = HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY, ctx->backDC);
+                if (handle != RH_None) {
+                    SetCursor(LoadCursorW(NULL, HandleCursor(handle)));
+                    return TRUE;
+                }
+            }
+            // 非文字标注悬停 -> 四向箭头（可拖动/选中），与下方文字悬停判定并列
+            {
+                int hit = HitTestAnnotation(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
+                if (hit >= 0 && ctx->annotations[hit].type != AT_Text) {
+                    SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
+                    return TRUE;
+                }
             }
             // 文字标注悬停 -> 四向箭头（可拖动/选中）
             // 注意：此处必须独立做命中测试，不能依赖 ctx->hoveredTextAnnotation。
@@ -4278,6 +5329,12 @@ static void ScreenshotCaptureThread() {
     ctx.lastHighlightRect = {0,0,0,0};
     ctx.lastToolbarRect = {0,0,0,0};
     ctx.lastPopupRect = {0,0,0,0};
+    ctx.lastCaretRect = {0,0,0,0};
+    ctx.hasLastCaret = false;
+    ctx.lastAnnotationBox = {0,0,0,0};
+    ctx.hasLastAnnotationBox = false;
+    ctx.lastDrawingBox = {0,0,0,0};
+    ctx.hasLastDrawingBox = false;
     ctx.selection = {0,0,0,0};
     ctx.resizeHandle = RH_None;
     ctx.dragStartX = 0; ctx.dragStartY = 0;
@@ -4293,6 +5350,17 @@ static void ScreenshotCaptureThread() {
     // 工具栏几何（按 DPI 缩放）+ 图标位图缓存（按 DPI 预渲染）
     ctx.toolbarMetrics = CalcToolbarMetrics(dpiScale);
     ctx.iconCache.Init(ctx.toolbarMetrics.iconSize);
+    // GDI+ 会话级初始化（必须在 InitMosaicBrushCursors 及任何 GDI+ 调用之前）：
+    // 会话内单次 Startup，避免每帧反复初始化导致拖拽卡顿。
+    if (!InitGdipResources(&ctx)) {
+        gdi.Cleanup();
+        ctx.iconCache.Cleanup();
+        DeleteDC(backDC); DeleteObject(backBmp);
+        DeleteDC(memDC); DeleteObject(screenBitmap);
+        g_captureCtx = nullptr;
+        g_isCapturing = false;
+        return;
+    }
     // 涂抹光标缓存（按半径预生成，DPI 缩放半径）
     for (int i = 0; i < SC_MOSAIC_RADIUS_COUNT; i++) ctx.mosaicBrushCursors[i] = NULL;
     ctx.mosaicBrushCursorsInited = false;
@@ -4329,6 +5397,16 @@ static void ScreenshotCaptureThread() {
     ctx.draggingTextAnnotation = -1;
     ctx.textDragStartX = 0;
     ctx.textDragStartY = 0;
+    // 非文字标注选中/拖拽/缩放状态初始化（与文字机制互斥）
+    ctx.hoveredAnnotation = -1;
+    ctx.selectedAnnotation = -1;
+    ctx.draggingAnnotation = -1;
+    ctx.resizingAnnotation = -1;
+    ctx.annotationResizeHandle = RH_None;
+    ctx.annotationDragStartX = 0;
+    ctx.annotationDragStartY = 0;
+    ctx.dragStartAnnotation = {};
+    ctx.annotationResizeStartBox = { 0, 0, 0, 0 };
 
     // 获取初始鼠标位置和颜色
     POINT pt;
@@ -4397,7 +5475,13 @@ static void ScreenshotCaptureThread() {
                 if (now - ctx.textCaretLastBlink >= 500) {
                     ctx.textCaretVisible = !ctx.textCaretVisible;
                     ctx.textCaretLastBlink = now;
-                    InvalidateRect(g_screenshotOverlayWindow, NULL, FALSE);
+                    // 仅刷新光标区域（光标位置不变，只切换可见性）。首次无缓存时全屏。
+                    if (ctx.hasLastCaret) {
+                        RECT r = InflateRectBy(ctx.lastCaretRect, 2);
+                        InvalidateRect(g_screenshotOverlayWindow, &r, FALSE);
+                    } else {
+                        InvalidateRect(g_screenshotOverlayWindow, NULL, FALSE);
+                    }
                 }
             }
 
@@ -4428,6 +5512,8 @@ static void ScreenshotCaptureThread() {
     FreeMosaicBrushCursors(&ctx);
     DeleteDC(backDC); DeleteObject(backBmp);
     DeleteDC(memDC); DeleteObject(screenBitmap);
+    // GDI+ 会话级资源最后释放（所有 GDI+ 调用均已结束后才可 Shutdown）
+    ShutdownGdipResources(&ctx);
     UnregisterClassW(L"ZToolsScreenshotOverlay", GetModuleHandle(NULL));
     g_isCapturing = false;
 }
