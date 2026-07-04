@@ -16,6 +16,7 @@ const path = require('path');
 // 工具栏按钮 -> SVG 文件名映射（顺序与 src/screenshot_windows.cpp 的 ToolButton 枚举一致）
 // 分隔线（Separator）对应 null，不生成图标。
 const ICON_MAP = {
+  Drag: 'drag',
   Rect: 'square',
   Circle: 'circle',
   Arrow: 'arrow-up-right',
@@ -75,9 +76,9 @@ function main() {
   // 所有图标文本的数组（按 ToolButton 枚举顺序，分隔线为 nullptr）
   lines.push('// 按 ToolButton 枚举顺序的 SVG 文本数组，分隔线为 nullptr。');
   lines.push('static const char* const kIconSvgs[] = {');
-  // 顺序：Rect Circle Arrow Brush Mosaic Text Translate SEP1 Undo Redo SEP2 Save Cancel Confirm
-  lines.push('    kIconSvg_Rect, kIconSvg_Circle, kIconSvg_Arrow, kIconSvg_Brush,');
-  lines.push('    kIconSvg_Mosaic, kIconSvg_Text, kIconSvg_Translate, nullptr,');
+  // 顺序：Drag Rect Circle Arrow Brush Mosaic Text Translate SEP1 Undo Redo SEP2 Save Cancel Confirm
+  lines.push('    kIconSvg_Drag, kIconSvg_Rect, kIconSvg_Circle, kIconSvg_Arrow,');
+  lines.push('    kIconSvg_Brush, kIconSvg_Mosaic, kIconSvg_Text, kIconSvg_Translate, nullptr,');
   lines.push('    kIconSvg_Undo, kIconSvg_Redo, nullptr,');
   lines.push('    kIconSvg_Save, kIconSvg_Cancel, kIconSvg_Confirm');
   lines.push('};');
