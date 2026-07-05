@@ -476,6 +476,18 @@ class ColorPicker {
 // 区域截图类
 class ScreenCapture {
   /**
+   * 预抓取当前虚拟屏幕帧
+   * @returns {boolean} 是否抓取成功
+   */
+  static prime() {
+    if (platform === 'darwin') {
+      throw new Error('ScreenCapture is not yet supported on macOS');
+    }
+
+    return addon.primeScreenshotFrame();
+  }
+
+  /**
    * 启动区域截图
    * @param {Function} callback - 截图完成时的回调函数
    * - 参数: { success: boolean, width?: number, height?: number }
@@ -493,7 +505,7 @@ class ScreenCapture {
       throw new TypeError('Callback must be a function');
     }
 
-    addon.startRegionCapture((result) => {
+    addon.startRegionCaptureWithPrimedFrame((result) => {
       callback(result);
     });
   }

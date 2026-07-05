@@ -13,8 +13,13 @@
 #include <vector>      // For input events
 #include <memory>      // For std::unique_ptr, std::addressof
 #include <cstddef>
+#include <cctype>
 #include <cwchar>
 #include <cwctype>
+#include <mutex>
+#include <condition_variable>
+#include <set>
+#include <sstream>
 #include <shellapi.h>  // For DragQueryFile, SHGetFileInfoW
 #include <shlobj.h>    // For SHLoadIndirectString, IApplicationActivationManager
 #include <shobjidl.h>  // For IApplicationActivationManager
@@ -94,6 +99,42 @@ static std::string g_colorPickerResult;
 static HHOOK g_colorPickerMouseHook = NULL;
 static HHOOK g_colorPickerKeyboardHook = NULL;
 static std::atomic<bool> g_colorPickerCallbackCalled(false);
+
+struct OptimizedShortcutDefinition {
+    std::string shortcut;
+    WORD mainKey = 0;
+    UINT hotkeyModifiers = 0;
+};
+
+struct OptimizedShortcutTrigger {
+    std::string shortcut;
+    bool primed = false;
+};
+
+struct OptimizedShortcutRegistrationResult {
+    bool success = true;
+    std::string error;
+};
+
+struct OptimizedShortcutRefreshRequest {
+    std::string shortcut;
+    bool shouldBeRegistered = true;
+};
+
+// 全局变量 - 优化截图快捷键监听
+static std::atomic<bool> g_isOptimizedShortcutListening(false);
+static napi_threadsafe_function g_optimizedShortcutTsfn = nullptr;
+static std::thread g_optimizedShortcutThread;
+static std::mutex g_optimizedShortcutMutex;
+static std::vector<OptimizedShortcutDefinition> g_optimizedShortcuts;
+static std::map<int, OptimizedShortcutDefinition> g_activeOptimizedShortcutIds;
+static std::atomic<DWORD> g_optimizedShortcutThreadId(0);
+static std::mutex g_optimizedShortcutRefreshResultMutex;
+static std::condition_variable g_optimizedShortcutRefreshResultCv;
+static bool g_optimizedShortcutRefreshPending = false;
+static bool g_optimizedShortcutRefreshCompleted = false;
+static OptimizedShortcutRefreshRequest g_optimizedShortcutRefreshRequest;
+static OptimizedShortcutRegistrationResult g_optimizedShortcutRefreshResult;
 
 // 窗口过程（处理剪贴板消息）
 LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1562,6 +1603,505 @@ WORD GetVirtualKeyCode(const std::string& key) {
     }
 
     return 0;  // 未知键
+}
+
+// 把字符串按分隔符拆分为片段。
+std::vector<std::string> SplitShortcutString(const std::string& value, char delimiter) {
+    std::vector<std::string> parts;
+    std::stringstream stream(value);
+    std::string segment;
+    while (std::getline(stream, segment, delimiter)) {
+        parts.push_back(segment);
+    }
+    return parts;
+}
+
+// 规范化快捷键片段，统一大小写和别名。
+std::string NormalizeShortcutToken(std::string token) {
+    token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), token.end());
+    std::transform(token.begin(), token.end(), token.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    if (token == "commandorcontrol") {
+        return "ctrl";
+    }
+    if (token == "command" || token == "cmd" || token == "meta" || token == "super" || token == "windows" || token == "win") {
+        return "command";
+    }
+    if (token == "control") {
+        return "ctrl";
+    }
+    if (token == "option") {
+        return "alt";
+    }
+    if (token == "return") {
+        return "enter";
+    }
+    return token;
+}
+
+// ==================== 优化截图快捷键监听 ====================
+
+static constexpr UINT WM_OPTIMIZED_SHORTCUT_REFRESH = WM_APP + 101;
+
+// 将快捷键字符串解析为 RegisterHotKey 所需的定义。
+bool TryParseOptimizedShortcut(const std::string& shortcut, OptimizedShortcutDefinition& outDefinition) {
+    const std::vector<std::string> parts = SplitShortcutString(shortcut, '+');
+    if (parts.empty()) {
+        return false;
+    }
+
+    OptimizedShortcutDefinition definition;
+    definition.shortcut = shortcut;
+
+    for (const std::string& rawPart : parts) {
+        const std::string token = NormalizeShortcutToken(rawPart);
+        if (token.empty()) {
+            continue;
+        }
+
+        if (token == "shift") {
+            definition.hotkeyModifiers |= MOD_SHIFT;
+            continue;
+        }
+        if (token == "ctrl") {
+            definition.hotkeyModifiers |= MOD_CONTROL;
+            continue;
+        }
+        if (token == "alt") {
+            definition.hotkeyModifiers |= MOD_ALT;
+            continue;
+        }
+        if (token == "command") {
+            definition.hotkeyModifiers |= MOD_WIN;
+            continue;
+        }
+
+        if (definition.mainKey != 0) {
+            return false;
+        }
+
+        definition.mainKey = GetVirtualKeyCode(token);
+        if (definition.mainKey == 0) {
+            return false;
+        }
+    }
+
+    if (definition.mainKey == 0) {
+        return false;
+    }
+
+    outDefinition = definition;
+    return true;
+}
+
+// 取消当前线程上已注册的优化截图快捷键。
+void UnregisterOptimizedShortcutsOnListenerThread() {
+    for (const auto& entry : g_activeOptimizedShortcutIds) {
+        UnregisterHotKey(NULL, entry.first);
+    }
+    g_activeOptimizedShortcutIds.clear();
+}
+
+// 格式化优化快捷键注册失败信息，便于回传给 JS 层展示。
+std::string BuildOptimizedShortcutRegistrationError(const std::string& shortcut, DWORD errorCode) {
+    std::ostringstream ss;
+    ss << "RegisterHotKey failed for " << shortcut;
+
+    if (errorCode != 0) {
+        ss << " (error " << errorCode << ")";
+
+        LPSTR buffer = nullptr;
+        const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+        const DWORD length = FormatMessageA(flags, NULL, errorCode, 0, reinterpret_cast<LPSTR>(&buffer), 0, NULL);
+        if (length > 0 && buffer != nullptr) {
+            std::string message(buffer, length);
+            while (!message.empty() && (message.back() == '\r' || message.back() == '\n' || message.back() == ' ' || message.back() == '\t')) {
+                message.pop_back();
+            }
+            if (!message.empty()) {
+                ss << ": " << message;
+            }
+            LocalFree(buffer);
+        }
+    }
+
+    return ss.str();
+}
+
+// 结束一次等待中的优化快捷键 refresh，并把结果通知给调用线程。
+void CompleteOptimizedShortcutRefreshResult(const OptimizedShortcutRegistrationResult& result) {
+    std::lock_guard<std::mutex> lock(g_optimizedShortcutRefreshResultMutex);
+    if (!g_optimizedShortcutRefreshPending) {
+        return;
+    }
+
+    g_optimizedShortcutRefreshResult = result;
+    g_optimizedShortcutRefreshPending = false;
+    g_optimizedShortcutRefreshCompleted = true;
+    g_optimizedShortcutRefreshRequest = OptimizedShortcutRefreshRequest{};
+    g_optimizedShortcutRefreshResultCv.notify_all();
+}
+
+// 构造优化快捷键注册结果对象，统一返回给 JS 层。
+Napi::Object CreateOptimizedShortcutRegistrationResult(Napi::Env env, bool success, const std::string& error = "") {
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("success", Napi::Boolean::New(env, success));
+    if (!error.empty()) {
+        result.Set("error", Napi::String::New(env, error));
+    }
+    return result;
+}
+
+// 按最新配置重新注册当前线程上的优化截图快捷键。
+void RefreshOptimizedShortcutsOnListenerThread() {
+    std::vector<OptimizedShortcutDefinition> shortcuts;
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+        shortcuts = g_optimizedShortcuts;
+    }
+
+    std::string refreshTarget;
+    bool shouldBeRegistered = true;
+    bool shouldReport = false;
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutRefreshResultMutex);
+        shouldReport = g_optimizedShortcutRefreshPending;
+        refreshTarget = g_optimizedShortcutRefreshRequest.shortcut;
+        shouldBeRegistered = g_optimizedShortcutRefreshRequest.shouldBeRegistered;
+    }
+
+    OptimizedShortcutRegistrationResult refreshResult;
+    refreshResult.success = !shouldReport;
+    bool targetSeen = false;
+
+    UnregisterOptimizedShortcutsOnListenerThread();
+
+    int nextHotkeyId = 1;
+    for (const auto& definition : shortcuts) {
+        UINT modifiers = definition.hotkeyModifiers | MOD_NOREPEAT;
+        const bool registered = RegisterHotKey(NULL, nextHotkeyId, modifiers, definition.mainKey);
+        if (registered) {
+            g_activeOptimizedShortcutIds[nextHotkeyId] = definition;
+            nextHotkeyId++;
+        }
+
+        if (shouldReport && definition.shortcut == refreshTarget) {
+            targetSeen = true;
+            if (registered) {
+                refreshResult.success = true;
+                refreshResult.error.clear();
+            } else {
+                refreshResult.success = false;
+                refreshResult.error = BuildOptimizedShortcutRegistrationError(definition.shortcut, GetLastError());
+            }
+        }
+    }
+
+    if (shouldReport) {
+        if (!targetSeen) {
+            if (shouldBeRegistered) {
+                refreshResult.success = false;
+                refreshResult.error = "optimized shortcut refresh target not found: " + refreshTarget;
+            } else {
+                refreshResult.success = true;
+                refreshResult.error.clear();
+            }
+        }
+        CompleteOptimizedShortcutRefreshResult(refreshResult);
+    }
+}
+
+// 回到 JS 主线程通知命中的优化快捷键。
+void CallOptimizedShortcutJs(napi_env env, napi_value js_callback, void* context, void* data) {
+    OptimizedShortcutTrigger* trigger = static_cast<OptimizedShortcutTrigger*>(data);
+    if (!trigger) {
+        return;
+    }
+
+    if (env != nullptr && js_callback != nullptr) {
+        napi_value global;
+        napi_get_global(env, &global);
+
+        napi_value payload;
+        napi_create_object(env, &payload);
+
+        napi_value shortcutValue;
+        napi_create_string_utf8(env, trigger->shortcut.c_str(), NAPI_AUTO_LENGTH, &shortcutValue);
+        napi_set_named_property(env, payload, "shortcut", shortcutValue);
+
+        napi_value primedValue;
+        napi_get_boolean(env, trigger->primed, &primedValue);
+        napi_set_named_property(env, payload, "primed", primedValue);
+
+        napi_call_function(env, global, js_callback, 1, &payload, nullptr);
+    }
+
+    delete trigger;
+}
+
+// native 优化快捷键消息循环线程。
+void OptimizedShortcutThread() {
+    g_optimizedShortcutThreadId = GetCurrentThreadId();
+    MSG msg;
+    PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    RefreshOptimizedShortcutsOnListenerThread();
+
+    while (g_isOptimizedShortcutListening && GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_HOTKEY) {
+            const int hotkeyId = static_cast<int>(msg.wParam);
+            auto it = g_activeOptimizedShortcutIds.find(hotkeyId);
+            if (it != g_activeOptimizedShortcutIds.end()) {
+                OptimizedShortcutTrigger* trigger = new OptimizedShortcutTrigger();
+                trigger->shortcut = it->second.shortcut;
+                trigger->primed = PrimeScreenshotFrameNow();
+                if (g_optimizedShortcutTsfn != nullptr) {
+                    napi_call_threadsafe_function(g_optimizedShortcutTsfn, trigger, napi_tsfn_nonblocking);
+                } else {
+                    delete trigger;
+                }
+            }
+            continue;
+        }
+
+        if (msg.message == WM_OPTIMIZED_SHORTCUT_REFRESH) {
+            RefreshOptimizedShortcutsOnListenerThread();
+            continue;
+        }
+
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnregisterOptimizedShortcutsOnListenerThread();
+    g_optimizedShortcutThreadId = 0;
+}
+
+// 确保 native 优化快捷键监听已经启动。
+Napi::Value EnsureOptimizedShortcutListener(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected callback function as first argument").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (g_isOptimizedShortcutListening) {
+        return env.Undefined();
+    }
+
+    napi_value callback = info[0];
+    napi_value resource_name;
+    napi_create_string_utf8(env, "OptimizedShortcutCallback", NAPI_AUTO_LENGTH, &resource_name);
+
+    napi_status status = napi_create_threadsafe_function(
+        env,
+        callback,
+        nullptr,
+        resource_name,
+        0,
+        1,
+        nullptr,
+        nullptr,
+        nullptr,
+        CallOptimizedShortcutJs,
+        &g_optimizedShortcutTsfn
+    );
+
+    if (status != napi_ok) {
+        Napi::Error::New(env, "Failed to create optimized shortcut threadsafe function").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    g_isOptimizedShortcutListening = true;
+    g_optimizedShortcutThread = std::thread(OptimizedShortcutThread);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (!g_isOptimizedShortcutListening || g_optimizedShortcutThreadId == 0) {
+        if (g_optimizedShortcutThread.joinable()) {
+            g_optimizedShortcutThread.join();
+        }
+        napi_release_threadsafe_function(g_optimizedShortcutTsfn, napi_tsfn_release);
+        g_optimizedShortcutTsfn = nullptr;
+        Napi::Error::New(env, "Failed to start optimized shortcut listener").ThrowAsJavaScriptException();
+    }
+
+    return env.Undefined();
+}
+
+// 停止 native 优化快捷键监听并释放资源。
+Napi::Value StopOptimizedShortcutListener(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (!g_isOptimizedShortcutListening) {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+        g_optimizedShortcuts.clear();
+        g_activeOptimizedShortcutIds.clear();
+        CompleteOptimizedShortcutRefreshResult({false, "optimized shortcut listener stopped"});
+        return env.Undefined();
+    }
+
+    g_isOptimizedShortcutListening = false;
+
+    const DWORD threadId = g_optimizedShortcutThreadId;
+    if (threadId != 0) {
+        PostThreadMessage(threadId, WM_QUIT, 0, 0);
+    }
+    if (g_optimizedShortcutThread.joinable()) {
+        g_optimizedShortcutThread.join();
+    }
+
+    if (g_optimizedShortcutTsfn != nullptr) {
+        napi_release_threadsafe_function(g_optimizedShortcutTsfn, napi_tsfn_release);
+        g_optimizedShortcutTsfn = nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+    g_optimizedShortcuts.clear();
+    g_activeOptimizedShortcutIds.clear();
+    CompleteOptimizedShortcutRefreshResult({false, "optimized shortcut listener stopped"});
+    return env.Undefined();
+}
+
+// 注册单个受管优化截图快捷键。
+Napi::Value RegisterOptimizedShortcut(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected shortcut as first argument").ThrowAsJavaScriptException();
+        return CreateOptimizedShortcutRegistrationResult(env, false, "Expected shortcut as first argument");
+    }
+
+    const std::string shortcut = info[0].As<Napi::String>().Utf8Value();
+    OptimizedShortcutDefinition definition;
+    if (!TryParseOptimizedShortcut(shortcut, definition)) {
+        Napi::Error::New(env, "Unsupported optimized shortcut: " + shortcut).ThrowAsJavaScriptException();
+        return CreateOptimizedShortcutRegistrationResult(env, false, "Unsupported optimized shortcut: " + shortcut);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+        auto existing = std::find_if(g_optimizedShortcuts.begin(), g_optimizedShortcuts.end(), [&](const OptimizedShortcutDefinition& item) {
+            return item.shortcut == shortcut;
+        });
+        if (existing != g_optimizedShortcuts.end()) {
+            *existing = definition;
+        } else {
+            g_optimizedShortcuts.push_back(definition);
+        }
+    }
+
+    const DWORD threadId = g_optimizedShortcutThreadId;
+    if (threadId == 0) {
+        return CreateOptimizedShortcutRegistrationResult(env, false, "optimized shortcut listener is not running");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutRefreshResultMutex);
+        g_optimizedShortcutRefreshPending = true;
+        g_optimizedShortcutRefreshCompleted = false;
+        g_optimizedShortcutRefreshRequest = {shortcut, true};
+        g_optimizedShortcutRefreshResult = OptimizedShortcutRegistrationResult{};
+    }
+
+    if (!PostThreadMessage(threadId, WM_OPTIMIZED_SHORTCUT_REFRESH, 0, 0)) {
+        const DWORD errorCode = GetLastError();
+        CompleteOptimizedShortcutRefreshResult({false, BuildOptimizedShortcutRegistrationError(shortcut, errorCode)});
+        return CreateOptimizedShortcutRegistrationResult(env, false, BuildOptimizedShortcutRegistrationError(shortcut, errorCode));
+    }
+
+    std::unique_lock<std::mutex> lock(g_optimizedShortcutRefreshResultMutex);
+    const bool completed = g_optimizedShortcutRefreshResultCv.wait_for(
+        lock,
+        std::chrono::milliseconds(1000),
+        []() { return g_optimizedShortcutRefreshCompleted; }
+    );
+
+    if (!completed) {
+        g_optimizedShortcutRefreshPending = false;
+        g_optimizedShortcutRefreshCompleted = false;
+        g_optimizedShortcutRefreshRequest = OptimizedShortcutRefreshRequest{};
+        return CreateOptimizedShortcutRegistrationResult(env, false, "optimized shortcut refresh timed out");
+    }
+
+    const OptimizedShortcutRegistrationResult result = g_optimizedShortcutRefreshResult;
+    g_optimizedShortcutRefreshCompleted = false;
+    return CreateOptimizedShortcutRegistrationResult(env, result.success, result.error);
+}
+
+// 注销单个受管优化截图快捷键。
+Napi::Value UnregisterOptimizedShortcut(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected shortcut as first argument").ThrowAsJavaScriptException();
+        return CreateOptimizedShortcutRegistrationResult(env, false, "Expected shortcut as first argument");
+    }
+
+    const std::string shortcut = info[0].As<Napi::String>().Utf8Value();
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+        const auto beforeSize = g_optimizedShortcuts.size();
+        g_optimizedShortcuts.erase(
+            std::remove_if(g_optimizedShortcuts.begin(), g_optimizedShortcuts.end(), [&](const OptimizedShortcutDefinition& item) {
+                return item.shortcut == shortcut;
+            }),
+            g_optimizedShortcuts.end()
+        );
+        changed = beforeSize != g_optimizedShortcuts.size();
+    }
+
+    if (!changed) {
+        return CreateOptimizedShortcutRegistrationResult(env, true);
+    }
+
+    const DWORD threadId = g_optimizedShortcutThreadId;
+    if (threadId == 0) {
+        return CreateOptimizedShortcutRegistrationResult(env, true);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutRefreshResultMutex);
+        g_optimizedShortcutRefreshPending = true;
+        g_optimizedShortcutRefreshCompleted = false;
+        g_optimizedShortcutRefreshRequest = {shortcut, false};
+        g_optimizedShortcutRefreshResult = OptimizedShortcutRegistrationResult{};
+    }
+
+    if (!PostThreadMessage(threadId, WM_OPTIMIZED_SHORTCUT_REFRESH, 0, 0)) {
+        const DWORD errorCode = GetLastError();
+        CompleteOptimizedShortcutRefreshResult({false, BuildOptimizedShortcutRegistrationError(shortcut, errorCode)});
+        return CreateOptimizedShortcutRegistrationResult(env, false, BuildOptimizedShortcutRegistrationError(shortcut, errorCode));
+    }
+
+    std::unique_lock<std::mutex> lock(g_optimizedShortcutRefreshResultMutex);
+    const bool completed = g_optimizedShortcutRefreshResultCv.wait_for(
+        lock,
+        std::chrono::milliseconds(1000),
+        []() { return g_optimizedShortcutRefreshCompleted; }
+    );
+
+    if (!completed) {
+        g_optimizedShortcutRefreshPending = false;
+        g_optimizedShortcutRefreshCompleted = false;
+        g_optimizedShortcutRefreshRequest = OptimizedShortcutRefreshRequest{};
+        return CreateOptimizedShortcutRegistrationResult(env, false, "optimized shortcut refresh timed out");
+    }
+
+    const OptimizedShortcutRegistrationResult result = g_optimizedShortcutRefreshResult;
+    g_optimizedShortcutRefreshCompleted = false;
+    return CreateOptimizedShortcutRegistrationResult(env, result.success, result.error);
+}
+
+// 读取当前受管优化截图快捷键数量。
+Napi::Value GetOptimizedShortcutCount(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+    return Napi::Number::New(env, static_cast<double>(g_optimizedShortcuts.size()));
 }
 
 // ==================== 获取选中内容功能 ====================
@@ -4719,7 +5259,14 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("simulateMouseClick", Napi::Function::New(env, SimulateMouseClick));
     exports.Set("simulateMouseDoubleClick", Napi::Function::New(env, SimulateMouseDoubleClick));
     exports.Set("simulateMouseRightClick", Napi::Function::New(env, SimulateMouseRightClick));
+    exports.Set("ensureOptimizedShortcutListener", Napi::Function::New(env, EnsureOptimizedShortcutListener));
+    exports.Set("stopOptimizedShortcutListener", Napi::Function::New(env, StopOptimizedShortcutListener));
+    exports.Set("registerOptimizedShortcut", Napi::Function::New(env, RegisterOptimizedShortcut));
+    exports.Set("unregisterOptimizedShortcut", Napi::Function::New(env, UnregisterOptimizedShortcut));
+    exports.Set("getOptimizedShortcutCount", Napi::Function::New(env, GetOptimizedShortcutCount));
     exports.Set("startRegionCapture", Napi::Function::New(env, StartRegionCapture));
+    exports.Set("primeScreenshotFrame", Napi::Function::New(env, PrimeScreenshotFrame));
+    exports.Set("startRegionCaptureWithPrimedFrame", Napi::Function::New(env, StartRegionCaptureWithPrimedFrame));
     exports.Set("getClipboardFiles", Napi::Function::New(env, GetClipboardFiles));
     exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
     exports.Set("startMouseMonitor", Napi::Function::New(env, StartMouseMonitor));

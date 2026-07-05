@@ -12,6 +12,8 @@
 #include <vector>
 #include <string>
 #include <cmath>      // For std::sqrt, std::fabs
+#include <mutex>
+#include <chrono>
 
 // DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
 #ifndef DWMWA_CLOAKED
@@ -45,6 +47,35 @@ static HWND g_screenshotOverlayWindow = NULL;
 static std::atomic<bool> g_isCapturing(false);
 static napi_threadsafe_function g_screenshotTsfn = nullptr;
 static std::thread g_screenshotThread;
+static const auto SC_PRIMED_FRAME_TTL = std::chrono::milliseconds(500);
+
+struct PrimedScreenshotFrame {
+    HBITMAP bitmap = NULL;
+    int vx = 0;
+    int vy = 0;
+    int vw = 0;
+    int vh = 0;
+    double dpiScale = 1.0;
+    std::chrono::steady_clock::time_point capturedAt{};
+    bool valid = false;
+};
+
+static PrimedScreenshotFrame g_primedScreenshotFrame;
+static std::mutex g_primedScreenshotFrameMutex;
+
+static void ReleasePrimedScreenshotFrameLocked() {
+    if (g_primedScreenshotFrame.bitmap) {
+        DeleteObject(g_primedScreenshotFrame.bitmap);
+        g_primedScreenshotFrame.bitmap = NULL;
+    }
+    g_primedScreenshotFrame.vx = 0;
+    g_primedScreenshotFrame.vy = 0;
+    g_primedScreenshotFrame.vw = 0;
+    g_primedScreenshotFrame.vh = 0;
+    g_primedScreenshotFrame.dpiScale = 1.0;
+    g_primedScreenshotFrame.capturedAt = std::chrono::steady_clock::time_point{};
+    g_primedScreenshotFrame.valid = false;
+}
 
 // ==================== 区域截图功能（预截屏 + 双缓冲架构） ====================
 
@@ -1341,12 +1372,8 @@ static bool CaptureVirtualScreen(HDC& outMemDC, HBITMAP& outBitmap,
 
     SelectObject(outMemDC, outBitmap);
 
-    // 设置高质量拉伸模式
-    SetStretchBltMode(outMemDC, HALFTONE);
-    SetBrushOrgEx(outMemDC, 0, 0, NULL);
-
     // 直接 BitBlt 物理像素（在 DPI 感知模式下，屏幕 DC 和坐标都是物理像素级别）
-    BitBlt(outMemDC, 0, 0, physVw, physVh, screenDC, physVx, physVy, SRCCOPY);
+    BitBlt(outMemDC, 0, 0, physVw, physVh, screenDC, physVx, physVy, SRCCOPY | CAPTUREBLT);
 
     // 更新返回的 dpiScale 为实际的物理/逻辑比例
     // 这样后续的坐标转换才能正确
@@ -1369,6 +1396,79 @@ static bool CreateBackBuffer(HDC& outDC, HBITMAP& outBmp, int w, int h) {
     SelectObject(outDC, outBmp);
     ReleaseDC(NULL, screenDC);
     return true;
+}
+
+// 立即抓取当前虚拟屏幕首帧，供后续截图流程复用。
+bool PrimeScreenshotFrameNow() {
+    HDC memDC = NULL;
+    HBITMAP bitmap = NULL;
+    int vx = 0, vy = 0, vw = 0, vh = 0;
+    double dpiScale = 1.0;
+    if (!CaptureVirtualScreen(memDC, bitmap, vx, vy, vw, vh, dpiScale)) {
+        return false;
+    }
+
+    if (memDC) {
+        DeleteDC(memDC);
+    }
+
+    std::lock_guard<std::mutex> lock(g_primedScreenshotFrameMutex);
+    ReleasePrimedScreenshotFrameLocked();
+    g_primedScreenshotFrame.bitmap = bitmap;
+    g_primedScreenshotFrame.vx = vx;
+    g_primedScreenshotFrame.vy = vy;
+    g_primedScreenshotFrame.vw = vw;
+    g_primedScreenshotFrame.vh = vh;
+    g_primedScreenshotFrame.dpiScale = dpiScale;
+    g_primedScreenshotFrame.capturedAt = std::chrono::steady_clock::now();
+    g_primedScreenshotFrame.valid = true;
+    return true;
+}
+
+static bool ConsumePrimedScreenshotFrame(HDC& outMemDC, HBITMAP& outBitmap,
+    int& vx, int& vy, int& vw, int& vh, double& dpiScale) {
+    std::lock_guard<std::mutex> lock(g_primedScreenshotFrameMutex);
+    if (!g_primedScreenshotFrame.valid || !g_primedScreenshotFrame.bitmap) {
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_primedScreenshotFrame.capturedAt > SC_PRIMED_FRAME_TTL) {
+        ReleasePrimedScreenshotFrameLocked();
+        return false;
+    }
+
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) {
+        ReleasePrimedScreenshotFrameLocked();
+        return false;
+    }
+
+    outMemDC = CreateCompatibleDC(screenDC);
+    ReleaseDC(NULL, screenDC);
+    if (!outMemDC) {
+        ReleasePrimedScreenshotFrameLocked();
+        return false;
+    }
+
+    SelectObject(outMemDC, g_primedScreenshotFrame.bitmap);
+    outBitmap = g_primedScreenshotFrame.bitmap;
+    vx = g_primedScreenshotFrame.vx;
+    vy = g_primedScreenshotFrame.vy;
+    vw = g_primedScreenshotFrame.vw;
+    vh = g_primedScreenshotFrame.vh;
+    dpiScale = g_primedScreenshotFrame.dpiScale;
+    g_primedScreenshotFrame.bitmap = NULL;
+    g_primedScreenshotFrame.valid = false;
+    return true;
+}
+
+static bool AcquireScreenshotBase(HDC& outMemDC, HBITMAP& outBitmap,
+    int& vx, int& vy, int& vw, int& vh, double& dpiScale) {
+    if (ConsumePrimedScreenshotFrame(outMemDC, outBitmap, vx, vy, vw, vh, dpiScale)) {
+        return true;
+    }
+    return CaptureVirtualScreen(outMemDC, outBitmap, vx, vy, vw, vh, dpiScale);
 }
 
 // 从预截屏位图读取像素颜色（逻辑坐标）
@@ -5558,7 +5658,7 @@ static void ScreenshotCaptureThread() {
     HDC memDC = NULL;
     HBITMAP screenBitmap = NULL;
     int vx, vy, vw, vh;
-    if (!CaptureVirtualScreen(memDC, screenBitmap, vx, vy, vw, vh, dpiScale)) {
+    if (!AcquireScreenshotBase(memDC, screenBitmap, vx, vy, vw, vh, dpiScale)) {
         g_isCapturing = false;
         return;
     }
@@ -5795,6 +5895,17 @@ static void ScreenshotCaptureThread() {
 
 // 启动区域截图
 Napi::Value StartRegionCapture(const Napi::CallbackInfo& info) {
+    return StartRegionCaptureWithPrimedFrame(info);
+}
+
+// 供 JS 主动触发首帧预抓取。
+Napi::Value PrimeScreenshotFrame(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    const bool success = PrimeScreenshotFrameNow();
+    return Napi::Boolean::New(env, success);
+}
+
+Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
     if (g_isCapturing) {
