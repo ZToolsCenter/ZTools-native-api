@@ -3,3 +3,6 @@ build/
 *.dylib
 *.log
 .DS_Store
+
+# 构建产物：由 scripts/gen-icons.js 从 src/assets/*.svg 生成
+src/generated/

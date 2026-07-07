@@ -27,7 +27,7 @@
         [
           "OS=='win'",
           {
-            "sources": ["src/binding_windows.cpp"],
+            "sources": ["src/binding_windows.cpp", "src/screenshot_windows.cpp"],
             "libraries": [
               "user32.lib",
               "kernel32.lib",
@@ -38,7 +38,8 @@
               "uiautomationcore.lib",
               "gdiplus.lib",
               "dwmapi.lib",
-              "gdi32.lib"
+              "gdi32.lib",
+              "imm32.lib"
             ],
             "msvs_settings": {
               "VCCLCompilerTool": {
