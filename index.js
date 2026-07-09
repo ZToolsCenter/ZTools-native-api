@@ -571,6 +571,17 @@ class UwpManager {
 }
 
 // MUI 资源字符串解析类
+class WindowsShortcutScanner {
+  static scan(scanPaths, rootScanPaths, skipFolders) {
+    if (platform !== 'win32') {
+      throw new Error('WindowsShortcutScanner is only supported on Windows');
+    }
+    if (!Array.isArray(scanPaths) || !Array.isArray(rootScanPaths) || !Array.isArray(skipFolders)) {
+      throw new TypeError('scanPaths, rootScanPaths and skipFolders must be arrays');
+    }
+    return addon.scanWindowsShortcuts(scanPaths, rootScanPaths, skipFolders);
+  }
+}
 class MuiResolver {
   /**
    * 批量解析 MUI 资源字符串
@@ -641,6 +652,7 @@ module.exports = {
   IconExtractor,
   UwpManager,
   MuiResolver,
+  WindowsShortcutScanner,
   getSelectedContent
 };
 

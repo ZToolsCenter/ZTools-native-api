@@ -4917,6 +4917,391 @@ bool StartsWithWideString(const std::wstring& value, const std::wstring& prefix)
            std::equal(prefix.begin(), prefix.end(), value.begin());
 }
 
+
+struct WindowsShortcutEntry {
+    std::wstring name;
+    std::wstring path;
+    std::wstring icon;
+    std::wstring targetPath;
+    std::wstring sourceType;
+};
+
+struct UrlShortcutInfo {
+    bool valid = false;
+    std::wstring url;
+    std::wstring iconFile;
+};
+
+static std::wstring JoinWindowsPath(const std::wstring& base, const std::wstring& name) {
+    if (base.empty()) return name;
+    wchar_t last = base[base.size() - 1];
+    if (last == L'\\' || last == L'/') {
+        return base + name;
+    }
+    return base + L"\\" + name;
+}
+
+static std::wstring GetFileNameWithoutExtension(const std::wstring& fileName) {
+    size_t slash = fileName.find_last_of(L"\\/");
+    std::wstring base = slash == std::wstring::npos ? fileName : fileName.substr(slash + 1);
+    size_t dot = base.find_last_of(L'.');
+    if (dot == std::wstring::npos || dot == 0) {
+        return base;
+    }
+    return base.substr(0, dot);
+}
+
+static std::wstring GetExtensionLower(const std::wstring& fileName) {
+    size_t dot = fileName.find_last_of(L'.');
+    if (dot == std::wstring::npos) {
+        return L"";
+    }
+    return ToLowerWideString(fileName.substr(dot));
+}
+
+static bool StartsWithLower(const std::wstring& value, const std::wstring& prefix) {
+    return value.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), value.begin());
+}
+
+static std::wstring GetIniStringValue(const wchar_t* section, const wchar_t* key, const std::wstring& filePath) {
+    DWORD size = 1024;
+    std::vector<wchar_t> buffer(size);
+    DWORD copied = 0;
+
+    for (;;) {
+        copied = GetPrivateProfileStringW(section, key, L"", buffer.data(), size, filePath.c_str());
+        if (copied < size - 1) {
+            break;
+        }
+        size *= 2;
+        buffer.assign(size, L'\0');
+        if (size > 65536) {
+            break;
+        }
+    }
+
+    if (copied == 0) {
+        return L"";
+    }
+    return std::wstring(buffer.data(), copied);
+}
+
+static UrlShortcutInfo ParseUrlShortcutFile(const std::wstring& filePath) {
+    UrlShortcutInfo info;
+    std::wstring url = GetIniStringValue(L"InternetShortcut", L"URL", filePath);
+    if (url.empty()) {
+        return info;
+    }
+
+    std::wstring lowerUrl = ToLowerWideString(url);
+    if (StartsWithLower(lowerUrl, L"http://") || StartsWithLower(lowerUrl, L"https://")) {
+        return info;
+    }
+
+    info.valid = true;
+    info.url = url;
+    info.iconFile = GetIniStringValue(L"InternetShortcut", L"IconFile", filePath);
+    return info;
+}
+
+static std::map<std::wstring, std::wstring> ReadLocalizedDisplayNames(const std::wstring& dirPath) {
+    std::map<std::wstring, std::wstring> result;
+    std::wstring iniPath = JoinWindowsPath(dirPath, L"desktop.ini");
+
+    DWORD attrs = GetFileAttributesW(iniPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return result;
+    }
+
+    DWORD size = 8192;
+    std::vector<wchar_t> buffer(size);
+    DWORD copied = 0;
+
+    for (;;) {
+        copied = GetPrivateProfileSectionW(L"LocalizedFileNames", buffer.data(), size, iniPath.c_str());
+        if (copied < size - 2) {
+            break;
+        }
+        size *= 2;
+        buffer.assign(size, L'\0');
+        if (size > 262144) {
+            break;
+        }
+    }
+
+    if (copied == 0) {
+        return result;
+    }
+
+    const wchar_t* item = buffer.data();
+    while (*item != L'\0') {
+        std::wstring line(item);
+        size_t eq = line.find(L'=');
+        if (eq != std::wstring::npos && eq > 0) {
+            std::wstring fileName = line.substr(0, eq);
+            std::wstring value = line.substr(eq + 1);
+            std::wstring localizedName;
+
+            if (!value.empty() && value[0] == L'@') {
+                localizedName = ResolveIndirectString(value);
+            } else {
+                localizedName = value;
+            }
+
+            if (!localizedName.empty()) {
+                std::wstring fullPath = ToLowerWideString(JoinWindowsPath(dirPath, fileName));
+                result[fullPath] = localizedName;
+            }
+        }
+        item += line.size() + 1;
+    }
+
+    return result;
+}
+
+static std::wstring ResolveShortcutTargetPath(const std::wstring& shortcutPath) {
+    std::wstring targetPath;
+    IShellLinkW* shellLink = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW,
+                                  reinterpret_cast<void**>(&shellLink));
+    if (FAILED(hr) || !shellLink) {
+        return targetPath;
+    }
+
+    IPersistFile* persistFile = nullptr;
+    hr = shellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&persistFile));
+    if (SUCCEEDED(hr) && persistFile) {
+        hr = persistFile->Load(shortcutPath.c_str(), STGM_READ);
+        if (SUCCEEDED(hr)) {
+            std::vector<wchar_t> pathBuffer(MAX_PATH * 4, L'\0');
+            WIN32_FIND_DATAW findData = {};
+            hr = shellLink->GetPath(pathBuffer.data(), static_cast<int>(pathBuffer.size()), &findData, SLGP_RAWPATH);
+            if (SUCCEEDED(hr) && pathBuffer[0] != L'\0') {
+                targetPath = pathBuffer.data();
+            }
+        }
+        persistFile->Release();
+    }
+
+    shellLink->Release();
+    return targetPath;
+}
+
+static bool ShouldSkipDirectoryName(const std::wstring& dirName, const std::vector<std::wstring>& skipFolders) {
+    std::wstring lower = ToLowerWideString(dirName);
+    for (const auto& skip : skipFolders) {
+        if (lower == skip) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ResolveShortcutTargetsInParallel(std::vector<WindowsShortcutEntry>& entries) {
+    if (entries.empty()) {
+        return;
+    }
+
+    unsigned int workerCount = std::thread::hardware_concurrency();
+    if (workerCount == 0) {
+        workerCount = 4;
+    }
+    workerCount = std::min<unsigned int>(workerCount, 8);
+    workerCount = std::max<unsigned int>(workerCount, 1);
+
+    std::atomic<size_t> nextIndex(0);
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+
+    for (unsigned int worker = 0; worker < workerCount; worker++) {
+        workers.emplace_back([&entries, &nextIndex]() {
+            HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+
+            for (;;) {
+                size_t index = nextIndex.fetch_add(1);
+                if (index >= entries.size()) {
+                    break;
+                }
+
+                WindowsShortcutEntry& entry = entries[index];
+                if (entry.sourceType != L"lnk") {
+                    continue;
+                }
+
+                std::wstring targetPath = ResolveShortcutTargetPath(entry.path);
+                if (!targetPath.empty() && GetExtensionLower(targetPath) == L".url") {
+                    UrlShortcutInfo urlInfo = ParseUrlShortcutFile(targetPath);
+                    if (!urlInfo.valid) {
+                        entry.sourceType = L"skip";
+                        continue;
+                    }
+
+                    entry.path = urlInfo.url;
+                    entry.icon = urlInfo.iconFile.empty() ? entry.icon : urlInfo.iconFile;
+                    entry.targetPath.clear();
+                    entry.sourceType = L"lnk-url";
+                    continue;
+                }
+
+                entry.targetPath = targetPath;
+            }
+
+            if (needUninit) {
+                CoUninitialize();
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    entries.erase(
+        std::remove_if(entries.begin(), entries.end(), [](const WindowsShortcutEntry& entry) {
+            return entry.sourceType == L"skip";
+        }),
+        entries.end()
+    );
+}
+
+static void AddShortcutEntry(const std::wstring& dirPath,
+                             const WIN32_FIND_DATAW& findData,
+                             const std::map<std::wstring, std::wstring>& localizedNames,
+                             std::vector<WindowsShortcutEntry>& entries) {
+    const std::wstring fileName(findData.cFileName);
+    const std::wstring fullPath = JoinWindowsPath(dirPath, fileName);
+    const std::wstring ext = GetExtensionLower(fileName);
+
+    if (ext != L".lnk" && ext != L".url") {
+        return;
+    }
+
+    std::wstring lookupPath = ToLowerWideString(fullPath);
+    auto nameIt = localizedNames.find(lookupPath);
+    std::wstring appName = nameIt != localizedNames.end()
+        ? nameIt->second
+        : GetFileNameWithoutExtension(fileName);
+
+    if (ext == L".url") {
+        UrlShortcutInfo urlInfo = ParseUrlShortcutFile(fullPath);
+        if (!urlInfo.valid) {
+            return;
+        }
+
+        WindowsShortcutEntry entry;
+        entry.name = appName;
+        entry.path = urlInfo.url;
+        entry.icon = urlInfo.iconFile.empty() ? fullPath : urlInfo.iconFile;
+        entry.sourceType = L"url";
+        entries.push_back(entry);
+        return;
+    }
+
+    WindowsShortcutEntry entry;
+    entry.name = appName;
+    entry.path = fullPath;
+    entry.icon = fullPath;
+    entry.sourceType = L"lnk";
+    entries.push_back(entry);
+}
+
+static void ScanShortcutDirectory(const std::wstring& dirPath,
+                                  bool recursive,
+                                  const std::vector<std::wstring>& skipFolders,
+                                  std::vector<WindowsShortcutEntry>& entries) {
+    DWORD attrs = GetFileAttributesW(dirPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return;
+    }
+
+    std::map<std::wstring, std::wstring> localizedNames = ReadLocalizedDisplayNames(dirPath);
+    std::wstring pattern = JoinWindowsPath(dirPath, L"*");
+    WIN32_FIND_DATAW findData = {};
+    HANDLE findHandle = FindFirstFileW(pattern.c_str(), &findData);
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        std::wstring name(findData.cFileName);
+        if (name == L"." || name == L"..") {
+            continue;
+        }
+
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (recursive && !ShouldSkipDirectoryName(name, skipFolders)) {
+                ScanShortcutDirectory(JoinWindowsPath(dirPath, name), true, skipFolders, entries);
+            }
+            continue;
+        }
+
+        AddShortcutEntry(dirPath, findData, localizedNames, entries);
+    } while (FindNextFileW(findHandle, &findData));
+
+    FindClose(findHandle);
+}
+
+static std::vector<std::wstring> NapiStringArrayToWideVector(Napi::Env env, const Napi::Value& value, const char* name) {
+    if (!value.IsArray()) {
+        Napi::TypeError::New(env, std::string(name) + " must be an array").ThrowAsJavaScriptException();
+        return {};
+    }
+
+    Napi::Array array = value.As<Napi::Array>();
+    std::vector<std::wstring> result;
+    result.reserve(array.Length());
+    for (uint32_t i = 0; i < array.Length(); i++) {
+        Napi::Value item = array.Get(i);
+        if (!item.IsString()) {
+            continue;
+        }
+        result.push_back(Utf8ToWideString(item.As<Napi::String>().Utf8Value()));
+    }
+    return result;
+}
+
+Napi::Value ScanWindowsShortcuts(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3) {
+        Napi::TypeError::New(env, "scanPaths, rootScanPaths and skipFolders are required").ThrowAsJavaScriptException();
+        return Napi::Array::New(env);
+    }
+
+    std::vector<std::wstring> scanPaths = NapiStringArrayToWideVector(env, info[0], "scanPaths");
+    std::vector<std::wstring> rootScanPaths = NapiStringArrayToWideVector(env, info[1], "rootScanPaths");
+    std::vector<std::wstring> skipFolders = NapiStringArrayToWideVector(env, info[2], "skipFolders");
+    for (auto& folder : skipFolders) {
+        folder = ToLowerWideString(folder);
+    }
+
+    std::vector<WindowsShortcutEntry> entries;
+    for (const auto& scanPath : scanPaths) {
+        ScanShortcutDirectory(scanPath, true, skipFolders, entries);
+    }
+    for (const auto& rootPath : rootScanPaths) {
+        ScanShortcutDirectory(rootPath, false, skipFolders, entries);
+    }
+    ResolveShortcutTargetsInParallel(entries);
+
+    Napi::Array result = Napi::Array::New(env, entries.size());
+    for (uint32_t i = 0; i < entries.size(); i++) {
+        const auto& entry = entries[i];
+        Napi::Object item = Napi::Object::New(env);
+        item.Set("name", Napi::String::New(env, WideToUtf8String(entry.name)));
+        item.Set("path", Napi::String::New(env, WideToUtf8String(entry.path)));
+        item.Set("icon", Napi::String::New(env, WideToUtf8String(entry.icon)));
+        if (!entry.targetPath.empty()) {
+            item.Set("targetPath", Napi::String::New(env, WideToUtf8String(entry.targetPath)));
+        }
+        item.Set("sourceType", Napi::String::New(env, WideToUtf8String(entry.sourceType)));
+        result.Set(i, item);
+    }
+
+    return result;
+}
 bool LooksLikeBrowserUrl(const std::wstring& value) {
     if (value.empty()) {
         return false;
@@ -5277,6 +5662,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
     exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
     exports.Set("resolveMuiStrings", Napi::Function::New(env, ResolveMuiStrings));
+    exports.Set("scanWindowsShortcuts", Napi::Function::New(env, ScanWindowsShortcuts));
     exports.Set("unicodeType", Napi::Function::New(env, UnicodeType));
     // 通过 COM IShellWindows 查询 Explorer 窗口的当前文件夹路径
     exports.Set("getExplorerFolderPath", Napi::Function::New(env, GetExplorerFolderPath));
