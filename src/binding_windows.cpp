@@ -5628,6 +5628,186 @@ Napi::Value ReadBrowserWindowUrl(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+bool ResolveExecutableFromPath(
+    const wchar_t* executable,
+    std::wstring& resolved,
+    DWORD& errorCode
+)
+{
+    DWORD pathSize = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+    if (pathSize == 0)
+    {
+        errorCode = GetLastError();
+        return false;
+    }
+
+    std::vector<wchar_t> pathBuffer(pathSize);
+    DWORD copied = GetEnvironmentVariableW(
+        L"PATH",
+        pathBuffer.data(),
+        static_cast<DWORD>(pathBuffer.size())
+    );
+    if (copied == 0 || copied > pathBuffer.size())
+    {
+        errorCode = copied == 0 ? GetLastError() : ERROR_BUFFER_OVERFLOW;
+        return false;
+    }
+
+    std::vector<wchar_t> resultBuffer(32768);
+    DWORD length = SearchPathW(
+        pathBuffer.data(),
+        executable,
+        nullptr,
+        static_cast<DWORD>(resultBuffer.size()),
+        resultBuffer.data(),
+        nullptr
+    );
+
+    if (length == 0 || length >= resultBuffer.size())
+    {
+        errorCode = length == 0
+                        ? GetLastError()
+                        : ERROR_INSUFFICIENT_BUFFER;
+        return false;
+    }
+
+    resolved.assign(resultBuffer.data(), length);
+    return true;
+}
+
+//创建CUI Shell
+Napi::Value LaunchCuiShell(const Napi::CallbackInfo& info)
+{
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 ||
+        !info[0].IsString() ||
+        !info[1].IsString())
+    {
+        Napi::TypeError::New(
+            env,
+            "shell and currentDirectory must be strings"
+        ).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string shell = info[0].As<Napi::String>().Utf8Value();
+    std::transform(
+        shell.begin(),
+        shell.end(),
+        shell.begin(),
+        [](unsigned char ch)
+        {
+            return static_cast<char>(std::tolower(ch));
+        }
+    );
+
+    const wchar_t* executable = nullptr;
+    std::wstring arguments;
+
+    if (shell == "powershell" || shell == "powershell.exe")
+    {
+        executable = L"powershell.exe";
+        arguments = L" -NoExit";
+    }
+    else if (shell == "cmd" || shell == "cmd.exe")
+    {
+        executable = L"cmd.exe";
+    }
+    else
+    {
+        Napi::TypeError::New(
+            env,
+            "shell must be powershell or cmd"
+        ).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::u16string directoryUtf16 =
+        info[1].As<Napi::String>().Utf16Value();
+
+    std::wstring currentDirectory(
+        directoryUtf16.begin(),
+        directoryUtf16.end()
+    );
+
+    std::replace(
+        currentDirectory.begin(),
+        currentDirectory.end(),
+        L'/',
+        L'\\'
+    );
+
+    DWORD attributes = GetFileAttributesW(currentDirectory.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        Napi::Error::New(
+            env,
+            "currentDirectory does not exist or is not a directory"
+        ).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::wstring applicationPath;
+    DWORD errorCode = ERROR_SUCCESS;
+
+    if (!ResolveExecutableFromPath(
+        executable,
+        applicationPath,
+        errorCode))
+    {
+        Napi::Error::New(
+            env,
+            "Executable was not found in PATH (Windows error " +
+            std::to_string(errorCode) + ")"
+        ).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::wstring commandLine =
+        L"\"" + applicationPath + L"\"" + arguments;
+
+    std::vector<wchar_t> commandBuffer(
+        commandLine.begin(),
+        commandLine.end()
+    );
+    commandBuffer.push_back(L'\0');
+
+    STARTUPINFOW startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+
+    PROCESS_INFORMATION processInfo{};
+
+    BOOL created = CreateProcessW(
+        applicationPath.c_str(),
+        commandBuffer.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+        nullptr,
+        currentDirectory.c_str(),
+        &startupInfo,
+        &processInfo
+    );
+
+    if (!created)
+    {
+        errorCode = GetLastError();
+        Napi::Error::New(
+            env,
+            "CreateProcessW failed (Windows error " +
+            std::to_string(errorCode) + ")"
+        ).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+
+    return Napi::Boolean::New(env, true);
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -5675,6 +5855,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     // 读取指定浏览器窗口的当前 URL
     exports.Set("readBrowserWindowUrl", Napi::Function::New(env, ReadBrowserWindowUrl));
     exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
+    exports.Set("launchCuiShell", Napi::Function::New(env, LaunchCuiShell));
     return exports;
 }
 
