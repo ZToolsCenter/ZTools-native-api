@@ -641,6 +641,13 @@ function getSelectedContent() {
   return addon.getSelectedContent();
 }
 
+function launchCuiShell(shell, currentDirectory) {
+  if (platform !== 'win32') {
+    throw new Error('launchShell is only supported on Windows');
+  }
+  return addon.launchCuiShell(shell, currentDirectory);
+}
+
 // 导出所有类
 module.exports = {
   ClipboardMonitor,
@@ -653,7 +660,8 @@ module.exports = {
   UwpManager,
   MuiResolver,
   WindowsShortcutScanner,
-  getSelectedContent
+  getSelectedContent,
+  launchCuiShell
 };
 
 // 为了向后兼容，默认导出 ClipboardMonitor
