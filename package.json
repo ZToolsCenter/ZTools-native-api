@@ -8,6 +8,7 @@
     "build:swift": "sh scripts/build-swift.sh",
     "clean": "node-gyp clean && node scripts/clean.js",
     "test": "node test/test-all.js",
+    "test:explorer-launch": "node test/test-explorer-launch.js",
     "install": "npm run build"
   },
   "keywords": [

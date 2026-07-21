@@ -20,10 +20,15 @@
 #include <condition_variable>
 #include <set>
 #include <sstream>
+#include <cmath>
 #include <shellapi.h>  // For DragQueryFile, SHGetFileInfoW
 #include <shlobj.h>    // For SHLoadIndirectString, IApplicationActivationManager
 #include <shobjidl.h>  // For IApplicationActivationManager
 #include <exdisp.h>    // For IShellWindows, IWebBrowserApp (COM Explorer 路径查询)
+#include <servprov.h>  // For IServiceProvider
+#include <shldisp.h>   // For IShellDispatch2, IShellFolderViewDual
+#include <shlguid.h>   // For SID_STopLevelBrowser
+#include <wrl/client.h>
 #include <uiautomation.h> // For browser URL reading via UI Automation
 #include <appmodel.h>  // For package APIs
 #include <shlwapi.h>   // For PathCombineW
@@ -5628,6 +5633,323 @@ Napi::Value ReadBrowserWindowUrl(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// ==================== 通过 Explorer 启动应用 ====================
+
+using Microsoft::WRL::ComPtr;
+
+struct ExplorerLaunchResult {
+    HRESULT hr;
+    const char* stage;
+};
+
+static void ClearShellExecuteVariants(
+    VARIANT* args,
+    VARIANT* directory,
+    VARIANT* operation,
+    VARIANT* show
+) {
+    VariantClear(args);
+    VariantClear(directory);
+    VariantClear(operation);
+    VariantClear(show);
+}
+
+static bool SetOptionalBstrVariant(VARIANT* value, const std::wstring& text) {
+    if (text.empty()) {
+        return true;
+    }
+
+    BSTR allocated = SysAllocStringLen(text.data(), static_cast<UINT>(text.size()));
+    if (!allocated) {
+        return false;
+    }
+
+    value->vt = VT_BSTR;
+    value->bstrVal = allocated;
+    return true;
+}
+
+static ExplorerLaunchResult RunShellExecuteViaExplorer(
+    const std::wstring& target,
+    const std::wstring& parameters,
+    const std::wstring& workingDirectory,
+    const std::wstring& verb,
+    long showCommand
+) {
+    ComPtr<IShellWindows> shellWindows;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ShellWindows,
+        nullptr,
+        CLSCTX_LOCAL_SERVER,
+        IID_PPV_ARGS(&shellWindows)
+    );
+    if (FAILED(hr)) {
+        return { hr, "create-shell-windows" };
+    }
+
+    VARIANT desktopLocation;
+    VARIANT emptyLocation;
+    VariantInit(&desktopLocation);
+    VariantInit(&emptyLocation);
+    desktopLocation.vt = VT_I4;
+    desktopLocation.lVal = CSIDL_DESKTOP;
+
+    long explorerHwnd = 0;
+    ComPtr<IDispatch> desktopDispatch;
+    hr = shellWindows->FindWindowSW(
+        &desktopLocation,
+        &emptyLocation,
+        SWC_DESKTOP,
+        &explorerHwnd,
+        SWFO_NEEDDISPATCH,
+        &desktopDispatch
+    );
+    if (hr == S_FALSE || !desktopDispatch) {
+        hr = FAILED(hr) ? hr : E_FAIL;
+    }
+    if (FAILED(hr)) {
+        return { hr, "find-desktop-shell" };
+    }
+
+    ComPtr<IServiceProvider> serviceProvider;
+    hr = desktopDispatch.As(&serviceProvider);
+    if (FAILED(hr)) {
+        return { hr, "query-service-provider" };
+    }
+
+    ComPtr<IShellBrowser> shellBrowser;
+    hr = serviceProvider->QueryService(
+        SID_STopLevelBrowser,
+        IID_PPV_ARGS(&shellBrowser)
+    );
+    if (FAILED(hr)) {
+        return { hr, "query-shell-browser" };
+    }
+
+    ComPtr<IShellView> shellView;
+    hr = shellBrowser->QueryActiveShellView(&shellView);
+    if (FAILED(hr)) {
+        return { hr, "query-shell-view" };
+    }
+
+    ComPtr<IDispatch> backgroundDispatch;
+    hr = shellView->GetItemObject(
+        SVGIO_BACKGROUND,
+        IID_PPV_ARGS(&backgroundDispatch)
+    );
+    if (FAILED(hr)) {
+        return { hr, "get-shell-background" };
+    }
+
+    ComPtr<IShellFolderViewDual> folderView;
+    hr = backgroundDispatch.As(&folderView);
+    if (FAILED(hr)) {
+        return { hr, "query-folder-view" };
+    }
+
+    ComPtr<IDispatch> applicationDispatch;
+    hr = folderView->get_Application(&applicationDispatch);
+    if (FAILED(hr)) {
+        return { hr, "get-shell-application" };
+    }
+
+    ComPtr<IShellDispatch2> shellDispatch;
+    hr = applicationDispatch.As(&shellDispatch);
+    if (FAILED(hr)) {
+        return { hr, "query-shell-dispatch" };
+    }
+
+    VARIANT args;
+    VARIANT directory;
+    VARIANT operation;
+    VARIANT show;
+    VariantInit(&args);
+    VariantInit(&directory);
+    VariantInit(&operation);
+    VariantInit(&show);
+
+    if (!SetOptionalBstrVariant(&args, parameters)) {
+        ClearShellExecuteVariants(&args, &directory, &operation, &show);
+        return { E_OUTOFMEMORY, "allocate-parameters" };
+    }
+    if (!SetOptionalBstrVariant(&directory, workingDirectory)) {
+        ClearShellExecuteVariants(&args, &directory, &operation, &show);
+        return { E_OUTOFMEMORY, "allocate-working-directory" };
+    }
+    if (!SetOptionalBstrVariant(&operation, verb)) {
+        ClearShellExecuteVariants(&args, &directory, &operation, &show);
+        return { E_OUTOFMEMORY, "allocate-verb" };
+    }
+
+    show.vt = VT_I4;
+    show.lVal = showCommand;
+
+    BSTR file = SysAllocStringLen(target.data(), static_cast<UINT>(target.size()));
+    if (!file) {
+        ClearShellExecuteVariants(&args, &directory, &operation, &show);
+        return { E_OUTOFMEMORY, "allocate-target" };
+    }
+
+    // Transfer the caller's foreground activation permission through the COM proxy.
+    CoAllowSetForegroundWindow(shellDispatch.Get(), nullptr);
+    hr = shellDispatch->ShellExecute(file, args, directory, operation, show);
+
+    SysFreeString(file);
+    ClearShellExecuteVariants(&args, &directory, &operation, &show);
+    return { hr, SUCCEEDED(hr) ? "completed" : "shell-execute" };
+}
+
+class ExplorerLaunchWorker : public Napi::AsyncWorker {
+public:
+    ExplorerLaunchWorker(
+        Napi::Env env,
+        Napi::Promise::Deferred deferred,
+        std::wstring target,
+        std::wstring parameters,
+        std::wstring workingDirectory,
+        std::wstring verb,
+        long showCommand
+    )
+        : Napi::AsyncWorker(env),
+          deferred_(deferred),
+          target_(std::move(target)),
+          parameters_(std::move(parameters)),
+          workingDirectory_(std::move(workingDirectory)),
+          verb_(std::move(verb)),
+          showCommand_(showCommand),
+          result_({ E_UNEXPECTED, "not-started" }) {}
+
+    void Execute() override {
+        HRESULT initHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const bool needUninitialize = initHr == S_OK || initHr == S_FALSE;
+        if (FAILED(initHr)) {
+            result_ = { initHr, "initialize-com" };
+            return;
+        }
+
+        result_ = RunShellExecuteViaExplorer(
+            target_,
+            parameters_,
+            workingDirectory_,
+            verb_,
+            showCommand_
+        );
+
+        if (needUninitialize) {
+            CoUninitialize();
+        }
+    }
+
+    void OnOK() override {
+        Napi::Object result = Napi::Object::New(Env());
+        result.Set("success", Napi::Boolean::New(Env(), SUCCEEDED(result_.hr)));
+        result.Set(
+            "hresult",
+            Napi::Number::New(Env(), static_cast<double>(static_cast<uint32_t>(result_.hr)))
+        );
+        result.Set("stage", Napi::String::New(Env(), result_.stage));
+        deferred_.Resolve(result);
+    }
+
+    void OnError(const Napi::Error& error) override {
+        deferred_.Reject(error.Value());
+    }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    std::wstring target_;
+    std::wstring parameters_;
+    std::wstring workingDirectory_;
+    std::wstring verb_;
+    long showCommand_;
+    ExplorerLaunchResult result_;
+};
+
+static bool ReadOptionalWideString(
+    Napi::Env env,
+    const Napi::Object& options,
+    const char* name,
+    std::wstring* output
+) {
+    Napi::Value value = options.Get(name);
+    if (value.IsUndefined() || value.IsNull()) {
+        return true;
+    }
+    if (!value.IsString()) {
+        Napi::TypeError::New(env, std::string(name) + " must be a string")
+            .ThrowAsJavaScriptException();
+        return false;
+    }
+
+    *output = Utf8ToWideString(value.As<Napi::String>().Utf8Value());
+    return true;
+}
+
+Napi::Value LaunchViaExplorer(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject() || info[0].IsArray()) {
+        Napi::TypeError::New(env, "options must be an object").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object options = info[0].As<Napi::Object>();
+    Napi::Value targetValue = options.Get("target");
+    if (!targetValue.IsString()) {
+        Napi::TypeError::New(env, "target must be a non-empty string")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::wstring target = Utf8ToWideString(targetValue.As<Napi::String>().Utf8Value());
+    if (target.empty()) {
+        Napi::TypeError::New(env, "target must be a non-empty string")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::wstring parameters;
+    std::wstring workingDirectory;
+    std::wstring verb;
+    if (!ReadOptionalWideString(env, options, "parameters", &parameters) ||
+        !ReadOptionalWideString(env, options, "workingDirectory", &workingDirectory) ||
+        !ReadOptionalWideString(env, options, "verb", &verb)) {
+        return env.Undefined();
+    }
+
+    long showCommand = SW_SHOWNORMAL;
+    Napi::Value showValue = options.Get("showCommand");
+    if (!showValue.IsUndefined() && !showValue.IsNull()) {
+        if (!showValue.IsNumber()) {
+            Napi::TypeError::New(env, "showCommand must be an integer between 0 and 11")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        double numericShowCommand = showValue.As<Napi::Number>().DoubleValue();
+        if (!std::isfinite(numericShowCommand) ||
+            std::floor(numericShowCommand) != numericShowCommand ||
+            numericShowCommand < SW_HIDE ||
+            numericShowCommand > SW_FORCEMINIMIZE) {
+            Napi::RangeError::New(env, "showCommand must be an integer between 0 and 11")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        showCommand = static_cast<long>(numericShowCommand);
+    }
+
+    auto deferred = Napi::Promise::Deferred::New(env);
+    auto* worker = new ExplorerLaunchWorker(
+        env,
+        deferred,
+        std::move(target),
+        std::move(parameters),
+        std::move(workingDirectory),
+        std::move(verb),
+        showCommand
+    );
+    worker->Queue();
+    return deferred.Promise();
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -5674,6 +5996,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("isFileLocationWindow", Napi::Function::New(env, IsFileLocationWindowBinding));
     // 读取指定浏览器窗口的当前 URL
     exports.Set("readBrowserWindowUrl", Napi::Function::New(env, ReadBrowserWindowUrl));
+    exports.Set("launchViaExplorer", Napi::Function::New(env, LaunchViaExplorer));
     exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
     return exports;
 }
