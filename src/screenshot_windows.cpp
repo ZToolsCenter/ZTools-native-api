@@ -47,6 +47,10 @@ static HWND g_screenshotOverlayWindow = NULL;
 static std::atomic<bool> g_isCapturing(false);
 static napi_threadsafe_function g_screenshotTsfn = nullptr;
 static std::thread g_screenshotThread;
+// 自动确认模式：选区完成后直接出图，跳过编辑态（工具栏/标注）。
+// 由 startRegionCaptureWithPrimedFrame 的 options.autoConfirm 设置，
+// 会话开始时拷贝进 CaptureContext 供窗口过程读取。
+static std::atomic<bool> g_autoConfirm(false);
 static const auto SC_PRIMED_FRAME_TTL = std::chrono::milliseconds(500);
 
 struct PrimedScreenshotFrame {
@@ -1004,6 +1008,9 @@ static void DrawPopup(HDC hdc, const RECT& popupRect,
 // 截图上下文
 struct CaptureContext {
     CaptureState state;
+    // 自动确认模式：选区确定后直接提取并完成截图，不进入编辑态（工具栏/标注）。
+    // 仅在 WM_LBUTTONUP 的 CS_Selecting 分支生效。
+    bool autoConfirm;
     int virtualX, virtualY, virtualW, virtualH;
     int startX, startY, endX, endY;
     int mouseX, mouseY;
@@ -5341,6 +5348,19 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
 
             // 进入确认态（可调整/拖动/工具栏），而非直接完成
             EnterConfirmed(ctx, finalRect);
+            // 自动确认模式：跳过编辑态，直接提取选区并完成截图
+            if (ctx->autoConfirm) {
+                ScreenshotResult* result = ExtractRegionResult(ctx->memDC, finalRect,
+                    ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations);
+                if (g_screenshotTsfn != nullptr) {
+                    napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+                } else {
+                    delete result;
+                }
+                ctx->state = CS_Done;
+                DestroyWindow(hwnd);
+                return 0;
+            }
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (ctx->state == CS_Resizing) {
             // resize 结束：从按下快照和最终鼠标位置重算，并只沿活动端当前所在侧补足最小尺寸。
@@ -5826,6 +5846,7 @@ static void ScreenshotCaptureThread() {
     // 初始化上下文
     CaptureContext ctx = {};
     ctx.state = CS_Idle;
+    ctx.autoConfirm = g_autoConfirm.load();
     ctx.virtualX = vx; ctx.virtualY = vy;
     ctx.virtualW = vw; ctx.virtualH = vh;
     ctx.startX = 0; ctx.startY = 0;
@@ -6053,23 +6074,39 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
-    // 可选的回调函数
-    if (info.Length() > 0 && info[0].IsFunction()) {
-        Napi::Function callback = info[0].As<Napi::Function>();
-        napi_value resource_name;
-        napi_create_string_utf8(env, "ScreenshotCallback", NAPI_AUTO_LENGTH, &resource_name);
+    // 解析可选参数（顺序无关，便于后续扩展）：
+    //   - 回调函数：截图完成后回调
+    //   - 选项对象：目前支持 { autoConfirm: boolean }
+    //              默认 autoConfirm=true，选区确定后直接出图，跳过编辑态；
+    //              传 false 才进入编辑态（工具栏/标注）
+    bool autoConfirm = true;
+    for (int i = 0; i < (int)info.Length(); i++) {
+        if (info[i].IsFunction()) {
+            Napi::Function callback = info[i].As<Napi::Function>();
+            napi_value resource_name;
+            napi_create_string_utf8(env, "ScreenshotCallback", NAPI_AUTO_LENGTH, &resource_name);
 
-        napi_status status = napi_create_threadsafe_function(
-            env, callback, nullptr, resource_name,
-            0, 1, nullptr, nullptr, nullptr,
-            CallScreenshotJs, &g_screenshotTsfn
-        );
+            napi_status status = napi_create_threadsafe_function(
+                env, callback, nullptr, resource_name,
+                0, 1, nullptr, nullptr, nullptr,
+                CallScreenshotJs, &g_screenshotTsfn
+            );
 
-        if (status != napi_ok) {
-            Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
-            return env.Undefined();
+            if (status != napi_ok) {
+                Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+        } else if (info[i].IsObject()) {
+            Napi::Object opts = info[i].As<Napi::Object>();
+            if (opts.Has("autoConfirm")) {
+                Napi::Value v = opts.Get("autoConfirm");
+                if (v.IsBoolean()) {
+                    autoConfirm = v.As<Napi::Boolean>().Value();
+                }
+            }
         }
     }
+    g_autoConfirm = autoConfirm;
 
     g_isCapturing = true;
 
