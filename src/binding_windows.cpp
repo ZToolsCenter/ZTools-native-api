@@ -5948,6 +5948,8 @@ Napi::Value LaunchViaExplorer(const Napi::CallbackInfo& info) {
     );
     worker->Queue();
     return deferred.Promise();
+}
+
 bool ResolveExecutableFromPath(
     const wchar_t* executable,
     std::wstring& resolved,
