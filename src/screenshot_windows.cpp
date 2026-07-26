@@ -47,6 +47,10 @@ static HWND g_screenshotOverlayWindow = NULL;
 static std::atomic<bool> g_isCapturing(false);
 static napi_threadsafe_function g_screenshotTsfn = nullptr;
 static std::thread g_screenshotThread;
+// 自动确认模式：选区完成后直接出图，跳过编辑态（工具栏/标注）。
+// 由 startRegionCaptureWithPrimedFrame 的 options.autoConfirm 设置，
+// 会话开始时拷贝进 CaptureContext 供窗口过程读取。
+static std::atomic<bool> g_autoConfirm(false);
 static const auto SC_PRIMED_FRAME_TTL = std::chrono::milliseconds(500);
 
 struct PrimedScreenshotFrame {
@@ -1004,6 +1008,9 @@ static void DrawPopup(HDC hdc, const RECT& popupRect,
 // 截图上下文
 struct CaptureContext {
     CaptureState state;
+    // 自动确认模式：选区确定后直接提取并完成截图，不进入编辑态（工具栏/标注）。
+    // 仅在 WM_LBUTTONUP 的 CS_Selecting 分支生效。
+    bool autoConfirm;
     int virtualX, virtualY, virtualW, virtualH;
     int startX, startY, endX, endY;
     int mouseX, mouseY;
@@ -2260,73 +2267,91 @@ static void DrawOneAnnotation(Gdiplus::Graphics& graphics, const Annotation& a,
 }
 
 // ==================== 马赛克渲染 ====================
-// 马赛克原理：从原始屏幕位图（srcDC = memDC，物理像素）取目标区域，按 mosaicSize 分块，
-// 每块用「缩小到 1 像素再放大」得到平均色块（StretchBlt 降采样），形成马赛克效果。
+// 马赛克原理：将原始屏幕位图（srcDC = memDC，物理像素）一次缩小到按 blockPx
+// 计算的低分辨率位图，再以最近邻一次放大到目标 DC，避免逐块执行大量 GDI 调用。
 // 目标 DC（targetDC）为逻辑像素（backDC / finalDC），源 DC（srcDC）为物理像素（memDC），
 // 二者通过 dpiScale 换算：srcX = (absX - virtualX) * dpiScale。
 
-// 对单个矩形区域做马赛克化并绘制到 targetDC。
-// dstX0/dstY0/dstW/dstH：目标逻辑像素矩形（已应用偏移到 targetDC 局部坐标）；
-// srcAbsX0/srcAbsY0：该矩形左上角的绝对虚拟屏幕坐标（用于在 memDC 取源像素）；
-// blockPx：马赛克块大小（逻辑像素）；srcDC/virtualX/virtualY/dpiScale：源参数。
-static void MosaicBlitRect(HDC targetDC, HDC srcDC,
+// 对单个矩形区域批量生成马赛克并绘制到 targetDC。
+// dstX0/dstY0/dstW/dstH 是目标逻辑像素矩形；srcAbsX0/srcAbsY0 是其在虚拟屏幕中的
+// 绝对逻辑坐标。低分辨率尺寸按 blockPx 向上取整，右/下不足整块的边缘由最后一格覆盖。
+// 返回 true 表示缩小和最近邻放大均成功；失败时不修改缓存有效性，调用方可跳过揭示。
+static bool MosaicBlitRect(HDC targetDC, HDC srcDC,
                            int dstX0, int dstY0, int dstW, int dstH,
                            int srcAbsX0, int srcAbsY0,
                            int blockPx, int virtualX, int virtualY, double dpiScale) {
-    if (dstW <= 0 || dstH <= 0 || blockPx < 1) return;
-
-    // 临时 1x1 DC：用作缩小缓冲（取块平均色）
-    HDC screenDC = GetDC(NULL);
-    if (!screenDC) return;
-    HDC onePxDC = CreateCompatibleDC(screenDC);
-    HBITMAP onePxBmp = CreateCompatibleBitmap(screenDC, 1, 1);
-    HGDIOBJ oldOne = SelectObject(onePxDC, onePxBmp);
-    ReleaseDC(NULL, screenDC);
-
-    SetStretchBltMode(onePxDC, HALFTONE);
-    SetBrushOrgEx(onePxDC, 0, 0, NULL);
-    int oldTargetMode = GetStretchBltMode(targetDC);
-    SetStretchBltMode(targetDC, COLORONCOLOR);  // 放大时取最近邻，保持块色纯净
-
-    // 按块遍历（逻辑像素步进）
-    for (int by = 0; by < dstH; by += blockPx) {
-        for (int bx = 0; bx < dstW; bx += blockPx) {
-            int dstBlockX = dstX0 + bx;
-            int dstBlockY = dstY0 + by;
-            int bw = (std::min)(blockPx, dstW - bx);
-            int bh = (std::min)(blockPx, dstH - by);
-
-            // 源像素坐标（物理）
-            int srcAbsX = srcAbsX0 + bx;
-            int srcAbsY = srcAbsY0 + by;
-            int sx = (int)((srcAbsX - virtualX) * dpiScale + 0.5);
-            int sy = (int)((srcAbsY - virtualY) * dpiScale + 0.5);
-            int sw = (int)(bw * dpiScale + 0.5);
-            int sh = (int)(bh * dpiScale + 0.5);
-            if (sw < 1) sw = 1;
-            if (sh < 1) sh = 1;
-
-            // 缩小到 1px（取整块平均色）
-            if (StretchBlt(onePxDC, 0, 0, 1, 1, srcDC, sx, sy, sw, sh, SRCCOPY)) {
-                // 放大回目标块
-                StretchBlt(targetDC, dstBlockX, dstBlockY, bw, bh,
-                           onePxDC, 0, 0, 1, 1, SRCCOPY);
-            }
-        }
+    if (!targetDC || !srcDC || dstW <= 0 || dstH <= 0 || blockPx < 1 || dpiScale <= 0) {
+        return false;
     }
-    SetStretchBltMode(targetDC, oldTargetMode);
 
-    SelectObject(onePxDC, oldOne);
-    DeleteObject(onePxBmp);
-    DeleteDC(onePxDC);
+    // 每个低分辨率像素对应约一个 blockPx 逻辑像素块；向上取整覆盖非整块边缘。
+    int reducedW = (dstW + blockPx - 1) / blockPx;
+    int reducedH = (dstH + blockPx - 1) / blockPx;
+    if (reducedW <= 0 || reducedH <= 0) return false;
+
+    // 源位图是物理像素，目标与马赛克块大小是逻辑像素，统一在这里完成坐标换算。
+    int srcX = (int)((srcAbsX0 - virtualX) * dpiScale + 0.5);
+    int srcY = (int)((srcAbsY0 - virtualY) * dpiScale + 0.5);
+    int srcW = (int)(dstW * dpiScale + 0.5);
+    int srcH = (int)(dstH * dpiScale + 0.5);
+    if (srcW < 1) srcW = 1;
+    if (srcH < 1) srcH = 1;
+
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return false;
+    HDC reducedDC = CreateCompatibleDC(screenDC);
+    HBITMAP reducedBmp = reducedDC
+        ? CreateCompatibleBitmap(screenDC, reducedW, reducedH)
+        : NULL;
+    ReleaseDC(NULL, screenDC);
+    if (!reducedDC || !reducedBmp) {
+        if (reducedBmp) DeleteObject(reducedBmp);
+        if (reducedDC) DeleteDC(reducedDC);
+        return false;
+    }
+
+    HGDIOBJ oldReducedBmp = SelectObject(reducedDC, reducedBmp);
+    if (!oldReducedBmp || oldReducedBmp == HGDI_ERROR) {
+        DeleteObject(reducedBmp);
+        DeleteDC(reducedDC);
+        return false;
+    }
+
+    // 第一次 StretchBlt：以 HALFTONE 将整个源区域压缩到低分辨率马赛克采样图。
+    int oldReducedMode = GetStretchBltMode(reducedDC);
+    POINT oldBrushOrigin = {0, 0};
+    bool reducedModeReady = oldReducedMode != 0
+        && SetStretchBltMode(reducedDC, HALFTONE) != 0
+        && SetBrushOrgEx(reducedDC, 0, 0, &oldBrushOrigin);
+    bool reducedOk = reducedModeReady
+        && StretchBlt(reducedDC, 0, 0, reducedW, reducedH,
+                      srcDC, srcX, srcY, srcW, srcH, SRCCOPY);
+    if (reducedModeReady) {
+        SetBrushOrgEx(reducedDC, oldBrushOrigin.x, oldBrushOrigin.y, NULL);
+    }
+    if (oldReducedMode != 0) SetStretchBltMode(reducedDC, oldReducedMode);
+
+    // 第二次 StretchBlt：最近邻放大，保持每个低分辨率采样点为纯色块。
+    int oldTargetMode = GetStretchBltMode(targetDC);
+    bool targetModeReady = reducedOk && oldTargetMode != 0
+        && SetStretchBltMode(targetDC, COLORONCOLOR) != 0;
+    bool expandedOk = targetModeReady
+        && StretchBlt(targetDC, dstX0, dstY0, dstW, dstH,
+                      reducedDC, 0, 0, reducedW, reducedH, SRCCOPY);
+    if (oldTargetMode != 0) SetStretchBltMode(targetDC, oldTargetMode);
+
+    SelectObject(reducedDC, oldReducedBmp);
+    DeleteObject(reducedBmp);
+    DeleteDC(reducedDC);
+    return reducedOk && expandedOk;
 }
 
 
 // ==================== 马赛克渲染（reveal-mask 模型） ====================
-// 核心：预先把整张选区按当前块大小做一次完整马赛克化得到 mosaicBase（逻辑像素）。
-// 马赛克标注只是「蒙版」——涂抹=路径圆形区域、框选=矩形区域——揭示其背后的 mosaicBase。
-// 任意区域、任意顺序叠加都连续无缝；切换块大小只需重建 base，已揭示区域自动更新。
-// 不再对每个标注单独像素化，故无「松开后再处理一遍」的不连续感。
+// 核心：仅在存在已提交马赛克或正在绘制马赛克时，才把整张虚拟屏幕按当前块大小
+// 生成 mosaicBase。马赛克标注只是「蒙版」——涂抹=路径圆形区域、框选=矩形区域——
+// 揭示其背后的 mosaicBase。任意区域、任意顺序叠加都连续无缝；切换块大小时延迟到
+// 下一次实际需要马赛克的绘制再重建，避免普通截图确认态承担无用的整屏预处理。
 
 // 释放马赛克 base 资源
 static void FreeMosaicBase(CaptureContext* ctx) {
@@ -2415,42 +2440,67 @@ static void FreeMosaicBrushCursors(CaptureContext* ctx) {
     ctx->mosaicBrushCursorsInited = false;
 }
 
-// 生成马赛克 base：把整张虚拟屏幕原始底图按 blockPx 马赛克化，存为离屏位图。
-// base 用绝对（虚拟屏幕）坐标、尺寸 = virtualW×virtualH（与 backDC 一致），与选区无关。
-// 这样选区 resize/move 时 base 无需重建（标注蒙版用绝对坐标，任意选区下都正确对位），
-// 仅在块大小变化或初次生成时重建。代价是占一份全屏位图内存（与 backDC/memDC 同级）。
-static void RebuildMosaicBase(CaptureContext* ctx) {
+// 生成会话级马赛克底图：将整个虚拟屏幕批量缩小后最近邻放大到离屏位图。
+// 缓存坐标与 backDC 一致（原点 = 虚拟屏幕左上角），尺寸 = virtualW×virtualH，
+// 与选区无关：选区移动/缩放不需要重建，仅在虚拟屏幕尺寸或块大小变化时重建。
+// 先在临时 GDI 对象中完整生成，成功后再替换旧缓存；失败会保留“无有效缓存”状态。
+static bool RebuildMosaicBase(CaptureContext* ctx) {
     int w = ctx->virtualW;
     int h = ctx->virtualH;
-    if (w <= 0 || h <= 0) { FreeMosaicBase(ctx); return; }
+    if (w <= 0 || h <= 0) {
+        FreeMosaicBase(ctx);
+        return false;
+    }
 
     int blockPx = SC_MOSAIC_SIZES[ctx->mosaicSizeIdx];
     if (blockPx < 2) blockPx = 2;
 
-    // 尺寸/块大小变化才重建位图
-    if (w != ctx->mosaicBaseW || h != ctx->mosaicBaseH
-        || blockPx != ctx->mosaicBaseBlockPx || !ctx->mosaicBaseDC) {
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) {
         FreeMosaicBase(ctx);
-        HDC screenDC = GetDC(NULL);
-        if (!screenDC) return;
-        ctx->mosaicBaseDC = CreateCompatibleDC(screenDC);
-        ctx->mosaicBaseBitmap = CreateCompatibleBitmap(screenDC, w, h);
-        ReleaseDC(NULL, screenDC);
-        if (!ctx->mosaicBaseDC || !ctx->mosaicBaseBitmap) { FreeMosaicBase(ctx); return; }
-        SelectObject(ctx->mosaicBaseDC, ctx->mosaicBaseBitmap);
-        ctx->mosaicBaseW = w;
-        ctx->mosaicBaseH = h;
-        ctx->mosaicBaseBlockPx = blockPx;
+        return false;
+    }
+    HDC newDC = CreateCompatibleDC(screenDC);
+    HBITMAP newBitmap = newDC ? CreateCompatibleBitmap(screenDC, w, h) : NULL;
+    ReleaseDC(NULL, screenDC);
+    if (!newDC || !newBitmap) {
+        if (newBitmap) DeleteObject(newBitmap);
+        if (newDC) DeleteDC(newDC);
+        FreeMosaicBase(ctx);
+        return false;
+    }
+
+    HGDIOBJ oldNewBitmap = SelectObject(newDC, newBitmap);
+    if (!oldNewBitmap || oldNewBitmap == HGDI_ERROR) {
+        DeleteObject(newBitmap);
+        DeleteDC(newDC);
+        FreeMosaicBase(ctx);
+        return false;
     }
 
     // 整虚拟屏幕按 blockPx 马赛克化：base 原点 = 虚拟屏幕左上角，源绝对坐标 = virtualX/virtualY。
-    MosaicBlitRect(ctx->mosaicBaseDC, ctx->memDC, 0, 0, w, h,
-                   ctx->virtualX, ctx->virtualY, blockPx,
-                   ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+    bool generated = MosaicBlitRect(newDC, ctx->memDC, 0, 0, w, h,
+                                    ctx->virtualX, ctx->virtualY, blockPx,
+                                    ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+    if (!generated) {
+        SelectObject(newDC, oldNewBitmap);
+        DeleteObject(newBitmap);
+        DeleteDC(newDC);
+        FreeMosaicBase(ctx);
+        return false;
+    }
+
+    FreeMosaicBase(ctx);
+    ctx->mosaicBaseDC = newDC;
+    ctx->mosaicBaseBitmap = newBitmap;
+    ctx->mosaicBaseW = w;
+    ctx->mosaicBaseH = h;
+    ctx->mosaicBaseBlockPx = blockPx;
+    return true;
 }
 
-// 检查 base 是否需要重建（仅块大小变化 / 未生成）。
-// base 覆盖整屏且用绝对坐标，选区变化不影响 base，故 resize/move 无需重建。
+// 判断现有马赛克缓存是否缺失，或尺寸/块大小已与当前会话不一致。
+// 此函数只检查缓存键；调用方必须先通过 HasMosaicToRender 确认当前帧确实需要马赛克。
 static bool MosaicBaseNeedsRebuild(const CaptureContext* ctx) {
     int blockPx = SC_MOSAIC_SIZES[ctx->mosaicSizeIdx];
     if (blockPx < 2) blockPx = 2;
@@ -2467,8 +2517,9 @@ static bool HasMosaicToRender(const std::vector<Annotation>& annotations, const 
     return false;
 }
 
-// 把单条马赛克标注对应的「蒙版区域」构建为 HRGN（选区相对坐标）。
-// ox/oy：绝对坐标 → 目标局部坐标的偏移（= -sel.left/-sel.top，因为 base/overlay 都是选区相对）。
+// 把单条马赛克标注对应的蒙版构建为目标 DC 局部坐标下的 HRGN。
+// ox/oy 将标注的绝对屏幕坐标转换到目标坐标系：覆盖层使用 -virtualX/-virtualY，
+// 导出位图使用 -selection.left/-selection.top。
 static HRGN BuildMosaicMaskRegion(const Annotation& a, float ox, float oy) {
     if (a.mosaicRect) {
         int absL = (std::min)(a.x1, a.x2);
@@ -2522,14 +2573,21 @@ static HRGN BuildMosaicMaskRegion(const Annotation& a, float ox, float oy) {
 }
 
 // 揭示马赛克：把 mosaicBase 中由 masks（已提交标注）+ curDrawing（正在绘制）覆盖的区域
-// BitBlt 到 targetDC（覆盖层 backDC）。
-// 全屏 base 用虚拟屏幕绝对坐标（原点=虚拟左上角，与 backDC 同坐标系），
-// 故 base 与 targetDC 1:1 对应，蒙版用绝对坐标（ox/oy=0）直接作为裁剪区，BitBlt 同位置拷贝。
-// ox/oy：标注坐标 → 目标局部坐标偏移（覆盖层=0；导出 finalDC 时=-rect.left/-rect.top）。
+// BitBlt 到 targetDC。mosaicBase 与 targetDC 使用相同的目标坐标系：覆盖层以虚拟屏幕
+// 左上角为原点，导出位图以截图选区左上角为原点。
+// contentBounds 是目标 DC 中允许显示马赛克的内容矩形；最终蒙版会与其求交，确保笔刷半径
+// 或历史标注不会越过截图选区。ox/oy 用于把标注绝对坐标换算到目标局部坐标。
 static void RevealMosaicToTarget(HDC targetDC, HDC mosaicBase,
                                  const std::vector<Annotation>& annotations,
                                  const Annotation* curDrawing,
+                                 const RECT& contentBounds,
                                  float ox, float oy) {
+    if (!targetDC || !mosaicBase
+        || contentBounds.right <= contentBounds.left
+        || contentBounds.bottom <= contentBounds.top) {
+        return;
+    }
+
     // 合并所有马赛克标注的蒙版区域（目标局部坐标）
     HRGN mask = CreateRectRgn(0, 0, 0, 0);
     bool any = false;
@@ -2547,14 +2605,22 @@ static void RevealMosaicToTarget(HDC targetDC, HDC mosaicBase,
         any = true;
     }
     if (any) {
-        // 用 SaveDC 保护调用方的裁剪区（P1 局部帧时为 dirtyRect）：
-        // 此处设置 mask 裁剪区做马赛克揭示 BitBlt，结束后 RestoreDC 恢复，
-        // 避免清除调用方的 dirtyRect 裁剪区导致后续绘制越界。
+        // 先把马赛克蒙版裁到截图内容矩形，再与调用方已有的 dirtyRect 裁剪区求交。
+        // contentBounds 采用半开区间；因此边框所在的矩形外沿不会被马赛克写入。
+        HRGN contentRgn = CreateRectRgn(contentBounds.left, contentBounds.top,
+                                        contentBounds.right, contentBounds.bottom);
+        CombineRgn(mask, mask, contentRgn, RGN_AND);
+        DeleteObject(contentRgn);
+
+        // 用 SaveDC 保护调用方的裁剪区（P1 局部帧时为 dirtyRect），揭示结束后完整恢复。
         int saved = SaveDC(targetDC);
-        // mask 与现有裁剪区（dirtyRect）求交，揭示只发生在 dirtyRect∩蒙版 区域
+        // mask 与现有裁剪区（dirtyRect）求交，揭示只发生在 dirtyRect∩选区∩蒙版。
         ExtSelectClipRgn(targetDC, mask, RGN_AND);
-        // base 与 targetDC 同坐标系，1:1 拷贝
-        BitBlt(targetDC, 0, 0, 0x7FFF, 0x7FFF, mosaicBase, 0, 0, SRCCOPY);
+        // base 与 targetDC 同坐标系，1:1 拷贝。
+        BitBlt(targetDC, contentBounds.left, contentBounds.top,
+               contentBounds.right - contentBounds.left,
+               contentBounds.bottom - contentBounds.top,
+               mosaicBase, contentBounds.left, contentBounds.top, SRCCOPY);
         if (saved) RestoreDC(targetDC, saved);
     }
     DeleteObject(mask);
@@ -2602,11 +2668,7 @@ static void CompositeAnnotations(HDC finalDC, HDC srcDC,
     if (annotations.empty()) return;
 
     // 马赛克先渲染到底图上，后续矢量/文字标注保持清晰覆盖在其上方。
-    bool hasMosaic = false;
-    for (const Annotation& a : annotations) {
-        if (a.type == AT_Mosaic) { hasMosaic = true; break; }
-    }
-    if (hasMosaic) {
+    if (HasMosaicToRender(annotations, nullptr)) {
         int blockPx = mosaicBlockPx;
         if (blockPx < 2) blockPx = 2;
         int w = rect.right - rect.left;
@@ -2614,17 +2676,24 @@ static void CompositeAnnotations(HDC finalDC, HDC srcDC,
         HDC screenDC = GetDC(NULL);
         if (screenDC) {
             HDC baseDC = CreateCompatibleDC(screenDC);
-            HBITMAP baseBmp = CreateCompatibleBitmap(screenDC, w, h);
-            HGDIOBJ oldBase = SelectObject(baseDC, baseBmp);
-            MosaicBlitRect(baseDC, srcDC, 0, 0, w, h,
-                           rect.left, rect.top, blockPx, virtualX, virtualY, dpiScale);
-            // 揭示蒙版区域（finalDC 原点 = 选区左上角，base 同为选区相对，ox=-rect.left）
-            float ox = (float)-rect.left;
-            float oy = (float)-rect.top;
-            RevealMosaicToTarget(finalDC, baseDC, annotations, nullptr, ox, oy);
-            SelectObject(baseDC, oldBase);
-            DeleteObject(baseBmp);
-            DeleteDC(baseDC);
+            HBITMAP baseBmp = baseDC ? CreateCompatibleBitmap(screenDC, w, h) : NULL;
+            if (baseDC && baseBmp) {
+                HGDIOBJ oldBase = SelectObject(baseDC, baseBmp);
+                bool generated = oldBase && oldBase != HGDI_ERROR
+                    && MosaicBlitRect(baseDC, srcDC, 0, 0, w, h,
+                                      rect.left, rect.top, blockPx,
+                                      virtualX, virtualY, dpiScale);
+                if (generated) {
+                    // 揭示蒙版区域（finalDC 原点 = 选区左上角，base 同为选区相对，ox=-rect.left）
+                    float ox = (float)-rect.left;
+                    float oy = (float)-rect.top;
+                    RevealMosaicToTarget(finalDC, baseDC, annotations, nullptr,
+                                         RECT{0, 0, w, h}, ox, oy);
+                }
+                if (oldBase && oldBase != HGDI_ERROR) SelectObject(baseDC, oldBase);
+            }
+            if (baseBmp) DeleteObject(baseBmp);
+            if (baseDC) DeleteDC(baseDC);
             ReleaseDC(NULL, screenDC);
         }
     }
@@ -3045,6 +3114,87 @@ static bool CalcAnnotationsBounds(std::vector<Annotation>& anns, RECT& out, HDC 
     out.right = maxR;
     out.bottom = maxB;
     return true;
+}
+
+// 约束单轴 resize 的活动端坐标，固定端始终保持按下时的位置。
+// rawActive/originalActive 分别是当前候选值和按下时的活动端；screenMin/screenMax 是
+// 虚拟屏幕在该轴上的绝对边界。已有标注时优先保证内容不被裁掉；松开时可按活动端
+// 当前所在侧补足最小尺寸，整个过程只移动活动端，因此穿越后不会带动固定端漂移。
+static int ConstrainResizeActiveCoordinate(int rawActive, int originalActive, int fixed,
+                                           int screenMin, int screenMax,
+                                           bool hasContent, int contentMin, int contentMax,
+                                           bool enforceMinSize) {
+    int active = (std::max)(screenMin, (std::min)(rawActive, screenMax));
+
+    if (hasContent) {
+        if (fixed <= contentMin) {
+            // 内容位于固定端高侧：活动端必须覆盖内容高边，不能穿越后把内容留在选区外。
+            active = (std::max)(active, contentMax);
+        } else if (fixed >= contentMax) {
+            // 内容位于固定端低侧：活动端必须覆盖内容低边。
+            active = (std::min)(active, contentMin);
+        } else {
+            // 固定端落在内容内部时不存在可完整覆盖内容的单侧区间，保留按下时活动端。
+            active = originalActive;
+        }
+        active = (std::max)(screenMin, (std::min)(active, screenMax));
+    }
+
+    if (enforceMinSize) {
+        // 活动端恰好落在固定端时沿按下时的方向补足，避免释放后方向不确定。
+        bool onLowSide = active < fixed || (active == fixed && originalActive < fixed);
+        if (onLowSide) {
+            active = (std::min)(active, fixed - SC_MIN_SELECTION);
+        } else {
+            active = (std::max)(active, fixed + SC_MIN_SELECTION);
+        }
+        // 固定端靠近虚拟屏幕边缘时，目标侧可能不足最小尺寸；此时边界优先且固定端不动。
+        active = (std::max)(screenMin, (std::min)(active, screenMax));
+    }
+
+    return active;
+}
+
+// 从鼠标按下时的选区快照计算本帧 resize 结果（绝对虚拟屏幕坐标）。
+// 每个活动轴都只更新对应手柄端，固定边/固定对角点始终取 startSelection；活动端可穿过
+// 固定端，最后仅为绘制和导出调用一次 NormalizeRect。contentBounds 在 hasContent=true 时
+// 限制活动端以保留已有标注；enforceMinSize 仅用于松开时沿最终方向补足最小尺寸。
+static RECT ResizeSelectionFromHandle(const RECT& startSelection, int handle, int dx, int dy,
+                                      const RECT& virtualBounds,
+                                      bool hasContent, const RECT& contentBounds,
+                                      bool enforceMinSize) {
+    RECT resized = startSelection;
+
+    bool movesLeft = handle == RH_Left || handle == RH_TopLeft || handle == RH_BottomLeft;
+    bool movesRight = handle == RH_Right || handle == RH_TopRight || handle == RH_BottomRight;
+    bool movesTop = handle == RH_Top || handle == RH_TopLeft || handle == RH_TopRight;
+    bool movesBottom = handle == RH_Bottom || handle == RH_BottomLeft || handle == RH_BottomRight;
+
+    if (movesLeft) {
+        resized.left = ConstrainResizeActiveCoordinate(
+            startSelection.left + dx, startSelection.left, startSelection.right,
+            virtualBounds.left, virtualBounds.right,
+            hasContent, contentBounds.left, contentBounds.right, enforceMinSize);
+    } else if (movesRight) {
+        resized.right = ConstrainResizeActiveCoordinate(
+            startSelection.right + dx, startSelection.right, startSelection.left,
+            virtualBounds.left, virtualBounds.right,
+            hasContent, contentBounds.left, contentBounds.right, enforceMinSize);
+    }
+
+    if (movesTop) {
+        resized.top = ConstrainResizeActiveCoordinate(
+            startSelection.top + dy, startSelection.top, startSelection.bottom,
+            virtualBounds.top, virtualBounds.bottom,
+            hasContent, contentBounds.top, contentBounds.bottom, enforceMinSize);
+    } else if (movesBottom) {
+        resized.bottom = ConstrainResizeActiveCoordinate(
+            startSelection.bottom + dy, startSelection.bottom, startSelection.top,
+            virtualBounds.top, virtualBounds.bottom,
+            hasContent, contentBounds.top, contentBounds.bottom, enforceMinSize);
+    }
+
+    return NormalizeRect(resized);
 }
 
 // 测量文字标注的包围盒（绝对虚拟屏幕坐标）
@@ -3687,25 +3837,20 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             DrawDimMask(backDC, ctx->gdi,
                 curSelRect.left, curSelRect.top, curSelRect.right, curSelRect.bottom,
                 ctx->virtualW, ctx->virtualH);
-            // 确认态边框
-            DrawConfirmedBorder(backDC, curSelRect, ctx->gdi);
-            // 调整手柄（拖拽选区/调整选区/文字编辑时不绘制，避免遮挡；确认态/绘制标注时绘制）
-            if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing) {
-                DrawResizeHandles(backDC, curSelRect);
-            }
             // 已提交标注 + 正在绘制的标注（绘制范围 clip 在选区内）
             // 调整选区时也保持显示，便于看清内容是否会被裁掉。
             if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing || ctx->state == CS_Resizing) {
                 const Annotation* cur = ctx->hasCurDrawing ? &ctx->curDrawing : nullptr;
-                // 马赛克（reveal-mask 模型）：先确保 base（整选区马赛克）已生成，
-                // 再把所有马赛克标注（含正在绘制的）的蒙版区域从 base 揭示到 backDC。
-                // base 预计算后每帧只做带区域裁剪的 BitBlt，无逐标注像素化，连续无闪烁。
+                // 马赛克（reveal-mask 模型）：只有当前帧确实包含马赛克内容时才延迟生成 base，
+                // 普通截图确认态不再承担整张虚拟屏幕的马赛克预处理。
                 if (HasMosaicToRender(ctx->annotations, cur)) {
                     if (MosaicBaseNeedsRebuild(ctx)) RebuildMosaicBase(ctx);
                     if (ctx->mosaicBaseDC) {
-                        // base 与 backDC 同为虚拟屏幕绝对坐标，蒙版 ox/oy = 0
+                        // 全屏缓存与 backDC 均以虚拟屏幕左上角为原点；把标注绝对坐标转换到
+                        // backDC 局部坐标，并用选区矩形硬裁剪马赛克笔刷的可见范围。
                         RevealMosaicToTarget(backDC, ctx->mosaicBaseDC,
-                                             ctx->annotations, cur, 0.0f, 0.0f);
+                                             ctx->annotations, cur, curSelRect,
+                                             (float)-ctx->virtualX, (float)-ctx->virtualY);
                     }
                 }
                 DrawAnnotations(backDC, curSelRect, ctx->virtualX, ctx->virtualY, ctx->annotations, cur);
@@ -3745,7 +3890,8 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     if (MosaicBaseNeedsRebuild(ctx)) RebuildMosaicBase(ctx);
                     if (ctx->mosaicBaseDC) {
                         RevealMosaicToTarget(backDC, ctx->mosaicBaseDC,
-                                             ctx->annotations, nullptr, 0.0f, 0.0f);
+                                             ctx->annotations, nullptr, curSelRect,
+                                             (float)-ctx->virtualX, (float)-ctx->virtualY);
                     }
                 }
                 // 绘制已提交的标注
@@ -3978,6 +4124,12 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                         graphics.DrawPath(&cPen, &handlePath);
                     }
                 }
+            }
+            // 确认态边框和调整手柄最后绘制，避免马赛克及其他标注覆盖交互轮廓。
+            DrawConfirmedBorder(backDC, curSelRect, ctx->gdi);
+            // 拖拽选区/调整选区/文字编辑时不绘制手柄，避免遮挡；确认态/绘制标注时显示。
+            if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing) {
+                DrawResizeHandles(backDC, curSelRect);
             }
             // 悬浮工具栏 + 粗细/颜色子菜单
             // 整体拖动选区(CS_Moving)时保持显示并实时跟随；调整选区(CS_Resizing)时仍隐藏，避免手柄附近抖动。
@@ -4912,51 +5064,21 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             dirty = UnionRectSafe(dirty, InflateRectBy(ctx->lastHighlightRect, 5));
             InvalidateRect(hwnd, &dirty, FALSE);
         } else if (ctx->state == CS_Resizing) {
-            // 根据手柄调整选区边
-            RECT& s = ctx->selection;
-            const RECT& o = ctx->dragStartSelection;
+            // 每帧都从按下时的完整快照重算：活动端可以越过固定端并翻转，固定端不会
+            // 因上一帧 NormalizeRect 后的 left/right、top/bottom 角色交换而漂移。
+            const RECT& startSelection = ctx->dragStartSelection;
             int dx = pt.x - ctx->dragStartX;
             int dy = pt.y - ctx->dragStartY;
-            switch (ctx->resizeHandle) {
-                case RH_Left:        s.left   = o.left + dx; break;
-                case RH_Right:       s.right  = o.right + dx; break;
-                case RH_Top:         s.top    = o.top + dy; break;
-                case RH_Bottom:      s.bottom = o.bottom + dy; break;
-                case RH_TopLeft:     s.left = o.left + dx; s.top = o.top + dy; break;
-                case RH_TopRight:    s.right = o.right + dx; s.top = o.top + dy; break;
-                case RH_BottomLeft:  s.left = o.left + dx; s.bottom = o.bottom + dy; break;
-                case RH_BottomRight: s.right = o.right + dx; s.bottom = o.bottom + dy; break;
-            }
-            ctx->selection = NormalizeRect(s);
-            // 已有标注内容时，选区不可缩小到裁掉内容（标注为绝对坐标，四边各自钳制）：
-            //   左/上边不得越过内容包围盒的左/上；右/下边不得小于包围盒的右/下。
-            RECT contentBounds;
-            if (CalcAnnotationsBounds(ctx->annotations, contentBounds, ctx->backDC)) {
-                if (s.left > contentBounds.left) {
-                    if (ctx->resizeHandle == RH_Left || ctx->resizeHandle == RH_TopLeft
-                        || ctx->resizeHandle == RH_BottomLeft) {
-                        s.left = contentBounds.left;
-                    }
-                }
-                if (s.top > contentBounds.top) {
-                    if (ctx->resizeHandle == RH_Top || ctx->resizeHandle == RH_TopLeft
-                        || ctx->resizeHandle == RH_TopRight) {
-                        s.top = contentBounds.top;
-                    }
-                }
-                if (s.right < contentBounds.right) {
-                    if (ctx->resizeHandle == RH_Right || ctx->resizeHandle == RH_TopRight
-                        || ctx->resizeHandle == RH_BottomRight) {
-                        s.right = contentBounds.right;
-                    }
-                }
-                if (s.bottom < contentBounds.bottom) {
-                    if (ctx->resizeHandle == RH_Bottom || ctx->resizeHandle == RH_BottomLeft
-                        || ctx->resizeHandle == RH_BottomRight) {
-                        s.bottom = contentBounds.bottom;
-                    }
-                }
-            }
+            RECT virtualBounds = {
+                ctx->virtualX, ctx->virtualY,
+                ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH
+            };
+            RECT contentBounds = {0, 0, 0, 0};
+            bool hasContent = CalcAnnotationsBounds(ctx->annotations, contentBounds, ctx->backDC);
+            // 拖动过程中不强制最小尺寸，保证穿越固定点时连续；鼠标释放时再按最终方向补足。
+            ctx->selection = ResizeSelectionFromHandle(
+                startSelection, ctx->resizeHandle, dx, dy, virtualBounds,
+                hasContent, contentBounds, false);
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (ctx->state == CS_Moving) {
             // 整体平移
@@ -5226,9 +5348,40 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
 
             // 进入确认态（可调整/拖动/工具栏），而非直接完成
             EnterConfirmed(ctx, finalRect);
+            // 自动确认模式：跳过编辑态，直接提取选区并完成截图
+            if (ctx->autoConfirm) {
+                ScreenshotResult* result = ExtractRegionResult(ctx->memDC, finalRect,
+                    ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations);
+                if (g_screenshotTsfn != nullptr) {
+                    napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
+                } else {
+                    delete result;
+                }
+                ctx->state = CS_Done;
+                DestroyWindow(hwnd);
+                return 0;
+            }
             InvalidateRect(hwnd, NULL, FALSE);
-        } else if (ctx->state == CS_Resizing || ctx->state == CS_Moving) {
-            // 调整/拖动结束 -> 回到确认态
+        } else if (ctx->state == CS_Resizing) {
+            // resize 结束：从按下快照和最终鼠标位置重算，并只沿活动端当前所在侧补足最小尺寸。
+            // 不能复用 EnterConfirmed 的固定向右/下扩张，否则穿越后会移动按下时的固定点。
+            int dx = ctx->mouseX - ctx->dragStartX;
+            int dy = ctx->mouseY - ctx->dragStartY;
+            RECT virtualBounds = {
+                ctx->virtualX, ctx->virtualY,
+                ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH
+            };
+            RECT contentBounds = {0, 0, 0, 0};
+            bool hasContent = CalcAnnotationsBounds(ctx->annotations, contentBounds, ctx->backDC);
+            ctx->selection = ResizeSelectionFromHandle(
+                ctx->dragStartSelection, ctx->resizeHandle, dx, dy, virtualBounds,
+                hasContent, contentBounds, true);
+            ctx->resizeHandle = RH_None;
+            ctx->state = CS_Confirmed;
+            ctx->needFullRedraw = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (ctx->state == CS_Moving) {
+            // 整体拖动结束仍可走通用确认流程；移动不会改变 resize 固定点语义。
             EnterConfirmed(ctx, ctx->selection);
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (ctx->state == CS_Drawing) {
@@ -5272,21 +5425,28 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 }
             }
         } else if (ctx->resizingAnnotation >= 0) {
-            // 非文字标注缩放结束：清缩放标志，保持选中态（四角圆点仍显示，可继续调整）
+            // 非文字标注缩放结束：先清缩放标志，再刷新最后位置与上帧位置的并集。
+            // WM_PAINT 将按最终确认态重画选中手柄，避免沿用拖拽态光标/外观。
+            int idx = ctx->resizingAnnotation;
+            RECT finalBox = MeasureAnnotationBounds(ctx->annotations[idx], ctx->backDC);
             ctx->resizingAnnotation = -1;
             ctx->annotationResizeHandle = RH_None;
             ctx->annotationOpHistoryPushed = false;
-            ctx->needFullRedraw = true;
+            InvalidateAnnotationOp(hwnd, ctx, finalBox);
         } else if (ctx->draggingAnnotation >= 0) {
-            // 非文字标注拖拽结束：清拖拽标志，保持选中态
+            // 非文字标注拖拽结束：先退出拖拽态再补刷最终脏区，不退化为全屏重绘。
+            int idx = ctx->draggingAnnotation;
+            RECT finalBox = MeasureAnnotationBounds(ctx->annotations[idx], ctx->backDC);
             ctx->draggingAnnotation = -1;
             ctx->annotationOpHistoryPushed = false;
-            ctx->needFullRedraw = true;
+            InvalidateAnnotationOp(hwnd, ctx, finalBox);
         } else if (ctx->draggingTextAnnotation >= 0) {
-            // 文字拖动结束
+            // 文字拖动结束：先退出拖动态，再按最终文字边框区域完成局部刷新。
+            int idx = ctx->draggingTextAnnotation;
+            RECT finalBox = MeasureAnnotationBounds(ctx->annotations[idx], ctx->backDC);
             ctx->draggingTextAnnotation = -1;
             ctx->annotationOpHistoryPushed = false;
-            ctx->needFullRedraw = true;
+            InvalidateAnnotationOp(hwnd, ctx, finalBox);
         }
         return 0;
     }
@@ -5686,6 +5846,7 @@ static void ScreenshotCaptureThread() {
     // 初始化上下文
     CaptureContext ctx = {};
     ctx.state = CS_Idle;
+    ctx.autoConfirm = g_autoConfirm.load();
     ctx.virtualX = vx; ctx.virtualY = vy;
     ctx.virtualW = vw; ctx.virtualH = vh;
     ctx.startX = 0; ctx.startY = 0;
@@ -5913,23 +6074,39 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
-    // 可选的回调函数
-    if (info.Length() > 0 && info[0].IsFunction()) {
-        Napi::Function callback = info[0].As<Napi::Function>();
-        napi_value resource_name;
-        napi_create_string_utf8(env, "ScreenshotCallback", NAPI_AUTO_LENGTH, &resource_name);
+    // 解析可选参数（顺序无关，便于后续扩展）：
+    //   - 回调函数：截图完成后回调
+    //   - 选项对象：目前支持 { autoConfirm: boolean }
+    //              默认 autoConfirm=true，选区确定后直接出图，跳过编辑态；
+    //              传 false 才进入编辑态（工具栏/标注）
+    bool autoConfirm = true;
+    for (int i = 0; i < (int)info.Length(); i++) {
+        if (info[i].IsFunction()) {
+            Napi::Function callback = info[i].As<Napi::Function>();
+            napi_value resource_name;
+            napi_create_string_utf8(env, "ScreenshotCallback", NAPI_AUTO_LENGTH, &resource_name);
 
-        napi_status status = napi_create_threadsafe_function(
-            env, callback, nullptr, resource_name,
-            0, 1, nullptr, nullptr, nullptr,
-            CallScreenshotJs, &g_screenshotTsfn
-        );
+            napi_status status = napi_create_threadsafe_function(
+                env, callback, nullptr, resource_name,
+                0, 1, nullptr, nullptr, nullptr,
+                CallScreenshotJs, &g_screenshotTsfn
+            );
 
-        if (status != napi_ok) {
-            Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
-            return env.Undefined();
+            if (status != napi_ok) {
+                Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+        } else if (info[i].IsObject()) {
+            Napi::Object opts = info[i].As<Napi::Object>();
+            if (opts.Has("autoConfirm")) {
+                Napi::Value v = opts.Get("autoConfirm");
+                if (v.IsBoolean()) {
+                    autoConfirm = v.As<Napi::Boolean>().Value();
+                }
+            }
         }
     }
+    g_autoConfirm = autoConfirm;
 
     g_isCapturing = true;
 
