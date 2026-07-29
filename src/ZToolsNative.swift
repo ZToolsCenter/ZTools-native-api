@@ -188,11 +188,16 @@ private struct WindowMetadata {
     var url: String?
     var axRole: String
     var axSubrole: String
+    var isFullscreen: Bool?
     var kind: String?
     var preciseTarget: Bool
 }
 
+/// 获取指定进程当前获得焦点的辅助功能窗口。
+/// - Parameter pid: 目标应用进程 ID
+/// - Returns: 获得焦点的窗口；无法访问或不存在时返回 nil
 private func focusedAXWindow(for pid: pid_t) -> AXUIElement? {
+    // 从应用级辅助功能元素读取当前焦点窗口。
     let app = AXUIElementCreateApplication(pid)
     var windowValue: AnyObject?
     let result = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowValue)
@@ -202,7 +207,13 @@ private func focusedAXWindow(for pid: pid_t) -> AXUIElement? {
     return nil
 }
 
+/// 读取窗口的字符串型辅助功能属性。
+/// - Parameters:
+///   - window: 目标辅助功能窗口
+///   - attribute: 要读取的属性名
+/// - Returns: 字符串或 URL 属性值；读取失败时返回空字符串
 private func axStringAttribute(_ window: AXUIElement, _ attribute: CFString) -> String {
+    // 请求属性并兼容字符串与 URL 两种常见返回类型。
     var value: AnyObject?
     AXUIElementCopyAttributeValue(window, attribute, &value)
     if let stringValue = value as? String {
@@ -214,7 +225,27 @@ private func axStringAttribute(_ window: AXUIElement, _ attribute: CFString) -> 
     return ""
 }
 
+/// 读取窗口的布尔型辅助功能属性。
+/// - Parameters:
+///   - window: 目标辅助功能窗口
+///   - attribute: 要读取的属性名
+/// - Returns: 布尔属性值；属性不受支持或读取失败时返回 nil
+private func axBooleanAttribute(_ window: AXUIElement, _ attribute: CFString) -> Bool? {
+    // 保留读取失败与明确 false 的区别，避免把不支持该属性误报为 false。
+    var value: AnyObject?
+    let result = AXUIElementCopyAttributeValue(window, attribute, &value)
+    guard result == .success else {
+        return nil
+    }
+
+    return value as? Bool
+}
+
+/// 获取辅助功能窗口的位置和尺寸。
+/// - Parameter window: 目标辅助功能窗口
+/// - Returns: 窗口边界；属性读取失败时对应分量为零
 private func axBounds(_ window: AXUIElement) -> CGRect {
+    // 分别读取位置与尺寸，避免其中一个属性失败时丢失另一个属性。
     var positionValue: AnyObject?
     var sizeValue: AnyObject?
     AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue)
@@ -284,6 +315,9 @@ private func jsonForWindowMetadata(_ info: WindowMetadata) -> String {
     fields.append("\"windowId\":\(info.windowId)")
     fields.append("\"axRole\":\"\(escapeJSON(info.axRole))\"")
     fields.append("\"axSubrole\":\"\(escapeJSON(info.axSubrole))\"")
+    if let isFullscreen = info.isFullscreen {
+        fields.append("\"isFullscreen\":\(isFullscreen ? "true" : "false")")
+    }
     fields.append("\"preciseTarget\":\(info.preciseTarget ? "true" : "false")")
     if let finderId = info.finderId { fields.append("\"finderId\":\(finderId)") }
     if let path = info.path { fields.append("\"path\":\"\(escapeJSON(path))\"") }
@@ -432,6 +466,7 @@ private func getFrontmostAppUsingCG() -> WindowMetadata? {
         let bounds = focusedWindow.map { axBounds($0) } ?? getWindowBounds(for: pid)
         let axRole = focusedWindow.map { axStringAttribute($0, kAXRoleAttribute as CFString) } ?? ""
         let axSubrole = focusedWindow.map { axStringAttribute($0, kAXSubroleAttribute as CFString) } ?? ""
+        let isFullscreen = focusedWindow.flatMap { axBooleanAttribute($0, "AXFullScreen" as CFString) }
         let axUrl = focusedWindow.map { axStringAttribute($0, kAXURLAttribute as CFString) } ?? ""
         let axDocument = focusedWindow.map { axStringAttribute($0, kAXDocumentAttribute as CFString) } ?? ""
         var location = normalizedFileLocation(from: !axUrl.isEmpty ? axUrl : axDocument)
@@ -467,6 +502,7 @@ private func getFrontmostAppUsingCG() -> WindowMetadata? {
             url: location.url,
             axRole: axRole,
             axSubrole: axSubrole,
+            isFullscreen: isFullscreen,
             kind: kind,
             preciseTarget: preciseTarget
         )
