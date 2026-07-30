@@ -51,7 +51,7 @@ static std::thread g_screenshotThread;
 // 由 startRegionCaptureWithPrimedFrame 的 options.autoConfirm 设置，
 // 会话开始时拷贝进 CaptureContext 供窗口过程读取。
 static std::atomic<bool> g_autoConfirm(false);
-static const auto SC_PRIMED_FRAME_TTL = std::chrono::milliseconds(500);
+static const auto SC_PRIMED_FRAME_TTL = std::chrono::seconds(2);
 
 struct PrimedScreenshotFrame {
     HBITMAP bitmap = NULL;
