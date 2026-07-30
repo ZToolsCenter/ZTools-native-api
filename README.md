@@ -194,9 +194,9 @@ if (WindowManager.getPlatform() === 'darwin') {
 获取当前激活窗口
 - **返回值**:
   - **macOS**: `{appName, bundleId, title, app, x, y, width, height, appPath, pid, isFullscreen} | null`
-  - **Windows**: `{appName, processId, pid, title, app, x, y, width, height, appPath} | null`
+  - **Windows**: `{appName, processId, pid, title, app, x, y, width, height, appPath, isFullscreen} | null`
 
-macOS 的 `isFullscreen` 直接来自焦点窗口的辅助功能属性 `AXFullScreen`。系统不支持该属性或未授予辅助功能权限时，该字段可能缺失。
+macOS 的 `isFullscreen` 直接来自焦点窗口的辅助功能属性 `AXFullScreen`。系统不支持该属性或未授予辅助功能权限时，该字段可能缺失。Windows 的 `isFullscreen` 由 Win32 原生层根据窗口与显示器边界、窗口状态和样式判定。
 
 **示例**:
 ```javascript

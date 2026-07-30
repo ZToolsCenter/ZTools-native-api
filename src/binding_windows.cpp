@@ -134,6 +134,9 @@ static std::mutex g_optimizedShortcutMutex;
 static std::vector<OptimizedShortcutDefinition> g_optimizedShortcuts;
 static std::map<int, OptimizedShortcutDefinition> g_activeOptimizedShortcutIds;
 static std::atomic<DWORD> g_optimizedShortcutThreadId(0);
+static std::mutex g_optimizedShortcutReadyMutex;
+static std::condition_variable g_optimizedShortcutReadyCv;
+static bool g_optimizedShortcutReady = false;
 static std::mutex g_optimizedShortcutRefreshResultMutex;
 static std::condition_variable g_optimizedShortcutRefreshResultCv;
 static bool g_optimizedShortcutRefreshPending = false;
@@ -694,6 +697,76 @@ Napi::Value StopWindowMonitor(const Napi::CallbackInfo& info) {
 
 // ==================== 窗口信息获取 ====================
 
+namespace {
+
+constexpr LONG kFullscreenEdgeTolerance = 2;
+
+bool IsDesktopShellWindow(HWND hwnd) {
+    if (hwnd == GetShellWindow()) {
+        return true;
+    }
+
+    WCHAR className[256] = {0};
+    if (GetClassNameW(hwnd, className, 256) == 0) {
+        return false;
+    }
+
+    return wcscmp(className, L"Progman") == 0 ||
+           wcscmp(className, L"WorkerW") == 0 ||
+           wcscmp(className, L"Shell_TrayWnd") == 0 ||
+           wcscmp(className, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+bool IsEdgeAligned(LONG actual, LONG expected) {
+    return std::abs(actual - expected) <= kFullscreenEdgeTolerance;
+}
+
+bool IsFullscreenWindow(HWND hwnd) {
+    if (hwnd == NULL || !IsWindowVisible(hwnd) || IsIconic(hwnd) || IsDesktopShellWindow(hwnd)) {
+        return false;
+    }
+
+    RECT windowRect = {};
+    HRESULT hr = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &windowRect,
+        sizeof(windowRect)
+    );
+    if (FAILED(hr) && !GetWindowRect(hwnd, &windowRect)) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (monitor == NULL) {
+        return false;
+    }
+
+    MONITORINFO monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, &monitorInfo)) {
+        return false;
+    }
+
+    const RECT& monitorRect = monitorInfo.rcMonitor;
+    const bool coversMonitor =
+        IsEdgeAligned(windowRect.left, monitorRect.left) &&
+        IsEdgeAligned(windowRect.top, monitorRect.top) &&
+        IsEdgeAligned(windowRect.right, monitorRect.right) &&
+        IsEdgeAligned(windowRect.bottom, monitorRect.bottom);
+    if (!coversMonitor) {
+        return false;
+    }
+
+    // 自动隐藏任务栏时，普通最大化窗口也可能覆盖整个显示器。保留标准窗口边框的
+    // 最大化窗口不是全屏；F11、无边框视频和游戏通常会移除这些样式。
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const bool hasStandardFrame = (style & (WS_CAPTION | WS_THICKFRAME)) != 0;
+    return !(IsZoomed(hwnd) && hasStandardFrame);
+}
+
+}  // namespace
+
 
 // 获取当前激活窗口
 Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
@@ -712,6 +785,7 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
     GetWindowThreadProcessId(hwnd, &processId);
     result.Set("processId", Napi::Number::New(env, processId));
     result.Set("pid", Napi::Number::New(env, processId));
+    result.Set("isFullscreen", Napi::Boolean::New(env, IsFullscreenWindow(hwnd)));
 
     // 获取窗口位置和大小
     RECT rect;
@@ -1848,14 +1922,62 @@ void CallOptimizedShortcutJs(napi_env env, napi_value js_callback, void* context
     delete trigger;
 }
 
+// 停止监听线程并释放其持有的全部资源。调用 join 前必须先让消息循环可退出。
+void StopOptimizedShortcutListenerInternal(const std::string& reason) {
+    g_isOptimizedShortcutListening = false;
+    g_optimizedShortcutReadyCv.notify_all();
+    CompleteOptimizedShortcutRefreshResult({false, reason});
+
+    const DWORD threadId = g_optimizedShortcutThreadId.load();
+    if (threadId != 0) {
+        PostThreadMessage(threadId, WM_QUIT, 0, 0);
+    }
+
+    if (g_optimizedShortcutThread.joinable()) {
+        g_optimizedShortcutThread.join();
+    }
+
+    if (g_optimizedShortcutTsfn != nullptr) {
+        napi_release_threadsafe_function(g_optimizedShortcutTsfn, napi_tsfn_release);
+        g_optimizedShortcutTsfn = nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
+        g_optimizedShortcuts.clear();
+        g_activeOptimizedShortcutIds.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutReadyMutex);
+        g_optimizedShortcutReady = false;
+    }
+    g_optimizedShortcutThreadId = 0;
+}
+
 // native 优化快捷键消息循环线程。
 void OptimizedShortcutThread() {
-    g_optimizedShortcutThreadId = GetCurrentThreadId();
-    MSG msg;
-    PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
-    RefreshOptimizedShortcutsOnListenerThread();
+    const DWORD threadId = GetCurrentThreadId();
+    MSG msg = {};
 
-    while (g_isOptimizedShortcutListening && GetMessage(&msg, NULL, 0, 0)) {
+    // PeekMessage 会为当前线程创建消息队列。只有队列创建完成后，PostThreadMessage 才可靠。
+    PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutReadyMutex);
+        g_optimizedShortcutThreadId = threadId;
+        g_optimizedShortcutReady = true;
+    }
+    g_optimizedShortcutReadyCv.notify_all();
+
+    if (g_isOptimizedShortcutListening) {
+        RefreshOptimizedShortcutsOnListenerThread();
+    }
+
+    while (g_isOptimizedShortcutListening) {
+        const BOOL messageResult = GetMessage(&msg, NULL, 0, 0);
+        if (messageResult <= 0) {
+            break;
+        }
+
         if (msg.message == WM_HOTKEY) {
             const int hotkeyId = static_cast<int>(msg.wParam);
             auto it = g_activeOptimizedShortcutIds.find(hotkeyId);
@@ -1883,6 +2005,12 @@ void OptimizedShortcutThread() {
 
     UnregisterOptimizedShortcutsOnListenerThread();
     g_optimizedShortcutThreadId = 0;
+    g_isOptimizedShortcutListening = false;
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutReadyMutex);
+        g_optimizedShortcutReady = false;
+    }
+    g_optimizedShortcutReadyCv.notify_all();
 }
 
 // 确保 native 优化快捷键监听已经启动。
@@ -1896,6 +2024,11 @@ Napi::Value EnsureOptimizedShortcutListener(const Napi::CallbackInfo& info) {
 
     if (g_isOptimizedShortcutListening) {
         return env.Undefined();
+    }
+
+    // 回收异常退出后仍处于 joinable 状态的旧线程和回调资源，再创建新监听器。
+    if (g_optimizedShortcutThread.joinable() || g_optimizedShortcutTsfn != nullptr) {
+        StopOptimizedShortcutListenerInternal("optimized shortcut listener restarting");
     }
 
     napi_value callback = info[0];
@@ -1921,17 +2054,35 @@ Napi::Value EnsureOptimizedShortcutListener(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_optimizedShortcutReadyMutex);
+        g_optimizedShortcutReady = false;
+    }
+    g_optimizedShortcutThreadId = 0;
     g_isOptimizedShortcutListening = true;
-    g_optimizedShortcutThread = std::thread(OptimizedShortcutThread);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    if (!g_isOptimizedShortcutListening || g_optimizedShortcutThreadId == 0) {
-        if (g_optimizedShortcutThread.joinable()) {
-            g_optimizedShortcutThread.join();
-        }
-        napi_release_threadsafe_function(g_optimizedShortcutTsfn, napi_tsfn_release);
-        g_optimizedShortcutTsfn = nullptr;
+    try {
+        g_optimizedShortcutThread = std::thread(OptimizedShortcutThread);
+    } catch (const std::exception& error) {
+        StopOptimizedShortcutListenerInternal("optimized shortcut listener thread creation failed");
+        Napi::Error::New(env, std::string("Failed to create optimized shortcut listener thread: ") + error.what()).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::unique_lock<std::mutex> readyLock(g_optimizedShortcutReadyMutex);
+    const bool ready = g_optimizedShortcutReadyCv.wait_for(
+        readyLock,
+        std::chrono::seconds(2),
+        []() { return g_optimizedShortcutReady || !g_isOptimizedShortcutListening; }
+    );
+    const bool started = ready && g_optimizedShortcutReady &&
+        g_isOptimizedShortcutListening && g_optimizedShortcutThreadId.load() != 0;
+    readyLock.unlock();
+
+    if (!started) {
+        StopOptimizedShortcutListenerInternal("optimized shortcut listener startup timed out");
         Napi::Error::New(env, "Failed to start optimized shortcut listener").ThrowAsJavaScriptException();
+        return env.Undefined();
     }
 
     return env.Undefined();
@@ -1940,34 +2091,7 @@ Napi::Value EnsureOptimizedShortcutListener(const Napi::CallbackInfo& info) {
 // 停止 native 优化快捷键监听并释放资源。
 Napi::Value StopOptimizedShortcutListener(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-
-    if (!g_isOptimizedShortcutListening) {
-        std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
-        g_optimizedShortcuts.clear();
-        g_activeOptimizedShortcutIds.clear();
-        CompleteOptimizedShortcutRefreshResult({false, "optimized shortcut listener stopped"});
-        return env.Undefined();
-    }
-
-    g_isOptimizedShortcutListening = false;
-
-    const DWORD threadId = g_optimizedShortcutThreadId;
-    if (threadId != 0) {
-        PostThreadMessage(threadId, WM_QUIT, 0, 0);
-    }
-    if (g_optimizedShortcutThread.joinable()) {
-        g_optimizedShortcutThread.join();
-    }
-
-    if (g_optimizedShortcutTsfn != nullptr) {
-        napi_release_threadsafe_function(g_optimizedShortcutTsfn, napi_tsfn_release);
-        g_optimizedShortcutTsfn = nullptr;
-    }
-
-    std::lock_guard<std::mutex> lock(g_optimizedShortcutMutex);
-    g_optimizedShortcuts.clear();
-    g_activeOptimizedShortcutIds.clear();
-    CompleteOptimizedShortcutRefreshResult({false, "optimized shortcut listener stopped"});
+    StopOptimizedShortcutListenerInternal("optimized shortcut listener stopped");
     return env.Undefined();
 }
 

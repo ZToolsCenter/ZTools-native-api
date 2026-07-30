@@ -204,7 +204,7 @@ class WindowManager {
    * 获取当前激活的窗口信息
    * @returns {{appName: string, bundleId?: string, title?: string, app?: string, x?: number, y?: number, width?: number, height?: number, appPath?: string, pid?: number, processId?: number, isFullscreen?: boolean}|null} 窗口信息对象
    * - macOS: { appName, bundleId, title, app, x, y, width, height, appPath, pid, isFullscreen }
-   * - Windows: { appName, processId, pid, title, app, x, y, width, height, appPath }
+   * - Windows: { appName, processId, pid, title, app, x, y, width, height, appPath, isFullscreen }
    */
   static getActiveWindow() {
     const result = addon.getActiveWindow();
