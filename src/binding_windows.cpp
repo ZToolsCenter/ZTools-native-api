@@ -5098,7 +5098,7 @@ std::wstring Utf8ToWideString(const std::string& input) {
         return std::wstring();
     }
 
-    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (input.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         return std::wstring();
     }
 
@@ -5126,7 +5126,7 @@ std::string WideToUtf8String(const std::wstring& input) {
         return std::string();
     }
 
-    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (input.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         return std::string();
     }
 
