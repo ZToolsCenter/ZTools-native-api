@@ -24,8 +24,11 @@ const calculator = apps.find(app => app.appId.includes('WindowsCalculator'));
 if (calculator) {
   console.log('Found calculator:', calculator.name, calculator.appId);
   console.log('Launching...');
-  const success = UwpManager.launchUwpApp(calculator.appId);
-  console.log('Launch result:', success);
+  const result = UwpManager.launchUwpApp(calculator.appId);
+  console.log('Launch result:', result);
+  if (!result.success) {
+    process.exitCode = 1;
+  }
 } else {
   console.log('Calculator not found in app list');
 }

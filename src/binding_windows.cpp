@@ -18,6 +18,8 @@
 #include <cwctype>
 #include <mutex>
 #include <condition_variable>
+#include <exception>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <cmath>
@@ -3412,28 +3414,92 @@ Napi::Value GetUwpApps(const Napi::CallbackInfo& info) {
     return result;
 }
 
-// 启动 UWP 应用
+/**
+ * 构造 UWP 应用启动结果，向 JavaScript 暴露激活与前台权限转交状态。
+ *
+ * @param env 当前 N-API 环境。
+ * @param success UWP 激活调用是否成功。
+ * @param hresult 当前失败阶段或激活调用的 HRESULT。
+ * @param foregroundHresult 前台权限转交调用的 HRESULT；未执行时为 E_PENDING。
+ * @param processId 激活成功后返回的应用进程 ID。
+ * @param stage 当前完成或失败阶段。
+ * @returns 包含启动诊断信息的 JavaScript 对象。
+ */
+static Napi::Object CreateUwpLaunchResult(
+    Napi::Env env,
+    bool success,
+    HRESULT hresult,
+    HRESULT foregroundHresult,
+    DWORD processId,
+    const char* stage
+) {
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("success", Napi::Boolean::New(env, success));
+    result.Set(
+        "hresult",
+        Napi::Number::New(env, static_cast<double>(static_cast<uint32_t>(hresult)))
+    );
+    result.Set(
+        "foregroundHresult",
+        Napi::Number::New(env, static_cast<double>(static_cast<uint32_t>(foregroundHresult)))
+    );
+    result.Set(
+        "foregroundPermissionGranted",
+        Napi::Boolean::New(env, SUCCEEDED(foregroundHresult))
+    );
+    result.Set("processId", Napi::Number::New(env, static_cast<double>(processId)));
+    result.Set("stage", Napi::String::New(env, stage));
+    return result;
+}
+
+/**
+ * 激活指定 UWP 应用，并把当前进程的前台窗口权限转交给激活管理器。
+ *
+ * @param info N-API 调用参数，第一个参数必须为 AppUserModelID 字符串。
+ * @returns 包含激活结果、HRESULT、前台权限状态和进程 ID 的对象。
+ * @throws JavaScript TypeError 参数缺失、类型错误或 AppUserModelID 为空时抛出。
+ */
 Napi::Value LaunchUwpApp(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
+    // 先校验调用契约，避免把空标识传给系统激活服务。
     if (info.Length() < 1 || !info[0].IsString()) {
         Napi::TypeError::New(env, "Expected appId (AppUserModelID) as first argument").ThrowAsJavaScriptException();
-        return Napi::Boolean::New(env, false);
+        return env.Undefined();
     }
 
     std::string appIdUtf8 = info[0].As<Napi::String>().Utf8Value();
-
-    // 转换为宽字符
-    int wideSize = MultiByteToWideChar(CP_UTF8, 0, appIdUtf8.c_str(), -1, NULL, 0);
-    if (wideSize <= 0) {
-        return Napi::Boolean::New(env, false);
+    if (appIdUtf8.empty()) {
+        Napi::TypeError::New(env, "appId must be a non-empty string").ThrowAsJavaScriptException();
+        return env.Undefined();
     }
-    std::wstring appIdWide(wideSize - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, appIdUtf8.c_str(), -1, &appIdWide[0], wideSize);
 
-    // 使用 IApplicationActivationManager 启动 UWP 应用
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // 严格按包含终止符的缓冲区大小转换，避免 AUMID 被截断。
+    int wideSize = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, appIdUtf8.c_str(), -1, NULL, 0);
+    if (wideSize <= 0) {
+        return CreateUwpLaunchResult(env, false, E_INVALIDARG, E_PENDING, 0, "convert-app-id");
+    }
+    std::wstring appIdWide(wideSize, L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            appIdUtf8.c_str(),
+            -1,
+            appIdWide.data(),
+            wideSize
+        ) != wideSize) {
+        return CreateUwpLaunchResult(env, false, E_INVALIDARG, E_PENDING, 0, "convert-app-id");
+    }
+    appIdWide.resize(static_cast<size_t>(wideSize - 1));
 
+    // 初始化 COM；若线程已使用其他 apartment，沿用现有 COM 初始化继续调用代理。
+    HRESULT initHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool needUninitialize = initHr == S_OK || initHr == S_FALSE;
+    if (FAILED(initHr) && initHr != RPC_E_CHANGED_MODE) {
+        return CreateUwpLaunchResult(env, false, initHr, E_PENDING, 0, "initialize-com");
+    }
+
+    // 创建进程外激活管理器，确保激活参数对象拥有独立生命周期。
     IApplicationActivationManager* paam = nullptr;
     HRESULT hr = CoCreateInstance(
         CLSID_ApplicationActivationManager,
@@ -3444,17 +3510,34 @@ Napi::Value LaunchUwpApp(const Napi::CallbackInfo& info) {
     );
 
     if (FAILED(hr) || paam == nullptr) {
-        CoUninitialize();
-        return Napi::Boolean::New(env, false);
+        const HRESULT createHr = FAILED(hr) ? hr : E_POINTER;
+        if (needUninitialize) {
+            CoUninitialize();
+        }
+        return CreateUwpLaunchResult(env, false, createHr, E_PENDING, 0, "create-activation-manager");
     }
 
+    // 把 ZTools 的前台权限交给进程外 COM 服务，使其可以激活目标 UWP 窗口。
+    HRESULT foregroundHr = CoAllowSetForegroundWindow(paam, nullptr);
+
+    // 即使权限转交失败也继续启动，避免焦点限制阻断应用本身。
     DWORD pid = 0;
     hr = paam->ActivateApplication(appIdWide.c_str(), nullptr, AO_NONE, &pid);
 
+    // 释放 COM 资源，并严格配对本函数成功执行的 COM 初始化。
     paam->Release();
-    CoUninitialize();
+    if (needUninitialize) {
+        CoUninitialize();
+    }
 
-    return Napi::Boolean::New(env, SUCCEEDED(hr));
+    return CreateUwpLaunchResult(
+        env,
+        SUCCEEDED(hr),
+        hr,
+        foregroundHr,
+        pid,
+        SUCCEEDED(hr) ? "completed" : "activate-application"
+    );
 }
 
 // ==================== 应用图标提取 ====================
@@ -5004,33 +5087,59 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo& info) {
 
 // ==================== 浏览器 URL 查询 ====================
 
+/**
+ * 将严格 UTF-8 字符串转换为 Windows UTF-16 字符串。
+ *
+ * @param input 待转换的 UTF-8 字符串。
+ * @returns 转换后的 UTF-16 字符串；输入无效或超长时返回空字符串。
+ */
 std::wstring Utf8ToWideString(const std::string& input) {
     if (input.empty()) {
         return std::wstring();
     }
 
-    int size = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, nullptr, 0);
+    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return std::wstring();
+    }
+
+    const int inputLength = static_cast<int>(input.size());
+    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), inputLength, nullptr, 0);
     if (size <= 0) {
         return std::wstring();
     }
 
-    std::wstring result(size - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, &result[0], size);
+    std::wstring result(size, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), inputLength, result.data(), size) != size) {
+        return std::wstring();
+    }
     return result;
 }
 
+/**
+ * 将 Windows UTF-16 字符串转换为严格 UTF-8 字符串。
+ *
+ * @param input 待转换的 UTF-16 字符串。
+ * @returns 转换后的 UTF-8 字符串；输入无效或超长时返回空字符串。
+ */
 std::string WideToUtf8String(const std::wstring& input) {
     if (input.empty()) {
         return std::string();
     }
 
-    int size = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return std::string();
+    }
+
+    const int inputLength = static_cast<int>(input.size());
+    int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, input.data(), inputLength, nullptr, 0, nullptr, nullptr);
     if (size <= 0) {
         return std::string();
     }
 
-    std::string result(size - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, input.c_str(), -1, &result[0], size, nullptr, nullptr);
+    std::string result(size, '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, input.data(), inputLength, result.data(), size, nullptr, nullptr) != size) {
+        return std::string();
+    }
     return result;
 }
 
@@ -5226,6 +5335,42 @@ static bool ShouldSkipDirectoryName(const std::wstring& dirName, const std::vect
     return false;
 }
 
+/**
+ * 解析单个 lnk 条目的目标，并处理指向 url 文件的快捷方式。
+ *
+ * @param entry 待原地更新的快捷方式条目。
+ * @returns 无返回值。
+ */
+static void ResolveShortcutEntryTarget(WindowsShortcutEntry& entry) {
+    if (entry.sourceType != L"lnk") {
+        return;
+    }
+
+    std::wstring targetPath = ResolveShortcutTargetPath(entry.path);
+    if (!targetPath.empty() && GetExtensionLower(targetPath) == L".url") {
+        UrlShortcutInfo urlInfo = ParseUrlShortcutFile(targetPath);
+        if (!urlInfo.valid) {
+            entry.sourceType = L"skip";
+            return;
+        }
+
+        entry.path = urlInfo.url;
+        entry.icon = urlInfo.iconFile.empty() ? entry.icon : urlInfo.iconFile;
+        entry.targetPath.clear();
+        entry.sourceType = L"lnk-url";
+        return;
+    }
+
+    entry.targetPath = targetPath;
+}
+
+/**
+ * 在独立 STA 线程中并行解析快捷方式目标，并把 worker 异常带回调用线程。
+ *
+ * @param entries 待原地解析和过滤的快捷方式条目。
+ * @returns 无返回值。
+ * @throws std::exception worker 执行或线程创建发生 C++ 异常时重新抛出。
+ */
 static void ResolveShortcutTargetsInParallel(std::vector<WindowsShortcutEntry>& entries) {
     if (entries.empty()) {
         return;
@@ -5241,51 +5386,56 @@ static void ResolveShortcutTargetsInParallel(std::vector<WindowsShortcutEntry>& 
     std::atomic<size_t> nextIndex(0);
     std::vector<std::thread> workers;
     workers.reserve(workerCount);
+    std::mutex workerErrorMutex;
+    std::exception_ptr workerError;
 
-    for (unsigned int worker = 0; worker < workerCount; worker++) {
-        workers.emplace_back([&entries, &nextIndex]() {
-            HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-            bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
-
-            for (;;) {
-                size_t index = nextIndex.fetch_add(1);
-                if (index >= entries.size()) {
-                    break;
+    try {
+        for (unsigned int worker = 0; worker < workerCount; worker++) {
+            workers.emplace_back([&entries, &nextIndex, &workerErrorMutex, &workerError]() {
+                HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                bool needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+                if (FAILED(hrInit)) {
+                    return;
                 }
 
-                WindowsShortcutEntry& entry = entries[index];
-                if (entry.sourceType != L"lnk") {
-                    continue;
-                }
+                try {
+                    for (;;) {
+                        size_t index = nextIndex.fetch_add(1);
+                        if (index >= entries.size()) {
+                            break;
+                        }
 
-                std::wstring targetPath = ResolveShortcutTargetPath(entry.path);
-                if (!targetPath.empty() && GetExtensionLower(targetPath) == L".url") {
-                    UrlShortcutInfo urlInfo = ParseUrlShortcutFile(targetPath);
-                    if (!urlInfo.valid) {
-                        entry.sourceType = L"skip";
-                        continue;
+                        ResolveShortcutEntryTarget(entries[index]);
                     }
-
-                    entry.path = urlInfo.url;
-                    entry.icon = urlInfo.iconFile.empty() ? entry.icon : urlInfo.iconFile;
-                    entry.targetPath.clear();
-                    entry.sourceType = L"lnk-url";
-                    continue;
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(workerErrorMutex);
+                    if (!workerError) {
+                        workerError = std::current_exception();
+                    }
                 }
 
-                entry.targetPath = targetPath;
+                if (needUninit) {
+                    CoUninitialize();
+                }
+            });
+        }
+    } catch (...) {
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
             }
-
-            if (needUninit) {
-                CoUninitialize();
-            }
-        });
+        }
+        throw;
     }
 
     for (auto& worker : workers) {
         if (worker.joinable()) {
             worker.join();
         }
+    }
+
+    if (workerError) {
+        std::rethrow_exception(workerError);
     }
 
     entries.erase(
@@ -5337,10 +5487,28 @@ static void AddShortcutEntry(const std::wstring& dirPath,
     entries.push_back(entry);
 }
 
+static constexpr size_t WINDOWS_SHORTCUT_MAX_SCAN_DEPTH = 64;
+
+/**
+ * 扫描目录中的快捷方式，并限制递归深度和重解析目录下钻。
+ *
+ * @param dirPath 待扫描目录路径。
+ * @param recursive 是否递归扫描普通子目录。
+ * @param skipFolders 需要跳过的目录名称列表。
+ * @param entries 接收扫描结果的条目数组。
+ * @param depth 当前递归深度。
+ * @returns 无返回值。
+ * @throws std::exception 内存分配等 C++ 操作失败时抛出。
+ */
 static void ScanShortcutDirectory(const std::wstring& dirPath,
                                   bool recursive,
                                   const std::vector<std::wstring>& skipFolders,
-                                  std::vector<WindowsShortcutEntry>& entries) {
+                                  std::vector<WindowsShortcutEntry>& entries,
+                                  size_t depth = 0) {
+    if (depth > WINDOWS_SHORTCUT_MAX_SCAN_DEPTH) {
+        return;
+    }
+
     DWORD attrs = GetFileAttributesW(dirPath.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         return;
@@ -5354,21 +5522,34 @@ static void ScanShortcutDirectory(const std::wstring& dirPath,
         return;
     }
 
-    do {
-        std::wstring name(findData.cFileName);
-        if (name == L"." || name == L"..") {
-            continue;
-        }
-
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (recursive && !ShouldSkipDirectoryName(name, skipFolders)) {
-                ScanShortcutDirectory(JoinWindowsPath(dirPath, name), true, skipFolders, entries);
+    try {
+        do {
+            std::wstring name(findData.cFileName);
+            if (name == L"." || name == L"..") {
+                continue;
             }
-            continue;
-        }
 
-        AddShortcutEntry(dirPath, findData, localizedNames, entries);
-    } while (FindNextFileW(findHandle, &findData));
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                const bool isReparsePoint =
+                    (findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                if (recursive && !isReparsePoint && !ShouldSkipDirectoryName(name, skipFolders)) {
+                    ScanShortcutDirectory(
+                        JoinWindowsPath(dirPath, name),
+                        true,
+                        skipFolders,
+                        entries,
+                        depth + 1
+                    );
+                }
+                continue;
+            }
+
+            AddShortcutEntry(dirPath, findData, localizedNames, entries);
+        } while (FindNextFileW(findHandle, &findData));
+    } catch (...) {
+        FindClose(findHandle);
+        throw;
+    }
 
     FindClose(findHandle);
 }
@@ -5392,6 +5573,12 @@ static std::vector<std::wstring> NapiStringArrayToWideVector(Napi::Env env, cons
     return result;
 }
 
+/**
+ * 扫描 Windows 快捷方式并将可恢复的 native 异常转换为 JavaScript 异常。
+ *
+ * @param info N-API 调用参数，依次为递归路径、扁平路径和跳过目录列表。
+ * @returns 快捷方式条目数组；参数错误或扫描失败时设置 JavaScript 异常。
+ */
 Napi::Value ScanWindowsShortcuts(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 3) {
@@ -5399,37 +5586,47 @@ Napi::Value ScanWindowsShortcuts(const Napi::CallbackInfo& info) {
         return Napi::Array::New(env);
     }
 
-    std::vector<std::wstring> scanPaths = NapiStringArrayToWideVector(env, info[0], "scanPaths");
-    std::vector<std::wstring> rootScanPaths = NapiStringArrayToWideVector(env, info[1], "rootScanPaths");
-    std::vector<std::wstring> skipFolders = NapiStringArrayToWideVector(env, info[2], "skipFolders");
-    for (auto& folder : skipFolders) {
-        folder = ToLowerWideString(folder);
-    }
-
-    std::vector<WindowsShortcutEntry> entries;
-    for (const auto& scanPath : scanPaths) {
-        ScanShortcutDirectory(scanPath, true, skipFolders, entries);
-    }
-    for (const auto& rootPath : rootScanPaths) {
-        ScanShortcutDirectory(rootPath, false, skipFolders, entries);
-    }
-    ResolveShortcutTargetsInParallel(entries);
-
-    Napi::Array result = Napi::Array::New(env, entries.size());
-    for (uint32_t i = 0; i < entries.size(); i++) {
-        const auto& entry = entries[i];
-        Napi::Object item = Napi::Object::New(env);
-        item.Set("name", Napi::String::New(env, WideToUtf8String(entry.name)));
-        item.Set("path", Napi::String::New(env, WideToUtf8String(entry.path)));
-        item.Set("icon", Napi::String::New(env, WideToUtf8String(entry.icon)));
-        if (!entry.targetPath.empty()) {
-            item.Set("targetPath", Napi::String::New(env, WideToUtf8String(entry.targetPath)));
+    try {
+        std::vector<std::wstring> scanPaths = NapiStringArrayToWideVector(env, info[0], "scanPaths");
+        std::vector<std::wstring> rootScanPaths = NapiStringArrayToWideVector(env, info[1], "rootScanPaths");
+        std::vector<std::wstring> skipFolders = NapiStringArrayToWideVector(env, info[2], "skipFolders");
+        for (auto& folder : skipFolders) {
+            folder = ToLowerWideString(folder);
         }
-        item.Set("sourceType", Napi::String::New(env, WideToUtf8String(entry.sourceType)));
-        result.Set(i, item);
+
+        std::vector<WindowsShortcutEntry> entries;
+        for (const auto& scanPath : scanPaths) {
+            ScanShortcutDirectory(scanPath, true, skipFolders, entries);
+        }
+        for (const auto& rootPath : rootScanPaths) {
+            ScanShortcutDirectory(rootPath, false, skipFolders, entries);
+        }
+        ResolveShortcutTargetsInParallel(entries);
+
+        Napi::Array result = Napi::Array::New(env, entries.size());
+        for (uint32_t i = 0; i < entries.size(); i++) {
+            const auto& entry = entries[i];
+            Napi::Object item = Napi::Object::New(env);
+            item.Set("name", Napi::String::New(env, WideToUtf8String(entry.name)));
+            item.Set("path", Napi::String::New(env, WideToUtf8String(entry.path)));
+            item.Set("icon", Napi::String::New(env, WideToUtf8String(entry.icon)));
+            if (!entry.targetPath.empty()) {
+                item.Set("targetPath", Napi::String::New(env, WideToUtf8String(entry.targetPath)));
+            }
+            item.Set("sourceType", Napi::String::New(env, WideToUtf8String(entry.sourceType)));
+            result.Set(i, item);
+        }
+
+        return result;
+    } catch (const std::exception& error) {
+        Napi::Error::New(env, std::string("Windows shortcut scan failed: ") + error.what())
+            .ThrowAsJavaScriptException();
+    } catch (...) {
+        Napi::Error::New(env, "Windows shortcut scan failed with an unknown native error")
+            .ThrowAsJavaScriptException();
     }
 
-    return result;
+    return Napi::Array::New(env);
 }
 bool LooksLikeBrowserUrl(const std::wstring& value) {
     if (value.empty()) {

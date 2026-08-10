@@ -573,7 +573,8 @@ class UwpManager {
   /**
    * 启动 UWP 应用
    * @param {string} appId - AppUserModelID（从 getUwpApps 获取）
-   * @returns {boolean} 是否启动成功
+   * @returns {{success: boolean, hresult: number, foregroundHresult: number, foregroundPermissionGranted: boolean, processId: number, stage: string}} 启动结果与前台权限诊断信息
+   * @throws {TypeError} appId 不是非空字符串时抛出
    */
   static launchUwpApp(appId) {
     if (platform !== 'win32') {
