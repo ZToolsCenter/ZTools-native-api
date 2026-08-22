@@ -120,8 +120,18 @@ enum ResizeHandle {
     RH_BottomLeft = 6,
     RH_BottomRight = 7,
     RH_ArrowStart = 8,   // 箭头起点端点手柄（仅箭头用，拖动改起点）
-    RH_ArrowEnd = 9      // 箭头终点端点手柄（仅箭头用，拖动改终点）
+    RH_ArrowEnd = 9,     // 箭头终点端点手柄（仅箭头用，拖动改终点）
+    RH_CornerRadiusTL = 10, // 选区左上角内倒角手柄（拖动改选区圆角半径，不改变选区矩形）
+    RH_CornerRadiusTR = 11, // 选区右上角内倒角手柄
+    RH_CornerRadiusBL = 12, // 选区左下角内倒角手柄
+    RH_CornerRadiusBR = 13  // 选区右下角内倒角手柄
 };
+
+// 是否为圆角（内倒角）手柄：四个角共用同一套拖拽逻辑（改 selectionCornerRadius）
+static bool IsCornerRadiusHandle(int h) {
+    return h == RH_CornerRadiusTL || h == RH_CornerRadiusTR ||
+           h == RH_CornerRadiusBL || h == RH_CornerRadiusBR;
+}
 
 // 工具栏按钮
 enum ToolButton {
@@ -260,7 +270,7 @@ static int AnnotationTypeToTool(AnnotationType t) {
 }
 
 // 手柄/工具栏几何常量
-static const int SC_HANDLE_SIZE = 8;        // 调整手柄边长
+static const int SC_HANDLE_SIZE = 10;       // 调整手柄边长（100% DPI 基准，运行时按 dpiScale 缩放）
 static const int SC_TOOLBAR_BTN = 32;       // 按钮尺寸（正方形）
 static const int SC_TOOLBAR_PAD = 6;        // 按钮↔工具栏边缘内边距（四边一致）
 static const int SC_TOOLBAR_H = SC_TOOLBAR_BTN + SC_TOOLBAR_PAD * 2;  // 工具栏高度 = 按钮 + 上下内边距
@@ -269,6 +279,17 @@ static const int SC_TOOLBAR_RADIUS = 8;     // 工具栏圆角
 static const int SC_TOOLBAR_MARGIN = 6;     // 选区到工具栏间距
 static const int SC_TOOLBAR_BORDER = 1;     // 工具栏边框
 static const int SC_MIN_SELECTION = 10;     // 最小选区尺寸
+static const int SC_CORNER_KNOB_INSET = 18; // 圆角拖拽手柄距选区角的内缩距离（100% DPI 基准，运行时按 dpiScale 缩放）
+static const int SC_CORNER_PROXIMITY = 14;  // 倒角手柄"靠近"感应余量：在命中框外再扩此距离即显示该角手柄（100% DPI 基准）
+
+// 手柄几何（DPI 缩放后）。选区/标注 resize 手柄与圆角手柄共用同一套尺寸，
+// 保证 1080p → 4K 下手柄与工具栏/图标同步放大，避免高 DPI 下手柄过小。
+struct SCHandleMetrics {
+    int handleSize;       // 手柄边长（绘制 + 命中框半宽基准）
+    int cornerKnobInset;  // 圆角手柄距选区角的内缩距离
+    int handleMargin;     // 脏区扩张余量 = handleSize/2 + 4（覆盖手柄半径 + 描边/抗锯齿）
+    int cornerProximity;  // 倒角手柄靠近感应余量（命中框外扩展距离，鼠标进入即显示该角手柄）
+};
 
 // 子菜单几何常量（100% DPI 基准值，运行时按 dpiScale 缩放）
 // 单行布局：[粗细圆点×3] | [分隔线] | [颜色圆点×8]，无文案。
@@ -461,6 +482,17 @@ static SCToolbarMetrics CalcToolbarMetrics(double dpiScale) {
     m.border = scale(SC_TOOLBAR_BORDER);
     // 图标视觉内容约占按钮 ~72%，留出内边距；额外 +2px 余量提升抗锯齿质量
     m.iconSize = scale(SC_TOOLBAR_BTN - 8) + 2;
+    return m;
+}
+
+// 按当前 DPI 计算手柄几何：选区/标注 resize 手柄与圆角手柄尺寸同步缩放。
+static SCHandleMetrics CalcHandleMetrics(double dpiScale) {
+    auto scale = [&](int v) { return (int)(v * dpiScale + 0.5); };
+    SCHandleMetrics m;
+    m.handleSize = scale(SC_HANDLE_SIZE);
+    m.cornerKnobInset = scale(SC_CORNER_KNOB_INSET);
+    m.handleMargin = m.handleSize / 2 + 4;
+    m.cornerProximity = scale(SC_CORNER_PROXIMITY);
     return m;
 }
 
@@ -1052,6 +1084,16 @@ struct CaptureContext {
     // 整体拖动/调整起点（绝对屏幕坐标）
     int dragStartX, dragStartY;
     RECT dragStartSelection;
+    // 选区圆角半径（0=直角；上限=min(w,h)/2，由 ClampCornerRadius 保证）
+    int selectionCornerRadius = 0;
+    // 圆角手柄拖拽起始半径（RH_CornerRadiusTL/TR/BL/BR 拖拽用，增量映射）
+    int dragStartRadius = 0;
+    // 当前"靠近/拖拽"的倒角手柄角（RH_CornerRadiusTL/TR/BL/BR 之一；RH_None=未靠近）。
+    // 仅鼠标靠近某角或正拖拽某角时显示该角一个倒角手柄，其余时刻隐藏。
+    int hoveredCornerHandle = RH_None;
+    // 键盘方向键微调累计位移（CS_Resizing 时叠加到鼠标位移上，松开时一并固化）
+    int kbDX = 0;
+    int kbDY = 0;
 
     // ---- 悬浮工具栏 ----
     // 工具栏矩形（相对虚拟屏幕坐标，绘制用）
@@ -1066,6 +1108,8 @@ struct CaptureContext {
     SCIconCache iconCache;
     // 当前 DPI 下的工具栏几何（缓存，避免每次绘制重算）
     SCToolbarMetrics toolbarMetrics;
+    // 当前 DPI 下的手柄几何（缓存：选区/标注 resize 手柄 + 圆角手柄）
+    SCHandleMetrics handleMetrics;
 
     // ---- 标注绘制 ----
     std::vector<Annotation> annotations;   // 已提交标注
@@ -1607,6 +1651,32 @@ static void CalcPanelPosition(int mx, int my, int vx, int vy, int vw, int vh,
     if (py < vy) py = vy + m.margin;
 }
 
+// 调整选区时放大镜面板位置：放在被拖手柄的"外侧"，避免遮挡正在调整的选区。
+// 左/右手柄置选区左/右外侧，顶/底置上下外侧，四角置对角外侧；边手柄在垂直方向居中。
+// 贴屏边放不下则翻到对侧，仍放不下则贴屏边（覆盖选区可接受，属边界情况）。
+static void CalcResizePanelPosition(int handle, const RECT& sel,
+    int vx, int vy, int vw, int vh, const SCPanelMetrics& m, int& px, int& py) {
+    bool movesL = handle == RH_Left || handle == RH_TopLeft || handle == RH_BottomLeft;
+    bool movesR = handle == RH_Right || handle == RH_TopRight || handle == RH_BottomRight;
+    bool movesT = handle == RH_Top || handle == RH_TopLeft || handle == RH_TopRight;
+    bool movesB = handle == RH_Bottom || handle == RH_BottomLeft || handle == RH_BottomRight;
+    if (movesL)      px = sel.left - m.w - m.margin;
+    else if (movesR) px = sel.right + m.margin;
+    else             px = (sel.left + sel.right) / 2 - m.w / 2;
+    if (movesT)      py = sel.top - m.h - m.margin;
+    else if (movesB) py = sel.bottom + m.margin;
+    else             py = (sel.top + sel.bottom) / 2 - m.h / 2;
+    // 外侧放不下 -> 翻到对侧；对侧仍放不下 -> 贴屏边
+    if (px < vx)            px = sel.right + m.margin;
+    if (px + m.w > vx + vw) px = sel.left - m.w - m.margin;
+    if (px < vx)            px = vx + m.margin;
+    if (px + m.w > vx + vw) px = vx + vw - m.w - m.margin;
+    if (py < vy)            py = sel.bottom + m.margin;
+    if (py + m.h > vy + vh) py = sel.top - m.h - m.margin;
+    if (py < vy)            py = vy + m.margin;
+    if (py + m.h > vy + vh) py = vy + vh - m.h - m.margin;
+}
+
 // 从预截屏位图恢复脏区域到后台缓冲
 static void RestoreDirtyRegion(HDC backDC, HDC memDC, const RECT& dirty, double dpiScale) {
     int w = dirty.right - dirty.left;
@@ -1823,9 +1893,11 @@ static void DrawWindowHighlight(HDC hdc, const RECT& rect, int vx, int vy, const
 // 在 backDC 上对"选区外部"区域 AlphaBlend 一层半透明黑色，
 // 选区内部不绘制，保持原始截图清晰。
 // rect 为相对虚拟屏幕的逻辑坐标（已减去 virtualX/virtualY）。
+// radius>0 时额外给选区四角的"角帽"（方框内、圆角弧外）叠同色遮罩，
+// 使圆角内不残留清晰直角三角；角帽用 GDI+ 抗锯齿路径填充，与 AA 圆角边框一致。
 static void DrawDimMask(HDC backDC, const SCGdiResources& gdi,
     int selLeft, int selTop, int selRight, int selBottom,
-    int virtualW, int virtualH) {
+    int virtualW, int virtualH, int radius) {
     if (!gdi.maskDC || !gdi.maskBitmap) return;
 
     BLENDFUNCTION blend;
@@ -1855,6 +1927,43 @@ static void DrawDimMask(HDC backDC, const SCGdiResources& gdi,
         AlphaBlend(backDC, selRight, selTop, virtualW - selRight, selBottom - selTop,
             gdi.maskDC, selRight, selTop, virtualW - selRight, selBottom - selTop, blend);
     }
+
+    // 圆角角帽：选区方框内、圆角弧外的四角区域，叠加同色遮罩。
+    // 用 GDI+ GraphicsPath 在每角构造"外两条直边 + 内凹四分之一弧"的封闭图形，
+    // FillPath 填充得到角帽，弧边抗锯齿。遮罩色与上面 AlphaBlend 一致（黑+SC_MASK_ALPHA）。
+    if (radius > 0 && selRight > selLeft && selBottom > selTop) {
+        int x = selLeft, y = selTop;
+        int w = selRight - selLeft;
+        int h = selBottom - selTop;
+        int r = (std::min)(radius, (std::min)(w, h) / 2);
+        if (r >= 1) {
+            Gdiplus::Graphics graphics(backDC);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::SolidBrush dimBrush(Gdiplus::Color(SC_MASK_ALPHA, 0, 0, 0));
+            Gdiplus::GraphicsPath capPath;
+            // 左上角：上边 → 内凹弧 → 左边
+            capPath.AddLine(x, y, x + r, y);
+            capPath.AddArc(x, y, r * 2, r * 2, 270.0f, -90.0f);
+            capPath.AddLine(x, y + r, x, y);
+            capPath.CloseFigure();
+            // 右上角：上边 → 右边 → 内凹弧
+            capPath.AddLine(x + w - r, y, x + w, y);
+            capPath.AddLine(x + w, y, x + w, y + r);
+            capPath.AddArc(x + w - r * 2, y, r * 2, r * 2, 0.0f, -90.0f);
+            capPath.CloseFigure();
+            // 右下角：右边 → 下边 → 内凹弧
+            capPath.AddLine(x + w, y + h - r, x + w, y + h);
+            capPath.AddLine(x + w, y + h, x + w - r, y + h);
+            capPath.AddArc(x + w - r * 2, y + h - r * 2, r * 2, r * 2, 90.0f, -90.0f);
+            capPath.CloseFigure();
+            // 左下角：左边 → 下边 → 内凹弧
+            capPath.AddLine(x, y + h - r, x, y + h);
+            capPath.AddLine(x, y + h, x + r, y + h);
+            capPath.AddArc(x, y + h - r * 2, r * 2, r * 2, 90.0f, 90.0f);
+            capPath.CloseFigure();
+            graphics.FillPath(&dimBrush, &capPath);
+        }
+    }
 }
 
 // ---- 确认态辅助函数 ----
@@ -1874,9 +1983,83 @@ static bool PointInRect(int x, int y, const RECT& r) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
 
-// 命中测试调整手柄，返回 ResizeHandle（绝对坐标）
-static int HitTestHandle(int x, int y, const RECT& sel) {
-    int hs = SC_HANDLE_SIZE;
+// 圆角手柄中心位置：选区四个角内侧，沿各自对角线内移 d = clamp(inset + radius, 0, maxR)。
+// radius 增大时四个手柄同步沿对角线向中心滑动（轨迹始终在该角的对角线上）；
+// 半径与手柄位置一一对应，松手后 radius 保持，手柄即停在原地（不回弹到静止位）。
+// inset 为 DPI 缩放后的静止内缩（radius=0 时手柄位置，避开角 resize 手柄）；
+// corner 取 RH_CornerRadiusTL/TR/BL/BR。sel 可为绝对坐标（命中测试用）或选区相对坐标（绘制用）。
+static void CornerRadiusHandleCenter(const RECT& sel, int inset, int radius, int corner, int& cx, int& cy) {
+    int w = sel.right - sel.left;
+    int h = sel.bottom - sel.top;
+    int maxR = (std::min)(w, h) / 2;
+    if (maxR < 0) maxR = 0;
+    int d = inset + radius;
+    if (d > maxR) d = maxR;   // 不越过中心 / 不出选区
+    if (d < 0) d = 0;
+    switch (corner) {
+        case RH_CornerRadiusTL: cx = sel.left + d;  cy = sel.top + d;    break;
+        case RH_CornerRadiusTR: cx = sel.right - d; cy = sel.top + d;    break;
+        case RH_CornerRadiusBL: cx = sel.left + d;  cy = sel.bottom - d; break;
+        case RH_CornerRadiusBR: cx = sel.right - d; cy = sel.bottom - d; break;
+        default:                cx = sel.left + d;  cy = sel.top + d;    break;
+    }
+}
+
+// 命中测试圆角手柄（绝对坐标）。依次测试四个角，返回命中的角手柄或 RH_None。
+// 命中框大小沿用 handleSize，与 resize 手柄一致；手柄位置随 radius 移动，故命中也按 radius 计算。
+static int HitTestCornerRadiusHandle(int x, int y, const RECT& sel, int handleSize, int inset, int radius) {
+    int corners[] = { RH_CornerRadiusTL, RH_CornerRadiusTR, RH_CornerRadiusBL, RH_CornerRadiusBR };
+    for (int c : corners) {
+        int cx, cy;
+        CornerRadiusHandleCenter(sel, inset, radius, c, cx, cy);
+        RECT box = { cx - handleSize, cy - handleSize, cx + handleSize, cy + handleSize };
+        if (PointInRect(x, y, box)) return c;
+    }
+    return RH_None;
+}
+
+// 找出鼠标"靠近"的倒角手柄（绝对坐标）：感应区 = 命中框外再扩 proximityMargin。
+// 感应区大于命中区，使手柄在鼠标靠近（尚未进入命中框）时即显现；仅返回最近的那一个角，
+// 选区四角通常互不相邻，足够大时鼠标只会靠近其一。
+static int FindNearestCornerRadiusHandle(int x, int y, const RECT& sel,
+                                         int handleSize, int inset, int radius,
+                                         int proximityMargin) {
+    int corners[] = { RH_CornerRadiusTL, RH_CornerRadiusTR, RH_CornerRadiusBL, RH_CornerRadiusBR };
+    int sense = handleSize + proximityMargin;  // 感应半宽 = 命中半宽 + 靠近余量
+    int best = RH_None;
+    int bestDist = 0x7FFFFFFF;  // 切比雪夫距离，越小越近
+    for (int c : corners) {
+        int cx, cy;
+        CornerRadiusHandleCenter(sel, inset, radius, c, cx, cy);
+        int dx = x - cx; if (dx < 0) dx = -dx;
+        int dy = y - cy; if (dy < 0) dy = -dy;
+        if (dx <= sense && dy <= sense) {
+            int dist = (dx > dy) ? dx : dy;
+            if (dist < bestDist) { bestDist = dist; best = c; }
+        }
+    }
+    return best;
+}
+
+// 倒角手柄附近脏区（backDC 相对坐标）：以手柄中心为基点，扩 handleMargin 覆盖半径+描边/抗锯齿。
+// 用于鼠标靠近/离开手柄时局部重绘，避免全屏刷新。
+static RECT CornerHandleDirtyRect(const CaptureContext* ctx, int corner) {
+    RECT r = {0, 0, 0, 0};
+    if (!IsCornerRadiusHandle(corner)) return r;
+    int cx, cy;
+    CornerRadiusHandleCenter(ctx->selection, ctx->handleMetrics.cornerKnobInset,
+                             ctx->selectionCornerRadius, corner, cx, cy);
+    int m = ctx->handleMetrics.handleMargin;
+    r.left = cx - m - ctx->virtualX;
+    r.top = cy - m - ctx->virtualY;
+    r.right = cx + m + 1 - ctx->virtualX;
+    r.bottom = cy + m + 1 - ctx->virtualY;
+    return r;
+}
+
+// 命中测试调整手柄，返回 ResizeHandle（绝对坐标）。handleSize 为 DPI 缩放后的命中半宽。
+static int HitTestHandle(int x, int y, const RECT& sel, int handleSize) {
+    int hs = handleSize;
     int cx = (sel.left + sel.right) / 2;
     int cy = (sel.top + sel.bottom) / 2;
     // 8 个手柄的判定矩形（顺序与 ResizeHandle 一致）
@@ -1916,6 +2099,13 @@ static LPCWSTR HandleCursor(int handle) {
         case RH_ArrowEnd:
             // 箭头端点拖拽：固定四向箭头，与悬停态一致
             return (LPCWSTR)IDC_SIZEALL;
+        // 圆角手柄：对角线方向拖拽（向内增大半径），按所在角选对应对角光标。
+        case RH_CornerRadiusTL:
+        case RH_CornerRadiusBR:
+            return (LPCWSTR)IDC_SIZENWSE;
+        case RH_CornerRadiusTR:
+        case RH_CornerRadiusBL:
+            return (LPCWSTR)IDC_SIZENESW;
         default:
             return (LPCWSTR)IDC_ARROW;
     }
@@ -1985,9 +2175,9 @@ static void DrawToolbarIcon(HDC hdc, int cx, int cy, int btn, bool active,
     DeleteDC(srcDC);
 }
 
-// 绘制选区调整手柄（8 个），传入相对坐标矩形
-static void DrawResizeHandles(HDC hdc, const RECT& selRel) {
-    int hs = SC_HANDLE_SIZE;
+// 绘制选区调整手柄（8 个），传入相对坐标矩形。handleSize 为 DPI 缩放后的边长。
+static void DrawResizeHandles(HDC hdc, const RECT& selRel, int handleSize) {
+    int hs = handleSize;
     int half = hs / 2;
     int cx = (selRel.left + selRel.right) / 2;
     int cy = (selRel.top + selRel.bottom) / 2;
@@ -2016,13 +2206,62 @@ static void DrawResizeHandles(HDC hdc, const RECT& selRel) {
     graphics.DrawPath(&borderPen, &path);
 }
 
+// 绘制单个倒角拖拽手柄（选区四角内侧其一）：白底圆 + 蓝环 + 朝向选区角的四分之一弧点缀。
+// 圆形与方形 resize 手柄区分；GDI+ 抗锯齿。selRel 为选区相对 backDC 坐标。
+// corner 指定画哪一个角（RH_CornerRadiusTL/TR/BL/BR），仅绘制该角手柄（默认隐藏，靠近/拖拽时调用方传入）。
+// 沿对角线内移 d = clamp(inset+radius, 0, maxR)：radius 增大时沿对角线向中心滑动，轨迹恒在对角线上；
+// 松手后 radius 保持，手柄停在原地（不回弹到静止位 inset）。
+// handleSize/inset 为 DPI 缩放后值；radius = ctx->selectionCornerRadius。
+static void DrawCornerRadiusHandle(HDC hdc, const RECT& selRel, int handleSize, int inset, int radius, int corner) {
+    if (!IsCornerRadiusHandle(corner)) return;
+    int half = handleSize / 2;
+    int gr = (std::max)(1, half - 2);
+    int cx, cy;
+    CornerRadiusHandleCenter(selRel, inset, radius, corner, cx, cy);
+    // 弧起始角（GDI+ 顺时针，0°=右/3 点）：落在朝向选区角的象限。
+    //   TL: 180°→270°（左上象限）  TR: 270°→0°（右上象限）
+    //   BR:   0°→90°（右下象限）  BL:  90°→180°（左下象限）
+    float start = 0.0f;
+    switch (corner) {
+        case RH_CornerRadiusTL: start = 180.0f; break;
+        case RH_CornerRadiusTR: start = 270.0f; break;
+        case RH_CornerRadiusBR: start =   0.0f; break;
+        case RH_CornerRadiusBL: start =  90.0f; break;
+    }
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::SolidBrush fillBrush(Gdiplus::Color(255, 255, 255, 255));
+    Gdiplus::Pen ringPen(Gdiplus::Color(255, 0, 136, 255), 1.5f);
+    Gdiplus::Pen glyphPen(Gdiplus::Color(255, 0, 136, 255), 1.0f);
+    Gdiplus::GraphicsPath path;
+    path.AddEllipse(cx - half, cy - half, half * 2, half * 2);
+    graphics.FillPath(&fillBrush, &path);
+    graphics.DrawPath(&ringPen, &path);
+    graphics.DrawArc(&glyphPen, cx - gr, cy - gr, gr * 2, gr * 2, start, 90.0f);
+}
+
 // 绘制确认态选区边框（细蓝框）
-static void DrawConfirmedBorder(HDC hdc, const RECT& selRel, const SCGdiResources& gdi) {
-    HGDIOBJ oldPen = SelectObject(hdc, gdi.selectionPen);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Rectangle(hdc, selRel.left, selRel.top, selRel.right, selRel.bottom);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBrush);
+// 前置声明：DrawConfirmedBorder 在 AddRoundedRect 之前定义，圆角分支需调用它。
+static void AddRoundedRect(Gdiplus::GraphicsPath& outPath, int x, int y, int w, int h, int radius);
+
+// 绘制确认态选区边框（细蓝框）。radius<1 为直角（沿用 GDI Rectangle）；
+// radius≥1 改用 GDI+ 圆角路径描边，抗锯齿且与 selectionPen（蓝 1px）一致。
+static void DrawConfirmedBorder(HDC hdc, const RECT& selRel, const SCGdiResources& gdi, int radius) {
+    if (radius < 1) {
+        HGDIOBJ oldPen = SelectObject(hdc, gdi.selectionPen);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, selRel.left, selRel.top, selRel.right, selRel.bottom);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        return;
+    }
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Pen pen(Gdiplus::Color(255, 0, 136, 255), 1.0f);
+    Gdiplus::GraphicsPath path;
+    AddRoundedRect(path, selRel.left, selRel.top,
+        selRel.right - selRel.left, selRel.bottom - selRel.top, radius);
+    graphics.DrawPath(&pen, &path);
 }
 
 // 用 GDI+ 圆角矩形路径填充 outPath（抗锯齿绘制的基础）。x,y,w,h 为整数像素矩形，
@@ -2752,10 +2991,222 @@ static bool SaveBitmapToClipboard(HBITMAP hBitmap) {
     return true;
 }
 
+// 将预乘 32bpp ARGB 像素缓冲编码为 PNG，可选产出 data URL base64 与/或原始 PNG 字节。
+// 用 Gdiplus::Bitmap 直接包装外部预乘缓冲（PixelFormat32bppPARGB），
+// PNG 编码器会转为非预乘写入 PNG（同时与剪贴板 CF_DIB 的预乘约定一致），保留 alpha。
+static bool EncodePremulArgbPng(const void* bits, int w, int h, int stride,
+                                std::string* base64Out, std::string* rawOut) {
+    if (!bits || w <= 0 || h <= 0) return false;
+    CLSID pngClsid;
+    if (GetPngEncoderClsid(&pngClsid) < 0) return false;
+    IStream* stream = NULL;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK || !stream) return false;
+    bool ok = false;
+    {
+        Gdiplus::Bitmap bmp(w, h, stride, PixelFormat32bppPARGB, (BYTE*)bits);
+        if (bmp.Save(stream, &pngClsid, NULL) == Gdiplus::Ok) {
+            HGLOBAL hMem = NULL;
+            if (GetHGlobalFromStream(stream, &hMem) == S_OK && hMem) {
+                size_t len = GlobalSize(hMem);
+                BYTE* ptr = (BYTE*)GlobalLock(hMem);
+                if (ptr && len > 0) {
+                    if (rawOut) rawOut->assign((const char*)ptr, len);
+                    if (base64Out) *base64Out = "data:image/png;base64," + Base64Encode(ptr, len);
+                    ok = true;
+                }
+                if (ptr) GlobalUnlock(hMem);
+            }
+        }
+    }
+    stream->Release();
+    return ok;
+}
+
+// 圆角透明图复制到剪贴板：CF_DIB（BITMAPV4HEADER, BI_BITFIELDS, 预乘 ARGB, 自下而上）
+// + 注册 PNG 格式（透明度跨应用最可靠，浏览器/Slack/图像编辑器按此读取）。
+// srcDC 须已选入 hbmp（用于 GetDIBits）。仅 radius>0 调用；radius==0 仍走 SaveBitmapToClipboard。
+static bool SaveArgbBitmapToClipboard(HBITMAP hbmp, HDC srcDC, int w, int h,
+                                      const std::string& pngBytes) {
+    if (!OpenClipboard(NULL)) return false;
+    EmptyClipboard();
+    // CF_DIB：用 GetDIBits 转成自下而上、BI_BITFIELDS 的 32bpp 预乘 ARGB
+    BITMAPV4HEADER b4 = {};
+    b4.bV4Size = sizeof(BITMAPV4HEADER);
+    b4.bV4Width = w;
+    b4.bV4Height = h;  // 正值 = 自下而上
+    b4.bV4Planes = 1;
+    b4.bV4BitCount = 32;
+    b4.bV4V4Compression = BI_BITFIELDS;
+    b4.bV4RedMask   = 0x00FF0000;
+    b4.bV4GreenMask = 0x0000FF00;
+    b4.bV4BlueMask  = 0x000000FF;
+    b4.bV4AlphaMask = 0xFF000000;
+    b4.bV4SizeImage = (DWORD)((SIZE_T)w * (SIZE_T)h * 4);
+    SIZE_T dibSize = sizeof(BITMAPV4HEADER) + (SIZE_T)w * (SIZE_T)h * 4;
+    HGLOBAL hDib = GlobalAlloc(GMEM_MOVEABLE, dibSize);
+    if (hDib) {
+        BYTE* p = (BYTE*)GlobalLock(hDib);
+        if (p) {
+            memcpy(p, &b4, sizeof(b4));
+            GetDIBits(srcDC, hbmp, 0, h, p + sizeof(b4), (BITMAPINFO*)&b4, DIB_RGB_COLORS);
+            GlobalUnlock(hDib);
+            if (!SetClipboardData(CF_DIB, hDib)) GlobalFree(hDib);
+        } else {
+            GlobalFree(hDib);
+        }
+    }
+    // PNG 格式：透明度最可靠的载体
+    if (!pngBytes.empty()) {
+        static UINT pngFmt = 0;
+        if (pngFmt == 0) pngFmt = RegisterClipboardFormatW(L"PNG");
+        if (pngFmt) {
+            HGLOBAL hPng = GlobalAlloc(GMEM_MOVEABLE, pngBytes.size());
+            if (hPng) {
+                BYTE* pp = (BYTE*)GlobalLock(hPng);
+                if (pp) {
+                    memcpy(pp, pngBytes.data(), pngBytes.size());
+                    GlobalUnlock(hPng);
+                    if (!SetClipboardData(pngFmt, hPng)) GlobalFree(hPng);
+                } else GlobalFree(hPng);
+            }
+        }
+    }
+    CloseClipboard();
+    return true;
+}
+
+// 生成圆角透明的 32bpp 预乘 ARGB DIB（radius>0 用）。
+// 复用现有像素提取+标注合成流程，但用 32bpp ARGB DIB 替代不透明位图；
+// 合成前把 alpha 统一置 255（保证标注以不透明背景混合、AA 边正确），合成后按圆角
+// 蒙版逐像素写入 alpha（内部不透明、弧边抗锯齿预乘、外部透明）。
+// 返回 HBITMAP（调用方 DeleteObject）；outDC 调用方 DeleteDC；outBits 为 DIB 像素指针。
+static HBITMAP BuildRoundedArgbFinal(HDC memDC, const RECT& rect, int vx, int vy,
+    double dpiScale, const std::vector<Annotation>& anns, int radius,
+    HDC& outDC, void*& outBits, int& outW, int& outH) {
+    outDC = NULL; outBits = NULL; outW = 0; outH = 0;
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    if (width <= 0 || height <= 0) return NULL;
+
+    int lx = rect.left - vx;
+    int ly = rect.top - vy;
+    int px = (int)(lx * dpiScale + 0.5);
+    int py = (int)(ly * dpiScale + 0.5);
+    int pw = (int)(width * dpiScale + 0.5);
+    int ph = (int)(height * dpiScale + 0.5);
+
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC) return NULL;
+
+    // 物理尺寸 32bpp ARGB DIB（top-down）；BitBlt 后 RGB 就位，alpha 字节不可靠（下方统一置 255）
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = pw;
+    bi.bmiHeader.biHeight = -ph;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP regionBmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HDC regionDC = CreateCompatibleDC(screenDC);
+    SelectObject(regionDC, regionBmp);
+    BitBlt(regionDC, 0, 0, pw, ph, memDC, px, py, SRCCOPY);
+
+    HBITMAP finalBmp = regionBmp;
+    HDC finalDC = regionDC;
+    void* finalBits = bits;
+    int finalW = pw, finalH = ph;
+
+    if (dpiScale > 1.01 || dpiScale < 0.99) {
+        BITMAPINFO bi2 = {};
+        bi2.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi2.bmiHeader.biWidth = width;
+        bi2.bmiHeader.biHeight = -height;
+        bi2.bmiHeader.biPlanes = 1;
+        bi2.bmiHeader.biBitCount = 32;
+        bi2.bmiHeader.biCompression = BI_RGB;
+        void* bits2 = NULL;
+        HBITMAP scaledBmp = CreateDIBSection(screenDC, &bi2, DIB_RGB_COLORS, &bits2, NULL, 0);
+        HDC scaledDC = CreateCompatibleDC(screenDC);
+        SelectObject(scaledDC, scaledBmp);
+        SetStretchBltMode(scaledDC, HALFTONE);
+        SetBrushOrgEx(scaledDC, 0, 0, NULL);
+        StretchBlt(scaledDC, 0, 0, width, height, regionDC, 0, 0, pw, ph, SRCCOPY);
+        DeleteDC(regionDC);
+        DeleteObject(regionBmp);
+        finalBmp = scaledBmp; finalDC = scaledDC; finalBits = bits2;
+        finalW = width; finalH = height;
+    }
+
+    // 合成前置 alpha=255：标注按不透明背景混合（结果不透明），后续圆角蒙版只负责透明
+    if (finalBits) {
+        BYTE* p = (BYTE*)finalBits;
+        int cnt = finalW * finalH;
+        for (int i = 0; i < cnt; i++) p[i * 4 + 3] = 255;
+    }
+    CompositeAnnotations(finalDC, memDC, anns, rect, vx, vy, dpiScale,
+                         SC_MOSAIC_SIZES[g_captureCtx ? g_captureCtx->mosaicSizeIdx : SC_DEFAULT_MOSAIC_IDX]);
+
+    // 圆角蒙版：同尺寸 32bpp DIB，不透明黑底 + GDI+ 填白圆角路径，取 RGB 通道作 coverage
+    int r = (std::min)(radius, (std::min)(finalW, finalH) / 2);
+    if (r >= 1 && finalBits) {
+        BITMAPINFO mbi = {};
+        mbi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        mbi.bmiHeader.biWidth = finalW;
+        mbi.bmiHeader.biHeight = -finalH;
+        mbi.bmiHeader.biPlanes = 1;
+        mbi.bmiHeader.biBitCount = 32;
+        mbi.bmiHeader.biCompression = BI_RGB;
+        void* maskBits = NULL;
+        HBITMAP maskBmp = CreateDIBSection(screenDC, &mbi, DIB_RGB_COLORS, &maskBits, NULL, 0);
+        if (maskBmp && maskBits) {
+            BYTE* mp = (BYTE*)maskBits;
+            int mcnt = finalW * finalH;
+            for (int i = 0; i < mcnt; i++) { mp[i*4]=0; mp[i*4+1]=0; mp[i*4+2]=0; mp[i*4+3]=255; }
+            HDC maskDC = CreateCompatibleDC(screenDC);
+            HGDIOBJ oldMask = SelectObject(maskDC, maskBmp);
+            {
+                Gdiplus::Graphics g(maskDC);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+                Gdiplus::SolidBrush white(Gdiplus::Color(255, 255, 255, 255));
+                Gdiplus::GraphicsPath path;
+                AddRoundedRect(path, 0, 0, finalW, finalH, r);
+                g.FillPath(&white, &path);
+            }
+            SelectObject(maskDC, oldMask);
+            DeleteDC(maskDC);
+            // 逐像素：final alpha = coverage（mask B 通道，==G==R），RGB 按其预乘
+            BYTE* dst = (BYTE*)finalBits;
+            BYTE* msk = (BYTE*)maskBits;
+            int dcnt = finalW * finalH;
+            for (int i = 0; i < dcnt; i++) {
+                int a = msk[i * 4];
+                if (a <= 0) {
+                    dst[i*4]=0; dst[i*4+1]=0; dst[i*4+2]=0; dst[i*4+3]=0;
+                } else if (a >= 255) {
+                    dst[i*4+3]=255;  // RGB 不变（不透明）
+                } else {
+                    dst[i*4]   = (BYTE)((int)dst[i*4]   * a / 255);
+                    dst[i*4+1] = (BYTE)((int)dst[i*4+1] * a / 255);
+                    dst[i*4+2] = (BYTE)((int)dst[i*4+2] * a / 255);
+                    dst[i*4+3] = (BYTE)a;
+                }
+            }
+            DeleteObject(maskBmp);
+        }
+    }
+
+    ReleaseDC(NULL, screenDC);
+    outDC = finalDC; outBits = finalBits; outW = finalW; outH = finalH;
+    return finalBmp;
+}
+
 // 从预截屏位图提取区域，生成 base64 并复制到剪贴板。
 // anns：可选的标注列表，会合成进最终 PNG（选区相对坐标，finalDC 原点 = 选区原点）。
+// radius>0 走圆角透明导出（32bpp ARGB + 圆角蒙版 + PNG/PNG剪贴板）；radius==0 维持不透明位图路径不变。
 static ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
-    int vx, int vy, double dpiScale, const std::vector<Annotation>& anns) {
+    int vx, int vy, double dpiScale, const std::vector<Annotation>& anns, int radius) {
     ScreenshotResult* result = new ScreenshotResult();
     result->success = false;
     int width = rect.right - rect.left;
@@ -2769,6 +3220,24 @@ static ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
 
     if (width <= 0 || height <= 0) return result;
 
+    // radius>0：圆角透明导出
+    if (radius > 0) {
+        HDC fDC = NULL; void* fBits = NULL; int fw = 0, fh = 0;
+        HBITMAP fbmp = BuildRoundedArgbFinal(memDC, rect, vx, vy, dpiScale, anns, radius,
+                                             fDC, fBits, fw, fh);
+        if (fbmp && fBits) {
+            std::string rawPng, b64;
+            if (EncodePremulArgbPng(fBits, fw, fh, fw * 4, &b64, &rawPng)) {
+                result->base64 = b64;
+                result->success = SaveArgbBitmapToClipboard(fbmp, fDC, fw, fh, rawPng);
+            }
+        }
+        if (fDC) DeleteDC(fDC);
+        if (fbmp) DeleteObject(fbmp);
+        return result;
+    }
+
+    // radius==0：原有不透明位图路径
     // 从物理尺寸位图提取区域
     int lx = rect.left - vx;
     int ly = rect.top - vy;
@@ -2893,11 +3362,30 @@ static std::wstring PromptSaveFilePath(HWND hwndOwner) {
 // 返回 true 表示保存成功。
 static bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
                                 double dpiScale, const std::vector<Annotation>& anns,
-                                const std::wstring& filePath) {
+                                const std::wstring& filePath, int radius) {
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
     if (width <= 0 || height <= 0 || filePath.empty()) return false;
 
+    // radius>0：圆角透明导出（32bpp ARGB + 圆角蒙版），GDI+ 直接保存为 PNG 文件
+    if (radius > 0) {
+        HDC fDC = NULL; void* fBits = NULL; int fw = 0, fh = 0;
+        HBITMAP fbmp = BuildRoundedArgbFinal(memDC, rect, vx, vy, dpiScale, anns, radius,
+                                             fDC, fBits, fw, fh);
+        bool ok = false;
+        if (fbmp && fBits) {
+            CLSID pngClsid;
+            if (GetPngEncoderClsid(&pngClsid) >= 0) {
+                Gdiplus::Bitmap bmp(fw, fh, fw * 4, PixelFormat32bppPARGB, (BYTE*)fBits);
+                ok = (bmp.Save(filePath.c_str(), &pngClsid, NULL) == Gdiplus::Ok);
+            }
+        }
+        if (fDC) DeleteDC(fDC);
+        if (fbmp) DeleteObject(fbmp);
+        return ok;
+    }
+
+    // radius==0：原有不透明位图路径
     // 复用 ExtractRegionResult 的合成逻辑生成 finalBmp（含标注、按逻辑尺寸）
     int lx = rect.left - vx;
     int ly = rect.top - vy;
@@ -2985,6 +3473,17 @@ static void CallScreenshotJs(napi_env env, napi_value js_callback, void* context
     }
 }
 
+// 钳制选区圆角半径到合理范围：[0, min(w,h)/2]。
+// 选区尺寸变化（确认/调整/移动）后调用，避免半径越界导致手柄命中与渲染不一致。
+static void ClampCornerRadius(CaptureContext* ctx) {
+    int w = ctx->selection.right - ctx->selection.left;
+    int h = ctx->selection.bottom - ctx->selection.top;
+    int maxR = (std::min)(w, h) / 2;
+    if (maxR < 0) maxR = 0;
+    if (ctx->selectionCornerRadius > maxR) ctx->selectionCornerRadius = maxR;
+    if (ctx->selectionCornerRadius < 0) ctx->selectionCornerRadius = 0;
+}
+
 // 进入确认态：规范化选区并切换状态
 static void EnterConfirmed(CaptureContext* ctx, const RECT& sel) {
     RECT n = NormalizeRect(sel);
@@ -2998,6 +3497,8 @@ static void EnterConfirmed(CaptureContext* ctx, const RECT& sel) {
     if (n.bottom - n.top < SC_MIN_SELECTION) n.bottom = n.top + SC_MIN_SELECTION;
     ctx->selection = n;
     ctx->resizeHandle = RH_None;
+    ctx->hoveredCornerHandle = RH_None;  // 进入确认态先置无，由后续 MOUSEMOVE 重新靠近探测
+    ClampCornerRadius(ctx);
     if (ctx->activeTool < 0) ctx->activeTool = TB_Drag;
     if (ctx->popupTool < 0) ctx->popupTool = -1;
     ctx->state = CS_Confirmed;
@@ -3195,6 +3696,77 @@ static RECT ResizeSelectionFromHandle(const RECT& startSelection, int handle, in
     }
 
     return NormalizeRect(resized);
+}
+
+// 取调整手柄在选区上的锚点（绝对虚拟屏幕坐标），作为放大镜焦点。
+// 锚点 = 手柄所在边/角的端点：左右手柄取边中点，顶/底取中点，四角取角点。
+static void GetResizeHandleAnchor(int handle, const RECT& sel, int& ax, int& ay) {
+    int cx = (sel.left + sel.right) / 2, cy = (sel.top + sel.bottom) / 2;
+    switch (handle) {
+        case RH_Left:        ax = sel.left;  ay = cy;        break;
+        case RH_Right:       ax = sel.right; ay = cy;        break;
+        case RH_Top:         ax = cx;        ay = sel.top;    break;
+        case RH_Bottom:      ax = cx;        ay = sel.bottom; break;
+        case RH_TopLeft:     ax = sel.left;  ay = sel.top;    break;
+        case RH_TopRight:    ax = sel.right; ay = sel.top;    break;
+        case RH_BottomLeft:  ax = sel.left;  ay = sel.bottom; break;
+        case RH_BottomRight: ax = sel.right; ay = sel.bottom; break;
+        default:             ax = cx;        ay = cy;        break;
+    }
+}
+
+// 从按下快照 + (鼠标位移 + 键盘微调) 实时重算选区，并刷新放大镜焦点像素色。
+// MOUSEMOVE 与 KEYDOWN 共用，保证两者一致。拖拽过程不强制最小尺寸（释放时再补）。
+static void ApplyResizeSelection(HWND hwnd, CaptureContext* ctx) {
+    const RECT& start = ctx->dragStartSelection;
+    int dx = (ctx->mouseX - ctx->dragStartX) + ctx->kbDX;
+    int dy = (ctx->mouseY - ctx->dragStartY) + ctx->kbDY;
+    RECT vb = { ctx->virtualX, ctx->virtualY,
+                ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH };
+    RECT cb = {0, 0, 0, 0};
+    bool hasContent = CalcAnnotationsBounds(ctx->annotations, cb, ctx->backDC);
+    ctx->selection = ResizeSelectionFromHandle(start, ctx->resizeHandle, dx, dy,
+                                               vb, hasContent, cb, false);
+    // 放大镜焦点取活动手柄锚点（随活动边移动，键盘微调时鼠标不动也能跟随）
+    int ax, ay;
+    GetResizeHandleAnchor(ctx->resizeHandle, ctx->selection, ax, ay);
+    ctx->currentColor = GetPixelColorFromBitmap(ctx->memDC, ax, ay,
+        ctx->virtualX, ctx->virtualY, ctx->dpiScale);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+// 方向键微调选区：CS_Resizing 微调活动边（累加 kbDX/kbDY）；CS_Confirmed 整体平移 1px。
+// Shift 加速到 10px。返回是否已处理（已处理则调用方 return 0）。
+static bool HandleSelectionNudgeKey(HWND hwnd, CaptureContext* ctx, WPARAM vk) {
+    int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
+    int ddx = 0, ddy = 0;
+    switch (vk) {
+        case VK_LEFT:  ddx = -step; break;
+        case VK_RIGHT: ddx =  step; break;
+        case VK_UP:    ddy = -step; break;
+        case VK_DOWN:  ddy =  step; break;
+        default: return false;
+    }
+    if (ctx->state == CS_Resizing && !IsCornerRadiusHandle(ctx->resizeHandle)) {
+        ctx->kbDX += ddx;
+        ctx->kbDY += ddy;
+        ApplyResizeSelection(hwnd, ctx);
+        return true;
+    }
+    if (ctx->state == CS_Confirmed && !ctx->popupOpen) {
+        RECT& s = ctx->selection;
+        int w = s.right - s.left, h = s.bottom - s.top;
+        int nl = s.left + ddx, nt = s.top + ddy;
+        if (nl < ctx->virtualX) nl = ctx->virtualX;
+        if (nt < ctx->virtualY) nt = ctx->virtualY;
+        if (nl + w > ctx->virtualX + ctx->virtualW) nl = ctx->virtualX + ctx->virtualW - w;
+        if (nt + h > ctx->virtualY + ctx->virtualH) nt = ctx->virtualY + ctx->virtualH - h;
+        s.left = nl; s.right = nl + w; s.top = nt; s.bottom = nt + h;
+        ctx->needFullRedraw = true;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return true;
+    }
+    return false;
 }
 
 // 测量文字标注的包围盒（绝对虚拟屏幕坐标）
@@ -3437,9 +4009,9 @@ static int HitTestAnnotation(std::vector<Annotation>& anns, int x, int y, HDC hd
 }
 
 // 命中测试标注包围盒的 8 个手柄（4 角 + 4 边中点），返回 ResizeHandle 或 RH_None。
-// 容差沿用选区手柄的 SC_HANDLE_SIZE，保证与选区手柄一致的可点击范围。
-static int HitTestAnnotationHandle(int x, int y, const RECT& box) {
-    int hs = SC_HANDLE_SIZE;
+// 容差沿用选区手柄的 handleSize，保证与选区手柄一致的可点击范围。
+static int HitTestAnnotationHandle(int x, int y, const RECT& box, int handleSize) {
+    int hs = handleSize;
     int cx = (box.left + box.right) / 2;
     int cy = (box.top + box.bottom) / 2;
     struct { int hx, hy; int handle; } tests[] = {
@@ -3461,9 +4033,9 @@ static int HitTestAnnotationHandle(int x, int y, const RECT& box) {
 
 // 命中测试箭头的起点/终点端点手柄，返回 RH_ArrowStart / RH_ArrowEnd / RH_None。
 // 箭头只允许拖拽两个端点（而非四角包围盒缩放），故单独命中 a.x1,y1 / a.x2,y2。
-// 容差沿用 SC_HANDLE_SIZE，与其它标注手柄可点击范围一致。
-static int HitTestArrowEndpoints(int x, int y, const Annotation& a) {
-    int hs = SC_HANDLE_SIZE;
+// 容差沿用 handleSize，与其它标注手柄可点击范围一致。
+static int HitTestArrowEndpoints(int x, int y, const Annotation& a, int handleSize) {
+    int hs = handleSize;
     struct { int hx, hy; int handle; } tests[] = {
         { a.x1, a.y1, RH_ArrowStart },
         { a.x2, a.y2, RH_ArrowEnd   },
@@ -3479,14 +4051,14 @@ static int HitTestArrowEndpoints(int x, int y, const Annotation& a) {
 //   箭头 = 起点/终点 2 端点；矩形/圆 = 包围盒 8 手柄（4 角 + 4 边中点）；
 //   画笔/马赛克 = 无手柄（RH_None，不可缩放，画笔仅可整体拖动）。
 // hdc 仅用于测量文字包围盒（此处文字不会进入，但签名与 HitTestAnnotation 对齐便于扩展）。
-static int HitTestAnnotationResizeHandle(const Annotation& a, int x, int y, HDC hdc) {
+static int HitTestAnnotationResizeHandle(const Annotation& a, int x, int y, HDC hdc, int handleSize) {
     switch (a.type) {
         case AT_Arrow:
-            return HitTestArrowEndpoints(x, y, a);
+            return HitTestArrowEndpoints(x, y, a, handleSize);
         case AT_Rect:
         case AT_Circle: {
             RECT box = MeasureAnnotationBounds(const_cast<Annotation&>(a), hdc);
-            return HitTestAnnotationHandle(x, y, box);
+            return HitTestAnnotationHandle(x, y, box, handleSize);
         }
         default:
             // AT_Brush / AT_Mosaic / AT_Text 无缩放手柄
@@ -3636,8 +4208,9 @@ static int CalcCaretPosFromMouse(HDC hdc, const std::wstring& text, int fontPx, 
 // 用于 resizingAnnotation/draggingAnnotation/draggingTextAnnotation 的 MOUSEMOVE。
 // curBox 为当前帧标注包围盒（绝对虚拟屏幕坐标，由调用方用 MeasureAnnotationBounds 算）；
 // 与上帧缓存的 lastAnnotationBox 求并集后转 backDC 坐标并扩大。lastAnnotationBox 由 WM_PAINT 更新。
-// 扩大量需覆盖选中态的 resize 手柄：手柄圆心贴在包围盒边缘，半径 = SC_HANDLE_SIZE/2，
-// 故 inflate 量取 SC_HANDLE_SIZE/2 + 余量，确保旧/新手柄范围都在脏区内，避免拖拽时残留手柄痕迹。
+// 扩大量需覆盖选中态的 resize 手柄：手柄圆心贴在包围盒边缘，半径 = handleSize/2，
+// 故 inflate 量取 handleSize/2 + 余量（= handleMetrics.handleMargin），确保旧/新手柄范围都在脏区内，
+// 避免拖拽时残留手柄痕迹。
 static void InvalidateAnnotationOp(HWND hwnd, CaptureContext* ctx, const RECT& curBox) {
     RECT b;
     if (ctx->hasLastAnnotationBox) {
@@ -3647,7 +4220,7 @@ static void InvalidateAnnotationOp(HWND hwnd, CaptureContext* ctx, const RECT& c
     }
     b.left -= ctx->virtualX; b.top -= ctx->virtualY;
     b.right -= ctx->virtualX; b.bottom -= ctx->virtualY;
-    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;  // 手柄半径 + 描边/抗锯齿余量
+    const int handleMargin = ctx->handleMetrics.handleMargin;  // 手柄半径 + 描边/抗锯齿余量
     InvalidateRect(hwnd, &InflateRectBy(b, handleMargin), FALSE);
 }
 
@@ -3661,7 +4234,7 @@ static void InvalidateAnnotationOp(HWND hwnd, CaptureContext* ctx, const RECT& c
 // 返回值可能为无效矩形（{0,0,0,0}）：表示当前无任何选中项，调用方据此决定是否全屏重绘兜底。
 static RECT CalcSelectionDirty(CaptureContext* ctx, bool includeToolbar) {
     RECT dirty = {0, 0, 0, 0};
-    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;  // 与 InvalidateAnnotationOp 一致的手柄半径余量
+    const int handleMargin = ctx->handleMetrics.handleMargin;  // 与 InvalidateAnnotationOp 一致的手柄半径余量
 
     // 非文字标注选中项的包围盒
     if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
@@ -3836,7 +4409,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // 选区外遮罩（选区内部保持清晰）
             DrawDimMask(backDC, ctx->gdi,
                 curSelRect.left, curSelRect.top, curSelRect.right, curSelRect.bottom,
-                ctx->virtualW, ctx->virtualH);
+                ctx->virtualW, ctx->virtualH, ctx->selectionCornerRadius);
             // 已提交标注 + 正在绘制的标注（绘制范围 clip 在选区内）
             // 调整选区时也保持显示，便于看清内容是否会被裁掉。
             if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing || ctx->state == CS_Resizing) {
@@ -4105,10 +4678,10 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                         handles[7][0] = box.right; handles[7][1] = cy;
                         handleCount = 8;
                     }
-                    // 白色圆形手柄（红色描边），半径 = SC_HANDLE_SIZE/2，与原方块视觉大小一致。
+                    // 白色圆形手柄（红色描边），半径 = handleSize/2（DPI 缩放后），与方块视觉大小一致。
                     // GDI+ 抗锯齿绘制（GDI Ellipse 边缘有硬锯齿）：白色填充 + 红色 1px 描边。
                     if (handleCount > 0) {
-                        int half = SC_HANDLE_SIZE / 2;
+                        int half = ctx->handleMetrics.handleSize / 2;
                         Gdiplus::Graphics graphics(backDC);
                         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
                         Gdiplus::SolidBrush cBrush(Gdiplus::Color(255, 255, 255, 255));
@@ -4126,10 +4699,45 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 }
             }
             // 确认态边框和调整手柄最后绘制，避免马赛克及其他标注覆盖交互轮廓。
-            DrawConfirmedBorder(backDC, curSelRect, ctx->gdi);
-            // 拖拽选区/调整选区/文字编辑时不绘制手柄，避免遮挡；确认态/绘制标注时显示。
-            if (ctx->state == CS_Confirmed || ctx->state == CS_Drawing) {
-                DrawResizeHandles(backDC, curSelRect);
+            DrawConfirmedBorder(backDC, curSelRect, ctx->gdi, ctx->selectionCornerRadius);
+            // 正在拖拽倒角手柄（CS_Resizing + 角手柄）：此时隐藏选区 resize 手柄，仅留被拖的倒角手柄。
+            bool draggingCorner = (ctx->state == CS_Resizing && IsCornerRadiusHandle(ctx->resizeHandle));
+            // 选区 resize 手柄：确认态/绘制标注/调整中/整体拖动中显示，并随 curSelRect 实时跟随。
+            // 倒角手柄拖拽时隐藏，避免两类手柄挤在同一角；文字编辑时不绘制，避免遮挡光标。
+            if (!draggingCorner && (ctx->state == CS_Confirmed || ctx->state == CS_Drawing
+                || ctx->state == CS_Resizing || ctx->state == CS_Moving)) {
+                DrawResizeHandles(backDC, curSelRect, ctx->handleMetrics.handleSize);
+            }
+            // 倒角拖拽手柄：默认不显示，仅"鼠标靠近某角"或"正拖拽某角"时显示该角一个。
+            // 拖拽 -> 取正在拖的角（resizeHandle）；确认态靠近 -> 取 hoveredCornerHandle；
+            // 沿对角线内移 d = clamp(inset+radius, 0, maxR)：radius 增大时沿对角线向中心滑动；
+            // 松手后 radius 保持 -> 手柄停在原地，不回弹到静止位 inset。
+            int visibleCorner = RH_None;
+            if (draggingCorner) {
+                visibleCorner = ctx->resizeHandle;
+            } else if (ctx->state == CS_Confirmed) {
+                visibleCorner = ctx->hoveredCornerHandle;
+            }
+            if (visibleCorner != RH_None) {
+                DrawCornerRadiusHandle(backDC, curSelRect,
+                    ctx->handleMetrics.handleSize, ctx->handleMetrics.cornerKnobInset,
+                    ctx->selectionCornerRadius, visibleCorner);
+            }
+            // 调整选区（标准手柄）时显示放大镜：焦点取活动手柄锚点（随活动边移动），
+            // 面板置于选区外侧避免遮挡目标。读 memDC 干净像素，所见即真实屏幕。
+            if (ctx->state == CS_Resizing && !IsCornerRadiusHandle(ctx->resizeHandle)) {
+                int ax, ay;
+                GetResizeHandleAnchor(ctx->resizeHandle, ctx->selection, ax, ay);
+                int pX, pY;
+                CalcResizePanelPosition(ctx->resizeHandle, ctx->selection,
+                    ctx->virtualX, ctx->virtualY, ctx->virtualW, ctx->virtualH,
+                    ctx->panelMetrics, pX, pY);
+                int pXRel = pX - ctx->virtualX, pYRel = pY - ctx->virtualY;
+                curPanelRect = { pXRel, pYRel,
+                    pXRel + ctx->panelMetrics.w, pYRel + ctx->panelMetrics.h };
+                DrawInfoPanel(backDC, pXRel, pYRel, ctx->currentColor,
+                    ctx->memDC, ctx->virtualX, ctx->virtualY, ax, ay, ctx->dpiScale,
+                    ctx->gdi, ctx->panelMetrics);
             }
             // 悬浮工具栏 + 粗细/颜色子菜单
             // 整体拖动选区(CS_Moving)时保持显示并实时跟随；调整选区(CS_Resizing)时仍隐藏，避免手柄附近抖动。
@@ -4173,14 +4781,14 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             } else {
                 ctx->hoverToolbarBtn = -1;
             }
-            // 确认态不绘制放大镜/尺寸标签
+            // 确认态不绘制尺寸标签；放大镜仅在调整手柄(CS_Resizing)时绘制（见上方）
         } else {
             // ---- Idle/Selecting 态：原有逻辑 ----
             // 绘制选区外遮罩（微信风格，仅 Selecting 状态），选区内部保持清晰
             if (ctx->state == CS_Selecting) {
                 DrawDimMask(backDC, ctx->gdi,
                     curSelRect.left, curSelRect.top, curSelRect.right, curSelRect.bottom,
-                    ctx->virtualW, ctx->virtualH);
+                    ctx->virtualW, ctx->virtualH, 0);
             }
 
             // 绘制选区或窗口尺寸标签
@@ -4253,6 +4861,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             ctx->startY = ctx->mouseY;
             ctx->endX = ctx->mouseX;
             ctx->endY = ctx->mouseY;
+            ctx->selectionCornerRadius = 0;  // 新框选从直角开始
             ctx->state = CS_Selecting;
             ctx->needFullRedraw = true;
         } else if (ctx->state == CS_TextEditing) {
@@ -4466,7 +5075,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 // 确定：提取选区并完成截图
                 if (b == TB_Confirm) {
                     ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
-                        ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations);
+                        ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius);
                     if (g_screenshotTsfn != nullptr) {
                         napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
                     }
@@ -4607,7 +5216,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     if (!filePath.empty()) {
                         bool saved = SaveRegionToPngFile(ctx->memDC, ctx->selection,
                             ctx->virtualX, ctx->virtualY, ctx->dpiScale,
-                            ctx->annotations, filePath);
+                            ctx->annotations, filePath, ctx->selectionCornerRadius);
                         // 无论保存成功与否，均关闭截图窗口（用户已选择保存路径）
                         // 通过回调告知 JS 结果（成功/失败），不回传路径
                         ScreenshotResult* result = new ScreenshotResult();
@@ -4740,7 +5349,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 Annotation& sel = ctx->annotations[ctx->selectedAnnotation];
                 RECT box = MeasureAnnotationBounds(sel, ctx->backDC);
                 // 按类型命中缩放手柄：箭头=2 端点；矩形/圆=8 手柄；画笔=无（仅可拖动）
-                int handle = HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY, ctx->backDC);
+                int handle = HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY, ctx->backDC, ctx->handleMetrics.handleSize);
                 if (handle != RH_None) {
                     ctx->resizingAnnotation = ctx->selectedAnnotation;
                     ctx->annotationResizeHandle = handle;
@@ -4794,7 +5403,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                     return 0;
                 } else {
                     // 非文字工具或空态下：切换选中目标到文字。
-                    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;
+                    const int handleMargin = ctx->handleMetrics.handleMargin;
                     RECT dirty = CalcSelectionDirty(ctx, true /*includeToolbar*/);
                     RECT newBox = MeasureTextAnnotation(ctx->backDC, ctx->annotations[hitText]);
                     newBox.left -= ctx->virtualX; newBox.top -= ctx->virtualY;
@@ -4838,7 +5447,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 // 切换选中目标：脏区 = 旧选中项（清掉其边框/手柄）∪ 新目标（显示新边框/手柄）
                 // ∪ 工具栏+popup（activeTool 可能变化导致高亮按钮位移）。
                 // 须在改 selectedAnnotation 之前算旧选中脏区。
-                const int handleMargin = SC_HANDLE_SIZE / 2 + 4;
+                const int handleMargin = ctx->handleMetrics.handleMargin;
                 RECT dirty = CalcSelectionDirty(ctx, true /*includeToolbar*/);
                 RECT newBox = MeasureAnnotationBounds(ctx->annotations[hitAnn], ctx->backDC);
                 newBox.left -= ctx->virtualX; newBox.top -= ctx->virtualY;
@@ -4962,7 +5571,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             }
 
             // 命中调整手柄 -> 进入 Resizing
-            int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection);
+            int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection, ctx->handleMetrics.handleSize);
             if (h != RH_None) {
                 ctx->selectedTextAnnotation = -1;  // 进入手柄调整，清除文字选中
                 ctx->selectedAnnotation = -1;      // 清除非文字标注选中
@@ -4971,6 +5580,26 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 ctx->dragStartX = ctx->mouseX;
                 ctx->dragStartY = ctx->mouseY;
                 ctx->dragStartSelection = ctx->selection;
+                ctx->kbDX = 0;
+                ctx->kbDY = 0;
+                ctx->state = CS_Resizing;
+                ctx->needFullRedraw = true;
+                return 0;
+            }
+            // 命中圆角手柄 -> 进入圆角调整（复用 CS_Resizing + 对应角手柄）
+            int corner = HitTestCornerRadiusHandle(ctx->mouseX, ctx->mouseY, ctx->selection,
+                ctx->handleMetrics.handleSize, ctx->handleMetrics.cornerKnobInset, ctx->selectionCornerRadius);
+            if (corner != RH_None) {
+                ctx->selectedTextAnnotation = -1;
+                ctx->selectedAnnotation = -1;
+                ctx->hoveredAnnotation = -1;
+                ctx->resizeHandle = corner;  // 记录具体角，决定拖拽方向与光标
+                ctx->dragStartX = ctx->mouseX;
+                ctx->dragStartY = ctx->mouseY;
+                ctx->dragStartSelection = ctx->selection;
+                ctx->dragStartRadius = ctx->selectionCornerRadius;
+                ctx->kbDX = 0;
+                ctx->kbDY = 0;
                 ctx->state = CS_Resizing;
                 ctx->needFullRedraw = true;
                 return 0;
@@ -5030,10 +5659,9 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         bool moved = (pt.x != ctx->mouseX || pt.y != ctx->mouseY);
         ctx->mouseX = pt.x;
         ctx->mouseY = pt.y;
-        // P2 优化：currentColor 仅用于放大镜信息面板（DrawInfoPanel），而该面板只
-        // 在 CS_Idle/CS_Selecting 态绘制。其余状态读不到 currentColor，故取色惰性化，
-        // 仅在这两种态更新像素色，避免每帧无谓的 GetPixel（DC 锁定读取）开销。
-        // 启动时已取一次初值（见线程函数），其余态保持上次值即可。
+        // currentColor 仅用于放大镜信息面板（DrawInfoPanel）。该面板在 CS_Idle/CS_Selecting
+        // 以及 CS_Resizing（标准手柄）态绘制：前两者在此取色（鼠标处），CS_Resizing 的取色
+        // 由 ApplyResizeSelection 在活动手柄锚点处完成，故此处不再重复。启动时已取一次初值。
         if (ctx->state == CS_Idle || ctx->state == CS_Selecting) {
             ctx->currentColor = GetPixelColorFromBitmap(ctx->memDC,
                 ctx->mouseX, ctx->mouseY, ctx->virtualX, ctx->virtualY, ctx->dpiScale);
@@ -5064,22 +5692,36 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             dirty = UnionRectSafe(dirty, InflateRectBy(ctx->lastHighlightRect, 5));
             InvalidateRect(hwnd, &dirty, FALSE);
         } else if (ctx->state == CS_Resizing) {
+            if (IsCornerRadiusHandle(ctx->resizeHandle)) {
+                // 圆角调整：手柄沿所在角对角线滑动，四角同步（共用同一 radius）。
+                // 取鼠标位移在该角对角线方向的投影（两向内分量之和/2）作为半径增量：
+                // 垂直于对角线的位移被忽略，故手柄轨迹恒为对角线。
+                int dx = pt.x - ctx->dragStartX;
+                int dy = pt.y - ctx->dragStartY;
+                int inX, inY;
+                switch (ctx->resizeHandle) {
+                    case RH_CornerRadiusTL: inX =  dx; inY =  dy; break;  // 右下为内
+                    case RH_CornerRadiusTR: inX = -dx; inY =  dy; break;  // 左下为内
+                    case RH_CornerRadiusBL: inX =  dx; inY = -dy; break;  // 右上为内
+                    case RH_CornerRadiusBR: inX = -dx; inY = -dy; break;  // 左上为内
+                    default:               inX =  dx; inY =  dy; break;
+                }
+                int diagDelta = (inX + inY) / 2;  // 对角线方向位移（轴向）
+                int w = ctx->selection.right - ctx->selection.left;
+                int h = ctx->selection.bottom - ctx->selection.top;
+                int maxR = (std::min)(w, h) / 2;
+                if (maxR < 0) maxR = 0;
+                int r = ctx->dragStartRadius + diagDelta;
+                if (r < 0) r = 0;
+                if (r > maxR) r = maxR;
+                ctx->selectionCornerRadius = r;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else {
             // 每帧都从按下时的完整快照重算：活动端可以越过固定端并翻转，固定端不会
             // 因上一帧 NormalizeRect 后的 left/right、top/bottom 角色交换而漂移。
-            const RECT& startSelection = ctx->dragStartSelection;
-            int dx = pt.x - ctx->dragStartX;
-            int dy = pt.y - ctx->dragStartY;
-            RECT virtualBounds = {
-                ctx->virtualX, ctx->virtualY,
-                ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH
-            };
-            RECT contentBounds = {0, 0, 0, 0};
-            bool hasContent = CalcAnnotationsBounds(ctx->annotations, contentBounds, ctx->backDC);
-            // 拖动过程中不强制最小尺寸，保证穿越固定点时连续；鼠标释放时再按最终方向补足。
-            ctx->selection = ResizeSelectionFromHandle(
-                startSelection, ctx->resizeHandle, dx, dy, virtualBounds,
-                hasContent, contentBounds, false);
-            InvalidateRect(hwnd, NULL, FALSE);
+            // 鼠标位移 + 键盘微调(kbDX/kbDY) 共同决定活动端；放大镜焦点取活动手柄锚点。
+            ApplyResizeSelection(hwnd, ctx);
+            }
         } else if (ctx->state == CS_Moving) {
             // 整体平移
             int dx = pt.x - ctx->dragStartX;
@@ -5233,7 +5875,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             InvalidateAnnotationOp(hwnd, ctx, MeasureAnnotationBounds(ctx->annotations[ctx->draggingTextAnnotation], ctx->backDC));
         } else if (ctx->state == CS_Confirmed) {
             // hover 手柄/工具栏/文字/非文字标注变化需重绘以更新光标提示与高亮
-            int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection);
+            int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection, ctx->handleMetrics.handleSize);
             int mxRel = ctx->mouseX - ctx->virtualX;
             int myRel = ctx->mouseY - ctx->virtualY;
             int tb = HitTestToolbar(mxRel, myRel, ctx->toolbarRect, ctx->toolbarMetrics);
@@ -5243,7 +5885,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()) {
                 Annotation& sel = ctx->annotations[ctx->selectedAnnotation];
                 bool onHandle = (HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY,
-                    ctx->backDC) != RH_None);
+                    ctx->backDC, ctx->handleMetrics.handleSize) != RH_None);
                 if (onHandle) {
                     ha = ctx->selectedAnnotation;  // 悬停在手柄上视为悬停选中项（光标由 SETCURSOR 处理）
                 }
@@ -5251,10 +5893,16 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             if (ha < 0) {
                 ha = HitTestAnnotation(ctx->annotations, ctx->mouseX, ctx->mouseY, ctx->backDC);
             }
+            // 倒角手柄"靠近"判定：感应区比命中框大一圈（handleSize + cornerProximity），
+            // 鼠标靠近某角即显示该角手柄；选区四角互不相邻，取最近的一个。
+            int newNear = FindNearestCornerRadiusHandle(ctx->mouseX, ctx->mouseY, ctx->selection,
+                ctx->handleMetrics.handleSize, ctx->handleMetrics.cornerKnobInset,
+                ctx->selectionCornerRadius, ctx->handleMetrics.cornerProximity);
             // 仅当 hover 状态真正变化时才重绘（去掉纯 moved 无变化的重绘，减少无意义全屏帧）。
-            // 脏区域 = 各变化项的旧位置 ∪ 新位置（工具栏/标注边框高亮变化）。
+            // 脏区域 = 各变化项的旧位置 ∪ 新位置（工具栏/标注边框高亮/倒角手柄变化）。
             if (h != ctx->resizeHandle || tb != ctx->hoverToolbarBtn
-                || ht != ctx->hoveredTextAnnotation || ha != ctx->hoveredAnnotation) {
+                || ht != ctx->hoveredTextAnnotation || ha != ctx->hoveredAnnotation
+                || newNear != ctx->hoveredCornerHandle) {
                 RECT dirty = {0,0,0,0};
                 // 工具栏 hover 变化：整条工具栏（按钮高亮）
                 if (tb != ctx->hoverToolbarBtn) {
@@ -5277,9 +5925,9 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 }
                 // 非文字标注 hover 变化：旧 ∪ 新 标注盒
                 // 选中态标注在 hover 进入/离开时会显示/隐藏 resize 手柄，手柄贴在包围盒边缘外，
-                // inflate 量需覆盖手柄半径（SC_HANDLE_SIZE/2 + 余量），否则手柄痕迹残留。
+                // inflate 量需覆盖手柄半径（handleSize/2 + 余量 = handleMetrics.handleMargin），否则手柄痕迹残留。
                 if (ha != ctx->hoveredAnnotation) {
-                    const int handleMargin = SC_HANDLE_SIZE / 2 + 4;
+                    const int handleMargin = ctx->handleMetrics.handleMargin;
                     if (ctx->hoveredAnnotation >= 0 && ctx->hoveredAnnotation < (int)ctx->annotations.size()) {
                         RECT r = MeasureAnnotationBounds(ctx->annotations[ctx->hoveredAnnotation], ctx->backDC);
                         r.left -= ctx->virtualX; r.top -= ctx->virtualY;
@@ -5293,10 +5941,20 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                         dirty = UnionRectSafe(dirty, InflateRectBy(r, handleMargin));
                     }
                 }
+                // 倒角手柄靠近变化：旧 ∪ 新角手柄位置重绘（出现/消失/切换角）。
+                if (newNear != ctx->hoveredCornerHandle) {
+                    if (IsCornerRadiusHandle(ctx->hoveredCornerHandle)) {
+                        dirty = UnionRectSafe(dirty, CornerHandleDirtyRect(ctx, ctx->hoveredCornerHandle));
+                    }
+                    if (IsCornerRadiusHandle(newNear)) {
+                        dirty = UnionRectSafe(dirty, CornerHandleDirtyRect(ctx, newNear));
+                    }
+                }
                 ctx->resizeHandle = h;
                 ctx->hoverToolbarBtn = tb;
                 ctx->hoveredTextAnnotation = ht;
                 ctx->hoveredAnnotation = ha;
+                ctx->hoveredCornerHandle = newNear;
                 if (IsValidRect(dirty)) {
                     InvalidateRect(hwnd, &dirty, FALSE);
                 } else {
@@ -5351,7 +6009,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // 自动确认模式：跳过编辑态，直接提取选区并完成截图
             if (ctx->autoConfirm) {
                 ScreenshotResult* result = ExtractRegionResult(ctx->memDC, finalRect,
-                    ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations);
+                    ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius);
                 if (g_screenshotTsfn != nullptr) {
                     napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
                 } else {
@@ -5363,10 +6021,23 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             }
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (ctx->state == CS_Resizing) {
+            if (IsCornerRadiusHandle(ctx->resizeHandle)) {
+                // 圆角调整结束：钳制半径即足够（选区矩形未变），无需最小尺寸逻辑。
+                ClampCornerRadius(ctx);
+                ctx->resizeHandle = RH_None;
+                // 松手后重算靠近角：鼠标仍在该角附近则保持显示，否则回 RH_None 由 MOUSEMOVE 再探测。
+                ctx->hoveredCornerHandle = FindNearestCornerRadiusHandle(ctx->mouseX, ctx->mouseY,
+                    ctx->selection, ctx->handleMetrics.handleSize, ctx->handleMetrics.cornerKnobInset,
+                    ctx->selectionCornerRadius, ctx->handleMetrics.cornerProximity);
+                ctx->state = CS_Confirmed;
+                ctx->needFullRedraw = true;
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else {
             // resize 结束：从按下快照和最终鼠标位置重算，并只沿活动端当前所在侧补足最小尺寸。
             // 不能复用 EnterConfirmed 的固定向右/下扩张，否则穿越后会移动按下时的固定点。
-            int dx = ctx->mouseX - ctx->dragStartX;
-            int dy = ctx->mouseY - ctx->dragStartY;
+            // 叠加键盘微调位移(kbDX/kbDY)，使其在松开时一并固化到最终选区。
+            int dx = (ctx->mouseX - ctx->dragStartX) + ctx->kbDX;
+            int dy = (ctx->mouseY - ctx->dragStartY) + ctx->kbDY;
             RECT virtualBounds = {
                 ctx->virtualX, ctx->virtualY,
                 ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH
@@ -5376,10 +6047,15 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             ctx->selection = ResizeSelectionFromHandle(
                 ctx->dragStartSelection, ctx->resizeHandle, dx, dy, virtualBounds,
                 hasContent, contentBounds, true);
+            ctx->kbDX = 0;
+            ctx->kbDY = 0;
             ctx->resizeHandle = RH_None;
+            ctx->hoveredCornerHandle = RH_None;
             ctx->state = CS_Confirmed;
             ctx->needFullRedraw = true;
+            ClampCornerRadius(ctx);  // 选区尺寸变化后，半径可能越界，钳制
             InvalidateRect(hwnd, NULL, FALSE);
+            }
         } else if (ctx->state == CS_Moving) {
             // 整体拖动结束仍可走通用确认流程；移动不会改变 resize 固定点语义。
             EnterConfirmed(ctx, ctx->selection);
@@ -5455,7 +6131,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         // 确认态下双击选区内部 -> 确认截图
         if ((ctx->state == CS_Confirmed) && PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
             ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
-                ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations);
+                ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius);
             if (g_screenshotTsfn != nullptr) {
                 napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
             }
@@ -5480,6 +6156,14 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
     }
 
     case WM_KEYDOWN: {
+        // 方向键微调选区：调整手柄拖拽中(CS_Resizing)微调活动边，或确认态整体平移。
+        // 文字编辑态(CS_TextEditing)不拦截，走下方原有光标逻辑。
+        if ((ctx->state == CS_Resizing || ctx->state == CS_Confirmed)
+            && (wParam == VK_LEFT || wParam == VK_RIGHT
+                || wParam == VK_UP || wParam == VK_DOWN)
+            && HandleSelectionNudgeKey(hwnd, ctx, wParam)) {
+            return 0;
+        }
         if (wParam == VK_ESCAPE) {
             // 文字编辑态：ESC 取消输入，回到确认态
             if (ctx->state == CS_TextEditing) {
@@ -5524,7 +6208,7 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // 确认态：Enter 确认截图
             if (ctx->state == CS_Confirmed) {
                 ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
-                    ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations);
+                    ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius);
                 if (g_screenshotTsfn != nullptr) {
                     napi_call_threadsafe_function(g_screenshotTsfn, result, napi_tsfn_nonblocking);
                 }
@@ -5724,18 +6408,25 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 return TRUE;
             }
             // 手柄 -> 对应 resize 光标
-            int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection);
+            int h = HitTestHandle(ctx->mouseX, ctx->mouseY, ctx->selection, ctx->handleMetrics.handleSize);
             if (h != RH_None) {
                 SetCursor(LoadCursorW(NULL, HandleCursor(h)));
                 return TRUE;
             }
-            // 已选中的非文字标注手柄 -> 对应 resize 光标（缩放入口）
+            // 圆角手柄 -> 对应对角 resize 光标（按所在角）
+            int cornerH = HitTestCornerRadiusHandle(ctx->mouseX, ctx->mouseY, ctx->selection,
+                ctx->handleMetrics.handleSize, ctx->handleMetrics.cornerKnobInset, ctx->selectionCornerRadius);
+            if (cornerH != RH_None) {
+                SetCursor(LoadCursorW(NULL, HandleCursor(cornerH)));
+                return TRUE;
+            }
+            // 已选中的非文字标注手柄 -> 对应 resize 光标（缩放入入口）
             //   箭头=起点/终点端点手柄（固定四向箭头）；矩形/圆=8 手柄（方向自适应）；画笔=无
             // 独立命中测试，不依赖 hovered 缓存（RDP 节流下缓存会滞后）
             if (ctx->selectedAnnotation >= 0 && ctx->selectedAnnotation < (int)ctx->annotations.size()
                 && ctx->annotations[ctx->selectedAnnotation].type != AT_Text) {
                 Annotation& sel = ctx->annotations[ctx->selectedAnnotation];
-                int handle = HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY, ctx->backDC);
+                int handle = HitTestAnnotationResizeHandle(sel, ctx->mouseX, ctx->mouseY, ctx->backDC, ctx->handleMetrics.handleSize);
                 if (handle != RH_None) {
                     SetCursor(LoadCursorW(NULL, HandleCursor(handle)));
                     return TRUE;
@@ -5884,6 +6575,7 @@ static void ScreenshotCaptureThread() {
 
     // 工具栏几何（按 DPI 缩放）+ 图标位图缓存（按 DPI 预渲染）
     ctx.toolbarMetrics = CalcToolbarMetrics(uiScale);
+    ctx.handleMetrics = CalcHandleMetrics(uiScale);
     ctx.iconCache.Init(ctx.toolbarMetrics.iconSize);
     // GDI+ 会话级初始化（必须在 InitMosaicBrushCursors 及任何 GDI+ 调用之前）：
     // 会话内单次 Startup，避免每帧反复初始化导致拖拽卡顿。

@@ -12,7 +12,7 @@ console.log('\n准备启动...\n');
 setTimeout(() => {
     console.log('启动区域截图...\n');
 
-    ScreenCapture.start((result) => {
+    ScreenCapture.start({ autoConfirm: false }, (result) => {
         console.log('截图完成！');
         console.log('结果:', result);
 
