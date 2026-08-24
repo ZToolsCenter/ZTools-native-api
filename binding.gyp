@@ -28,6 +28,7 @@
           "OS=='win'",
           {
             "sources": ["src/binding_windows.cpp", "src/screenshot_windows.cpp"],
+            "defines": ["_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"],
             "libraries": [
               "user32.lib",
               "kernel32.lib",

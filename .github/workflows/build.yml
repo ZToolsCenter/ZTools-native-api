@@ -27,10 +27,12 @@ jobs:
           echo "Building Universal Binary (x86_64 + arm64)"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build C++ binding (Universal Binary)
-        run: npx node-gyp rebuild
+        run: |
+          node scripts/gen-icons.js
+          npx node-gyp rebuild
 
       - name: Build Swift library (Universal Binary)
         run: |
@@ -123,7 +125,7 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build native module
         run: npm run build
