@@ -556,6 +556,44 @@ class IconExtractor {
 // UWP 应用管理类
 class UwpManager {
   /**
+   * 监听当前用户 UWP 包的安装、更新和卸载完成事件。
+   * @param {(event: {type: 'install'|'update'|'uninstall', packageFullName: string}) => void} callback - 包变化回调
+   * @returns {void} 无返回值
+   * @throws {Error} 当前平台不是 Windows、回调无效或原生监听初始化失败时抛出
+   */
+  static startPackageMonitor(callback) {
+    if (platform !== 'win32') {
+      throw new Error('startPackageMonitor is only supported on Windows');
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError('Callback must be a function');
+    }
+    addon.startUwpPackageMonitor(callback);
+  }
+
+  /**
+   * 停止当前用户 UWP 包变化监听。
+   * @returns {void} 无返回值
+   */
+  static stopPackageMonitor() {
+    if (platform === 'win32') {
+      addon.stopUwpPackageMonitor();
+    }
+  }
+
+  /**
+   * 获取当前用户已注册包的稳定快照。
+   * @returns {string[]} 按包完整名排序的快照
+   * @throws {Error} 当前平台不是 Windows 或包注册表不可读时抛出
+   */
+  static getPackageSnapshot() {
+    if (platform !== 'win32') {
+      throw new Error('getPackageSnapshot is only supported on Windows');
+    }
+    return addon.getUwpPackageSnapshot();
+  }
+
+  /**
    * 获取已安装的 UWP 应用列表
    * @returns {Array<{name: string, appId: string, icon: string, installLocation: string}>} 应用列表
    * - name: 应用显示名称

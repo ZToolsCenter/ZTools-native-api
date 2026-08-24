@@ -31,6 +31,8 @@
 #include <shldisp.h>   // For IShellDispatch2, IShellFolderViewDual
 #include <shlguid.h>   // For SID_STopLevelBrowser
 #include <wrl/client.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Foundation.h>
 #include <uiautomation.h> // For browser URL reading via UI Automation
 #include <appmodel.h>  // For package APIs
 #include <shlwapi.h>   // For PathCombineW
@@ -106,6 +108,20 @@ static std::string g_colorPickerResult;
 static HHOOK g_colorPickerMouseHook = NULL;
 static HHOOK g_colorPickerKeyboardHook = NULL;
 static std::atomic<bool> g_colorPickerCallbackCalled(false);
+
+struct UwpPackageChangeEvent {
+    std::string type;
+    std::string packageFullName;
+};
+
+// 全局变量 - UWP 包注册变化监控
+static std::atomic<bool> g_isUwpPackageMonitoring(false);
+static napi_threadsafe_function g_uwpPackageTsfn = nullptr;
+static std::thread g_uwpPackageMonitorThread;
+static std::mutex g_uwpPackageMonitorMutex;
+static std::condition_variable g_uwpPackageMonitorCv;
+static bool g_uwpPackageMonitorReady = false;
+static std::string g_uwpPackageMonitorError;
 
 struct OptimizedShortcutDefinition {
     std::string shortcut;
@@ -2964,6 +2980,267 @@ static std::string WideToUtf8(const std::wstring& wstr) {
     return utf8;
 }
 
+/**
+ * 在 Node.js 主线程中分发一次 UWP 包注册变化。
+ *
+ * @param env 当前 N-API 环境。
+ * @param jsCallback JavaScript 监听回调。
+ * @param context 线程安全函数上下文，当前未使用。
+ * @param data 指向待释放的 UwpPackageChangeEvent。
+ * @returns 无返回值。
+ */
+static void CallUwpPackageChangeJs(napi_env env, napi_value jsCallback, void* context, void* data) {
+    std::unique_ptr<UwpPackageChangeEvent> event(static_cast<UwpPackageChangeEvent*>(data));
+    if (env == nullptr || jsCallback == nullptr || event == nullptr) {
+        return;
+    }
+
+    // 将原生事件压缩为稳定的轻量对象，避免把 WinRT 对象跨线程传入 JS。
+    napi_value payload;
+    napi_value type;
+    napi_value packageFullName;
+    napi_create_object(env, &payload);
+    napi_create_string_utf8(env, event->type.c_str(), NAPI_AUTO_LENGTH, &type);
+    napi_create_string_utf8(env, event->packageFullName.c_str(), NAPI_AUTO_LENGTH, &packageFullName);
+    napi_set_named_property(env, payload, "type", type);
+    napi_set_named_property(env, payload, "packageFullName", packageFullName);
+
+    napi_value global;
+    napi_get_global(env, &global);
+    napi_call_function(env, global, jsCallback, 1, &payload, nullptr);
+}
+
+/**
+ * 将已完成且成功的包变化排入 Node.js 线程安全回调队列。
+ *
+ * @param type 包变化类型。
+ * @param packageFullName 当前变化包的完整包名。
+ * @returns 无返回值。
+ */
+static void QueueUwpPackageChange(const char* type, const winrt::hstring& packageFullName) {
+    auto event = std::make_unique<UwpPackageChangeEvent>();
+    event->type = type;
+    event->packageFullName = winrt::to_string(packageFullName);
+
+    // 与停止流程串行，确保 TSFN 不会在排队过程中被释放。
+    std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+    if (!g_isUwpPackageMonitoring || g_uwpPackageTsfn == nullptr) {
+        return;
+    }
+
+    UwpPackageChangeEvent* rawEvent = event.release();
+    napi_status status = napi_call_threadsafe_function(
+        g_uwpPackageTsfn,
+        rawEvent,
+        napi_tsfn_nonblocking
+    );
+    if (status != napi_ok) {
+        delete rawEvent;
+    }
+}
+
+/**
+ * 在独立 MTA 线程中订阅当前用户的包安装、更新和卸载完成事件。
+ *
+ * @returns 无返回值；初始化失败时通过共享状态通知启动调用方。
+ */
+static void RunUwpPackageMonitor() {
+    try {
+        // PackageCatalog 依赖 WinRT apartment，专用线程可避免 Electron 主线程的 COM 模型冲突。
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        auto catalog = winrt::Windows::ApplicationModel::PackageCatalog::OpenForCurrentUser();
+
+        // 只在操作完成且 HRESULT 成功时失效缓存，避免更新中途扫描到过渡状态。
+        auto installingRevoker = catalog.PackageInstalling(
+            winrt::auto_revoke,
+            [](const auto&, const winrt::Windows::ApplicationModel::PackageInstallingEventArgs& args) {
+                if (args.IsComplete() && args.ErrorCode().value >= 0) {
+                    winrt::hstring packageFullName;
+                    try {
+                        packageFullName = args.Package().Id().FullName();
+                    } catch (...) {
+                        // 完成事件本身足以失效缓存，包元数据只用于日志。
+                    }
+                    QueueUwpPackageChange("install", packageFullName);
+                }
+            }
+        );
+        auto updatingRevoker = catalog.PackageUpdating(
+            winrt::auto_revoke,
+            [](const auto&, const winrt::Windows::ApplicationModel::PackageUpdatingEventArgs& args) {
+                if (args.IsComplete() && args.ErrorCode().value >= 0) {
+                    winrt::hstring packageFullName;
+                    try {
+                        packageFullName = args.TargetPackage().Id().FullName();
+                    } catch (...) {
+                        // 完成事件本身足以失效缓存，包元数据只用于日志。
+                    }
+                    QueueUwpPackageChange("update", packageFullName);
+                }
+            }
+        );
+        auto uninstallingRevoker = catalog.PackageUninstalling(
+            winrt::auto_revoke,
+            [](const auto&, const winrt::Windows::ApplicationModel::PackageUninstallingEventArgs& args) {
+                if (args.IsComplete() && args.ErrorCode().value >= 0) {
+                    winrt::hstring packageFullName;
+                    try {
+                        packageFullName = args.Package().Id().FullName();
+                    } catch (...) {
+                        // 卸载完成后包对象可能已不可读，仍需通知主进程刷新缓存。
+                    }
+                    QueueUwpPackageChange("uninstall", packageFullName);
+                }
+            }
+        );
+
+        // 发布就绪状态后保持对象和事件撤销器存活，直到 JS 主动停止监听。
+        {
+            std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+            g_uwpPackageMonitorReady = true;
+            g_uwpPackageMonitorError.clear();
+        }
+        g_uwpPackageMonitorCv.notify_all();
+
+        std::unique_lock<std::mutex> lock(g_uwpPackageMonitorMutex);
+        g_uwpPackageMonitorCv.wait(lock, []() {
+            return !g_isUwpPackageMonitoring.load();
+        });
+    } catch (const winrt::hresult_error& error) {
+        // 把 WinRT 初始化错误同步给 start 调用，主进程可降级到启动校验。
+        {
+            std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+            g_uwpPackageMonitorError = winrt::to_string(error.message());
+            g_uwpPackageMonitorReady = false;
+            g_isUwpPackageMonitoring = false;
+        }
+        g_uwpPackageMonitorCv.notify_all();
+    } catch (const std::exception& error) {
+        // 保留标准异常信息，避免原生线程异常穿透导致进程终止。
+        {
+            std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+            g_uwpPackageMonitorError = error.what();
+            g_uwpPackageMonitorReady = false;
+            g_isUwpPackageMonitoring = false;
+        }
+        g_uwpPackageMonitorCv.notify_all();
+    }
+}
+
+/**
+ * 启动当前用户 UWP 包注册变化监听。
+ *
+ * @param info 第一个参数必须是接收包变化对象的 JavaScript 回调。
+ * @returns undefined。
+ * @throws JavaScript TypeError 回调参数无效时抛出。
+ * @throws JavaScript Error 监听已启动或 PackageCatalog 初始化失败时抛出。
+ */
+static Napi::Value StartUwpPackageMonitor(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsFunction()) {
+        Napi::TypeError::New(env, "Expected a callback function").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // 拒绝重复启动，防止同一 PackageCatalog 事件被多次订阅。
+    {
+        std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+        if (g_isUwpPackageMonitoring || g_uwpPackageTsfn != nullptr) {
+            Napi::Error::New(env, "UWP package monitor already started").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+
+    // 先建立 TSFN，确保原生事件到达时 JavaScript 回调已可用。
+    napi_value resourceName;
+    napi_create_string_utf8(env, "UwpPackageChangeCallback", NAPI_AUTO_LENGTH, &resourceName);
+    napi_status status = napi_create_threadsafe_function(
+        env,
+        info[0],
+        nullptr,
+        resourceName,
+        0,
+        1,
+        nullptr,
+        nullptr,
+        nullptr,
+        CallUwpPackageChangeJs,
+        &g_uwpPackageTsfn
+    );
+    if (status != napi_ok) {
+        Napi::Error::New(env, "Failed to create UWP package monitor callback").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+        g_uwpPackageMonitorReady = false;
+        g_uwpPackageMonitorError.clear();
+        g_isUwpPackageMonitoring = true;
+    }
+    g_uwpPackageMonitorThread = std::thread(RunUwpPackageMonitor);
+
+    // 等待订阅完成，让调用方能可靠获知权限或 WinRT 初始化错误。
+    std::string startError;
+    {
+        std::unique_lock<std::mutex> lock(g_uwpPackageMonitorMutex);
+        g_uwpPackageMonitorCv.wait(lock, []() {
+            return g_uwpPackageMonitorReady || !g_isUwpPackageMonitoring.load();
+        });
+        if (!g_uwpPackageMonitorReady) {
+            startError = g_uwpPackageMonitorError.empty()
+                ? "Failed to start UWP package monitor"
+                : g_uwpPackageMonitorError;
+        }
+    }
+
+    if (!startError.empty()) {
+        // 初始化失败时先回收线程和 TSFN，再把错误返回 JavaScript。
+        if (g_uwpPackageMonitorThread.joinable()) {
+            g_uwpPackageMonitorThread.join();
+        }
+        napi_release_threadsafe_function(g_uwpPackageTsfn, napi_tsfn_release);
+        g_uwpPackageTsfn = nullptr;
+        Napi::Error::New(env, startError).ThrowAsJavaScriptException();
+    }
+
+    return env.Undefined();
+}
+
+/**
+ * 停止 UWP 包注册变化监听并释放 WinRT 订阅与 JS 回调资源。
+ *
+ * @param info 当前 N-API 调用上下文。
+ * @returns undefined。
+ */
+static Napi::Value StopUwpPackageMonitor(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 先关闭事件入队边界，再唤醒专用线程撤销所有 WinRT 订阅。
+    {
+        std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+        g_isUwpPackageMonitoring = false;
+    }
+    g_uwpPackageMonitorCv.notify_all();
+
+    if (g_uwpPackageMonitorThread.joinable()) {
+        g_uwpPackageMonitorThread.join();
+    }
+
+    // 线程退出后不再有事件处理器持有回调，可以安全释放 TSFN。
+    {
+        std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
+        if (g_uwpPackageTsfn != nullptr) {
+            napi_release_threadsafe_function(g_uwpPackageTsfn, napi_tsfn_release);
+            g_uwpPackageTsfn = nullptr;
+        }
+        g_uwpPackageMonitorReady = false;
+        g_uwpPackageMonitorError.clear();
+    }
+
+    return env.Undefined();
+}
+
 // 辅助函数：解码 XML 实体（&amp; &#xHHHH; &#DDD; 等）
 static std::wstring DecodeXmlEntities(const std::wstring& input) {
     std::wstring result;
@@ -3212,6 +3489,79 @@ static std::wstring ReadFileToWString(const std::wstring& path) {
 
     std::wstring result(wideLen, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, buffer.data(), bytesRead, &result[0], wideLen);
+    return result;
+}
+
+/**
+ * 获取当前用户已注册包的稳定快照，用于补偿进程未运行期间错过的 PackageCatalog 事件。
+ *
+ * @param info 当前 N-API 调用上下文。
+ * @returns 按包完整名排序的字符串数组。
+ * @throws JavaScript Error 无法读取当前用户包注册表时抛出。
+ */
+static Napi::Value GetUwpPackageSnapshot(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    HKEY packageRepository = NULL;
+    LONG openResult = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages",
+        0,
+        KEY_READ,
+        &packageRepository
+    );
+    if (openResult != ERROR_SUCCESS) {
+        Napi::Error::New(
+            env,
+            "Failed to open current user package repository: " + std::to_string(openResult)
+        ).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // 只枚举包完整名，不读取 manifest，保持启动校验足够轻量。
+    DWORD subKeyCount = 0;
+    RegQueryInfoKeyW(
+        packageRepository,
+        NULL,
+        NULL,
+        NULL,
+        &subKeyCount,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    std::vector<std::wstring> packageFullNames;
+    packageFullNames.reserve(subKeyCount);
+    for (DWORD index = 0; index < subKeyCount; ++index) {
+        WCHAR subKeyName[512] = {0};
+        DWORD subKeyNameLength = 512;
+        if (
+            RegEnumKeyExW(
+                packageRepository,
+                index,
+                subKeyName,
+                &subKeyNameLength,
+                NULL,
+                NULL,
+                NULL,
+                NULL
+            ) == ERROR_SUCCESS
+        ) {
+            packageFullNames.emplace_back(subKeyName, subKeyNameLength);
+        }
+    }
+    RegCloseKey(packageRepository);
+
+    // 排序后快照与注册表枚举顺序无关，可直接持久化并逐项比较。
+    std::sort(packageFullNames.begin(), packageFullNames.end());
+    Napi::Array result = Napi::Array::New(env, packageFullNames.size());
+    for (uint32_t index = 0; index < packageFullNames.size(); ++index) {
+        result.Set(index, Napi::String::New(env, WideToUtf8(packageFullNames[index])));
+    }
     return result;
 }
 
@@ -5365,11 +5715,11 @@ static void ResolveShortcutEntryTarget(WindowsShortcutEntry& entry) {
 }
 
 /**
- * 在独立 STA 线程中并行解析快捷方式目标，并把 worker 异常带回调用线程。
+ * 在独立 STA 线程中并行解析快捷方式目标，单条异常时跳过对应快捷方式。
  *
  * @param entries 待原地解析和过滤的快捷方式条目。
  * @returns 无返回值。
- * @throws std::exception worker 执行或线程创建发生 C++ 异常时重新抛出。
+ * @throws std::exception worker 基础设施或线程创建发生 C++ 异常时重新抛出。
  */
 static void ResolveShortcutTargetsInParallel(std::vector<WindowsShortcutEntry>& entries) {
     if (entries.empty()) {
@@ -5405,7 +5755,12 @@ static void ResolveShortcutTargetsInParallel(std::vector<WindowsShortcutEntry>& 
                             break;
                         }
 
-                        ResolveShortcutEntryTarget(entries[index]);
+                        try {
+                            // 单个损坏快捷方式的可恢复 C++ 异常不能终止整个来源扫描。
+                            ResolveShortcutEntryTarget(entries[index]);
+                        } catch (...) {
+                            entries[index].sourceType = L"skip";
+                        }
                     }
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(workerErrorMutex);
@@ -6481,6 +6836,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
     exports.Set("startColorPicker", Napi::Function::New(env, StartColorPicker));
     exports.Set("stopColorPicker", Napi::Function::New(env, StopColorPicker));
+    exports.Set("startUwpPackageMonitor", Napi::Function::New(env, StartUwpPackageMonitor));
+    exports.Set("stopUwpPackageMonitor", Napi::Function::New(env, StopUwpPackageMonitor));
+    exports.Set("getUwpPackageSnapshot", Napi::Function::New(env, GetUwpPackageSnapshot));
     exports.Set("getUwpApps", Napi::Function::New(env, GetUwpApps));
     exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
     exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));

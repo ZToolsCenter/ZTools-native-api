@@ -40,7 +40,8 @@
               "gdiplus.lib",
               "dwmapi.lib",
               "gdi32.lib",
-              "imm32.lib"
+              "imm32.lib",
+              "windowsapp.lib"
             ],
             "msvs_settings": {
               "VCCLCompilerTool": {
