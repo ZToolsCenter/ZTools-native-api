@@ -13,7 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 
-// 工具栏按钮 -> SVG 文件名映射（顺序与 src/screenshot_windows.cpp 的 ToolButton 枚举一致）
+// 工具栏按钮 -> SVG 文件名映射（顺序与 src/screenshot/internal.h 的 ToolButton 枚举一致）
 // 分隔线（Separator）对应 null，不生成图标。
 const ICON_MAP = {
   Drag: 'drag',
@@ -24,27 +24,29 @@ const ICON_MAP = {
   Mosaic: 'mosaic',
   Text: 'text',
   Translate: 'translate',
+  LongCapture: 'long-capture',
   Undo: 'arrow-back-up',
   Redo: 'arrow-forward-up',
   Save: 'download',
   Cancel: 'x',
   Confirm: 'check',
+  // —— 长截图工具栏专用图标（不进 kIconSvgs 数组，长截图窗口按名直取常量）——
+  DirectionV: 'direction-vertical',
+  DirectionH: 'direction-horizontal',
+  AutoScrollV: 'auto-scroll-vertical',
+  AutoScrollH: 'auto-scroll-horizontal',
+  CropIcon: 'crop',
+  // —— 长截图裁剪 popover 子操作图标 ——
+  CropDiscardTop: 'crop-discard-top',
+  CropDiscardBottom: 'crop-discard-bottom',
+  CropDiscardLeft: 'crop-discard-left',
+  CropDiscardRight: 'crop-discard-right',
+  CropReset: 'crop-reset',
 };
 
 const ASSETS_DIR = path.join(__dirname, '..', 'src', 'assets');
 const OUT_DIR = path.join(__dirname, '..', 'src', 'generated');
 const OUT_FILE = path.join(OUT_DIR, 'icon_svgs.h');
-
-// C 字符串字面量转义：处理 " \ 和换行
-function toCLiteral(str) {
-  // 把字符串按行拆开，每行用独立字面量拼接，保证可读性且避免超长行
-  return str
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .split(/\r?\n/)
-    .map((line) => `    "${line}"`)
-    .join('\n');
-}
 
 function main() {
   if (!fs.existsSync(ASSETS_DIR)) {
@@ -76,9 +78,9 @@ function main() {
   // 所有图标文本的数组（按 ToolButton 枚举顺序，分隔线为 nullptr）
   lines.push('// 按 ToolButton 枚举顺序的 SVG 文本数组，分隔线为 nullptr。');
   lines.push('static const char* const kIconSvgs[] = {');
-  // 顺序：Drag Rect Circle Arrow Brush Mosaic Text Translate SEP1 Undo Redo SEP2 Save Cancel Confirm
+  // 顺序：Drag Rect Circle Arrow Brush Mosaic Text Translate LongCapture SEP1 Undo Redo SEP2 Save Cancel Confirm
   lines.push('    kIconSvg_Drag, kIconSvg_Rect, kIconSvg_Circle, kIconSvg_Arrow,');
-  lines.push('    kIconSvg_Brush, kIconSvg_Mosaic, kIconSvg_Text, kIconSvg_Translate, nullptr,');
+  lines.push('    kIconSvg_Brush, kIconSvg_Mosaic, kIconSvg_Text, kIconSvg_Translate, kIconSvg_LongCapture, nullptr,');
   lines.push('    kIconSvg_Undo, kIconSvg_Redo, nullptr,');
   lines.push('    kIconSvg_Save, kIconSvg_Cancel, kIconSvg_Confirm');
   lines.push('};');

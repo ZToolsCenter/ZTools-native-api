@@ -40,7 +40,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uiautomationcore.lib")
 
-#include "screenshot_windows.h"
+#include "screenshot/screenshot_windows.h"
 
 // DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
 #ifndef DWMWA_CLOAKED
@@ -3972,27 +3972,8 @@ static std::unique_ptr<Gdiplus::Bitmap> CreateBitmapFromIcon(
     return bitmap;
 }
 
-// 获取 PNG 编码器 CLSID
-int GetPngEncoderClsid(CLSID* pClsid) {
-    UINT num = 0u;
-    UINT size = 0u;
-    Gdiplus::GetImageEncodersSize(std::addressof(num), std::addressof(size));
-    if (size == 0u) return -1;
-
-    std::unique_ptr<Gdiplus::ImageCodecInfo> pImageCodecInfo(
-        static_cast<Gdiplus::ImageCodecInfo*>(static_cast<void*>(new BYTE[size])));
-    if (pImageCodecInfo == nullptr) return -1;
-
-    Gdiplus::GetImageEncoders(num, size, pImageCodecInfo.get());
-
-    for (UINT i = 0u; i < num; i++) {
-        if (std::wcscmp(pImageCodecInfo.get()[i].MimeType, L"image/png") == 0) {
-            *pClsid = pImageCodecInfo.get()[i].Clsid;
-            return (int)i;
-        }
-    }
-    return -1;
-}
+// GetPngEncoderClsid 已迁移至 src/screenshot/output_windows.cpp（CR-019），
+// 此处经 screenshot_windows.h 声明继续复用（含进程内 CLSID 缓存）。
 
 // 将 HICON 转换为 PNG 字节数组
 static std::vector<unsigned char> HIconToPNG(HICON hIcon) {
@@ -6830,6 +6811,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startRegionCapture", Napi::Function::New(env, StartRegionCapture));
     exports.Set("primeScreenshotFrame", Napi::Function::New(env, PrimeScreenshotFrame));
     exports.Set("startRegionCaptureWithPrimedFrame", Napi::Function::New(env, StartRegionCaptureWithPrimedFrame));
+    // 中止进行中的长截图滚动捕获
+    exports.Set("abortLongCapture", Napi::Function::New(env, AbortLongCapture));
     exports.Set("getClipboardFiles", Napi::Function::New(env, GetClipboardFiles));
     exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
     exports.Set("startMouseMonitor", Napi::Function::New(env, StartMouseMonitor));

@@ -491,12 +491,20 @@ class ScreenCapture {
    * 启动区域截图
    * @param {Object|Function} [options] - 截图选项；直接传函数时按旧签名 start(callback) 处理
    * @param {boolean} [options.autoConfirm=true] - 选区确定后直接出图，跳过编辑态（工具栏/标注）
+   * @param {Object} [options.longCapture] - 长截图（手动滚动捕获）参数，进入编辑态后点工具栏「长截图」按钮生效。
+   *   点击后进入长截图预览界面：全屏黑色遮罩保留、选区框与底部工具栏保持展示（仅剩完成/取消，
+   *   其他操作禁用）；选区内直通底层应用，滚轮滚动页面（鼠标按键被吞，防止误触），
+   *   侧边小地图实时展示拼接长图（外框=已捕获区域，蓝色内框=当前可见区域，随滚动移动）；
+   *   向下滚动追加新内容到底部、向上滚动前插到头部；点「完成」出图、「取消」或 ESC 中止
+   * @param {number} [options.longCapture.maxFrames=100] - 最大拼接帧数（1~200，达到上限自动完成）
+   * @param {number} [options.longCapture.interval=250] - 滚轮停止后等待内容稳定的毫秒数（50~2000，采样防抖；
+   *   滚动进行中也会按不低于 min(interval, 250)ms 的节拍主动采样，保证相邻帧有大重叠区域）
    * @param {Function} [callback] - 截图完成时的回调函数
    * - 参数: { success: boolean, width?: number, height?: number, base64?: string }
    * - success: 是否成功截图
-   * - width: 截图宽度（成功时）
-   * - height: 截图高度（成功时）
-   * - base64: 截图 PNG 的 base64（成功时）
+   * - width: 截图宽度（成功时；长截图为拼接后的总宽度）
+   * - height: 截图高度（成功时；长截图为拼接后的总高度）
+   * - base64: 截图 PNG 的 base64（成功时；长截图已同时写入剪贴板）
    *
    * @example
    * // 默认：框选/点选完成即出图，不再二次编辑
@@ -504,6 +512,12 @@ class ScreenCapture {
    *
    * // 进入编辑态：选区确定后停留在工具栏，可标注/调整
    * ScreenCapture.start({ autoConfirm: false }, (result) => { ... });
+   *
+   * // 编辑态 + 长截图：选区确定后点工具栏「长截图」按钮进入手动滚动捕获
+   * ScreenCapture.start({
+   *   autoConfirm: false,
+   *   longCapture: { maxFrames: 100, interval: 250 }
+   * }, (result) => { ... });
    */
   static start(options, callback) {
     if (platform === 'darwin') {
@@ -524,6 +538,17 @@ class ScreenCapture {
     addon.startRegionCaptureWithPrimedFrame(options || {}, (result) => {
       callback(result);
     });
+  }
+
+  /**
+   * 中止进行中的长截图滚动捕获（Windows）
+   * 滚动捕获会以失败结果（success: false）回调后结束
+   */
+  static abortLongCapture() {
+    if (platform === 'darwin') {
+      throw new Error('ScreenCapture is not yet supported on macOS');
+    }
+    addon.abortLongCapture();
   }
 }
 
