@@ -27,7 +27,25 @@
         [
           "OS=='win'",
           {
-            "sources": ["src/binding_windows.cpp", "src/screenshot_windows.cpp"],
+            "sources": [
+              "src/binding_windows.cpp",
+              "src/screenshot/capture_windows.cpp",
+              "src/screenshot/icons_windows.cpp",
+              "src/screenshot/overlay_ui_windows.cpp",
+              "src/screenshot/overlay_paint_windows.cpp",
+              "src/screenshot/overlay_input_windows.cpp",
+              "src/screenshot/annotations_windows.cpp",
+              "src/screenshot/mosaic_windows.cpp",
+              "src/screenshot/output_windows.cpp",
+              "src/screenshot/lc_match_core.cpp",
+              "src/screenshot/lc_stitch_state.cpp",
+              "src/screenshot/lc_frame_io.cpp",
+              "src/screenshot/lc_panel_ui.cpp",
+              "src/screenshot/lc_toolbar_ui.cpp",
+              "src/screenshot/lc_session.cpp",
+              "src/screenshot/wndproc_windows.cpp",
+              "src/screenshot/session_windows.cpp"
+            ],
             "defines": ["_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"],
             "libraries": [
               "user32.lib",
