@@ -179,6 +179,11 @@ struct LongCaptureContext {
     // 虚拟屏幕（逻辑坐标）与 DPI
     int vx = 0, vy = 0, vw = 0, vh = 0;
     double dpiScale = 1.0;   // 单一 scale 模型的已知限制见 CaptureContext.dpiScale 注释
+    // UI 界面（chrome）缩放 = GetDpiForSystem/96，与编辑态工具栏/面板（CalcToolbarMetrics(uiScale)）
+    // 同源。内容几何换算（rows/ds、cropRect、物理采样偏移）一律用 dpiScale；PMv2 捕获线程下
+    // GetSystemMetrics 已返回物理像素，dpiScale = physVw/vw 恒为 1，若 chrome 也乘它，
+    // 工具栏/面板在任意缩放比下都保持 96 DPI 尺寸（高分屏下过小），故界面尺寸一律用本值。
+    double uiScale = 1.0;
 
     // 选区（逻辑虚拟屏幕坐标，已规范化）
     RECT selection = {};

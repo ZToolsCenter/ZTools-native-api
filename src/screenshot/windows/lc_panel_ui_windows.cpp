@@ -11,7 +11,8 @@ const int LONG_MASK_GRAY = 44;
 
 const BYTE LONG_MASK_ALPHA = 0xA0;
 
-// 预览面板布局常量（逻辑像素，绘制时按 dpiScale 缩放）。
+// 预览面板布局常量（逻辑像素，窗口尺寸/内边距等界面 chrome 按 uiScale 缩放，
+// 内容显示尺寸换算用 dpiScale，区分见 LongCaptureContext.uiScale 注释）。
 // 面板只保留小地图本体（帧提示与完成/取消按钮已移至选区底部的长截图工具栏窗口）。
 
 const int LC_PANEL_W = 232;   // 面板总宽
@@ -31,7 +32,7 @@ static const int LC_PANEL_MIN_H = 48; // 预览最小高度（逻辑像素，防
 static RECT LongCapturePanelPreviewRect(LongCaptureContext* c, int cw, int ch) {
     RECT r = {0, 0, 0, 0};
     if (!c || c->stitchH <= 0 || c->physW <= 0) return r;
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 预览区内边距为界面 chrome 尺寸
     int pad = (int)(LC_PANEL_PAD * ds + 0.5);
     int availW = cw - pad * 2;
     int availH = ch - pad * 2;
@@ -162,7 +163,7 @@ void LongCapturePanelRender(HWND panel, LongCaptureContext* c) {
     if (!EnsureArgbSurface(s_lcPnSurfDC, s_lcPnSurfBmp, s_lcPnSurfBits,
                            s_lcPnSurfW, s_lcPnSurfH, cw, ch))
         return;
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 面板圆角半径为界面 chrome 尺寸
     float radius = (float)(8 * ds + 0.5);
     {
         Gdiplus::Bitmap surf(cw, ch, cw * 4, PixelFormat32bppPARGB, (BYTE*)s_lcPnSurfBits);
@@ -383,7 +384,7 @@ LRESULT CALLBACK LongCapturePanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 void LongCapturePanelUpdate(LongCaptureContext* c) {
     HWND panel = g_longControlWindow;
     if (!panel || c->stitchH <= 0 || c->physW <= 0) return;
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 面板 pad/避让边距为界面 chrome 尺寸
     auto sc = [ds](int v) { return (int)(v * ds + 0.5); };
     RECT wr;
     GetWindowRect(panel, &wr);
@@ -396,11 +397,13 @@ void LongCapturePanelUpdate(LongCaptureContext* c) {
     int rows = rowEnd - rowStart;
     if (rows <= 0) return;
     // 显示空间逻辑尺寸统一公式：固定轴取 cropRect 逻辑尺寸（纵向=宽/横向=高，
-    // 无 /ds 舍入往返误差），滚动轴取 rows / ds。与 LongCaptureOutputSizeLabel、
+    // 无 /ds 舍入往返误差），滚动轴取 rows / dpiScale（内容显示尺寸换算用几何缩放，
+    // 不随上面的 chrome uiScale 变）。与 LongCaptureOutputSizeLabel、
     // LongCapturePanelPreviewRect 同一换算口径。
-    double dispWLogical = c->horizontal ? rows / ds : (double)(c->cropRect.right - c->cropRect.left);
+    double dispWLogical = c->horizontal ? rows / c->dpiScale
+                                        : (double)(c->cropRect.right - c->cropRect.left);
     double dispHLogical = c->horizontal ? (double)(c->cropRect.bottom - c->cropRect.top)
-                                        : rows / ds;
+                                        : rows / c->dpiScale;
     if (dispWLogical < 1.0) dispWLogical = 1.0;
     int prevH = (int)(dispHLogical * ((double)availW / dispWLogical) + 0.5);
     // 屏幕下沿约束：预览不超过面板顶部以下剩余空间与屏高 45%
@@ -446,7 +449,7 @@ HWND LongCaptureCreatePanel(CaptureContext* ctx, LongCaptureContext* c) {
         RegisterClassExW(&wc);
         registered = true;
     }
-    double ds = ctx->dpiScale;
+    double ds = c->uiScale;   // 面板窗口尺寸/边距为界面 chrome 尺寸
     auto sc = [ds](int v) { return (int)(v * ds + 0.5); };
     int winW = sc(LC_PANEL_W);
     int pad = sc(LC_PANEL_PAD);

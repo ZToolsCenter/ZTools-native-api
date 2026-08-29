@@ -18,7 +18,8 @@
 // 菜单浮层绝不进入选区画面——否则会被逐帧采样采进拼接内容、污染重叠识别基准。
 
 
-// 布局常量（逻辑像素，绘制/命中测试时按 dpiScale 缩放）
+// 布局常量（逻辑像素，绘制/命中测试时按 uiScale 缩放——界面 chrome 用 uiScale，
+// 内容几何换算用 dpiScale，两者区分见 LongCaptureContext.uiScale 注释）
 
 static const int LC_BAR_H = 44;        // 工具栏高度（图标按钮 32 + 上下内边距 6）
 
@@ -182,7 +183,7 @@ static void LongCaptureOutputSizeLabel(const LongCaptureContext* c, wchar_t* buf
 
 static LongToolbarLayout LongCaptureToolbarLayout(LongCaptureContext* c, int cw, int ch) {
     LongToolbarLayout L = {};
-    double ds = c ? c->dpiScale : 1.0;
+    double ds = c ? c->uiScale : 1.0;   // 界面 chrome 尺寸（按钮/间距/菜单）按 uiScale
     auto sc = [ds](int v) { return (int)(v * ds + 0.5); };
     int barH = sc(LC_BAR_H), pad = sc(LC_BAR_PAD), btnH = sc(LC_BAR_BTN_H);
     bool popMenu = c && c->menuKind != LCM_None;
@@ -245,10 +246,10 @@ static LongToolbarLayout LongCaptureToolbarLayout(LongCaptureContext* c, int cw,
     return L;
 }
 
-// 工具栏窗口总宽（逻辑像素 × dpiScale），与 LongCaptureToolbarLayout 的横向排布严格一致
+// 工具栏窗口总宽（逻辑像素 × uiScale），与 LongCaptureToolbarLayout 的横向排布严格一致
 
 static int LongCaptureToolbarWindowWidth(LongCaptureContext* c) {
-    double ds = c ? c->dpiScale : 1.0;
+    double ds = c ? c->uiScale : 1.0;
     auto sc = [ds](int v) { return (int)(v * ds + 0.5); };
     int cell = LC_BAR_BTN_W + LC_BAR_GAP;
     int content = LC_BAR_BTN_W + LC_BAR_GAP   // 最左 6 点拖拽把手格
@@ -270,7 +271,7 @@ static int LongCaptureHitTestToolbar(int x, int y, const LongToolbarLayout& L) {
 // 方向/裁剪共用同一套布局与命中机制）
 
 static RECT LongCapturePopoverCellRect(const LongCaptureContext* c, const LongToolbarLayout& L, int i) {
-    double ds = c ? c->dpiScale : 1.0;
+    double ds = c ? c->uiScale : 1.0;   // popover cell 为界面 chrome 尺寸
     int pad = (int)(LC_POP_PAD * ds + 0.5);
     int cell = (int)(LC_POP_CELL_W * ds + 0.5);
     int gap = (int)(LC_POP_CELL_GAP * ds + 0.5);
@@ -489,7 +490,7 @@ void LongCaptureToolbarRender(LongCaptureContext* c, int dstX, int dstY, int w, 
                            s_lcTbSurfW, s_lcTbSurfH, w, h))
         return;
     LongToolbarLayout L = LongCaptureToolbarLayout(c, w, h);
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 圆角/字号/图标均为界面 chrome 尺寸
     int radius = (int)(LC_BAR_RADIUS * ds + 0.5);
     {
         Gdiplus::Bitmap surf(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)s_lcTbSurfBits);
@@ -772,7 +773,7 @@ static void LongCaptureTooltipRender(LongCaptureContext* c, int dstX, int dstY, 
     if (!EnsureArgbSurface(s_lcTipSurfDC, s_lcTipSurfBmp, s_lcTipSurfBits,
                            s_lcTipSurfW, s_lcTipSurfH, w, h))
         return;
-    double ds = c ? c->dpiScale : 1.0;
+    double ds = c ? c->uiScale : 1.0;   // 气泡圆角/内边距/字号为界面 chrome 尺寸
     {
         Gdiplus::Bitmap surf(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)s_lcTipSurfBits);
         Gdiplus::Graphics g(&surf);
@@ -811,7 +812,7 @@ static bool LongCaptureTooltipVisible() {
 
 static void LongCaptureTooltipShow(LongCaptureContext* c, const wchar_t* text, const RECT& anchor) {
     if (!c || !text || !*text) return;
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 气泡测量/内边距/锚距为界面 chrome 尺寸
     int padX, padY;
     LongCaptureTipPadding(ds, padX, padY);
     // 文本测量：必须与绘制同为 GDI+（MeasureString + 同款 Font/StringFormat）。
@@ -889,7 +890,7 @@ static void LongCaptureTooltipCancel() {
 //（此时可能盖到选区边角：菜单是点击即散的瞬态浮层，污染帧会被匹配管线安全拒绝）。
 
 static bool LongCaptureMenuOpenBelow(LongCaptureContext* c, const RECT& bar) {
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 菜单面板高/间距为界面 chrome 尺寸（选区/屏幕边界为屏幕坐标不缩放）
     int gap = (int)(LC_MENU_GAP * ds + 0.5);
     int menuH = (int)(LongCaptureMenuHeightLogi(c) * ds + 0.5);
     bool below;
@@ -925,7 +926,7 @@ void LongCaptureSetMenu(LongCaptureContext* c, LCMenuKind kind) {
     c->menuHover = -1;
     LongCaptureTooltipCancel();
     if (!tb) return;
-    double ds = c->dpiScale;
+    double ds = c->uiScale;   // 底条高/菜单高/间距为界面 chrome 尺寸
     int barH = (int)(LC_BAR_H * ds + 0.5);
     int gap = (int)(LC_MENU_GAP * ds + 0.5);
     RECT wr;
@@ -1009,8 +1010,9 @@ void LongCaptureSwitchDirection(LongCaptureContext* c) {
     // 帧缓冲转置复用纵向管线：physW/physH 交换（capW/capH 的屏幕采样 DIB 不变）
     c->physW = c->horizontal ? c->capH : c->capW;
     c->physH = c->horizontal ? c->capW : c->capH;
-    // 缩略图列宽随新帧宽重算（面板预览内宽，不超过帧宽）
-    int previewPx = (int)((LC_PANEL_W - 2 * LC_PANEL_PAD) * c->dpiScale + 0.5);
+    // 缩略图列宽随新帧宽重算（面板预览内宽，物理像素按 uiScale，与面板窗口尺寸同源，
+    // 不超过帧宽）
+    int previewPx = (int)((LC_PANEL_W - 2 * LC_PANEL_PAD) * c->uiScale + 0.5);
     c->thumbW = (std::min)((std::max)(1, previewPx), c->physW);
     LongCaptureResetSession(c);
 }
@@ -1134,7 +1136,7 @@ LRESULT CALLBACK LongCaptureToolbarWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         if (c->tbDragging && GetCapture() == hwnd) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ClientToScreen(hwnd, &pt);
-            double ds = c->dpiScale;
+            double ds = c->uiScale;   // 拖拽边界留白为界面 chrome 尺寸
             auto sc = [ds](int v) { return (int)(v * ds + 0.5); };
             RECT wr;
             GetWindowRect(hwnd, &wr);
@@ -1367,7 +1369,7 @@ HWND LongCaptureCreateToolbar(CaptureContext* ctx, LongCaptureContext* c) {
         RegisterClassExW(&wc);
         registered = true;
     }
-    double ds = ctx->dpiScale;
+    double ds = c->uiScale;   // 窗口尺寸/边距/图标光栅化均为界面 chrome 尺寸
     auto sc = [ds](int v) { return (int)(v * ds + 0.5); };
     // 图标缓存：按当前 DPI 光栅化（与主截图工具栏同比例：按钮边长 − 8 后缩放）
     s_lcIcons.Init(sc(LC_BAR_BTN_W - 8) + 2);

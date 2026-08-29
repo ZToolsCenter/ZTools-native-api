@@ -47,6 +47,7 @@ void BeginLongCapture(CaptureContext* ctx, HWND overlayHwnd) {
     lc->vx = ctx->virtualX; lc->vy = ctx->virtualY;
     lc->vw = ctx->virtualW; lc->vh = ctx->virtualH;
     lc->dpiScale = ctx->dpiScale;
+    lc->uiScale = GetDpiScaleFactor();
     lc->selection = ctx->selection;
 
     // 采样裁剪 = 选区每边内缩（公式收口见 CalcSampleCrop 注释），换算物理像素（与 ExtractRegionResult 同式）
@@ -74,8 +75,9 @@ void BeginLongCapture(CaptureContext* ctx, HWND overlayHwnd) {
         lc->physOriginX = (int)(lc->vx * ds);
         lc->physOriginY = (int)(lc->vy * ds);
     }
-    // 面板两级缩略图固定列宽 = 面板预览内宽（物理像素），不超过选区宽度
-    int previewPx = (int)((LC_PANEL_W - 2 * LC_PANEL_PAD) * ds + 0.5);
+    // 面板两级缩略图固定列宽 = 面板预览内宽（物理像素，按 uiScale；面板窗口尺寸同源），
+    // 不超过选区宽度
+    int previewPx = (int)((LC_PANEL_W - 2 * LC_PANEL_PAD) * lc->uiScale + 0.5);
     lc->thumbW = (std::min)((std::max)(1, previewPx), lc->physW);
 
     g_longCtx.store(lc);
