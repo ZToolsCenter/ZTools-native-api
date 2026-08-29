@@ -1,5 +1,5 @@
 // 长截图子系统：会话主循环 / 生命周期 / 全局状态。
-// CR-021 拆分自 long_capture_windows.cpp 的「主循环 + 生命周期」段。
+// 拆分自 long_capture_windows.cpp 的「主循环 + 生命周期」段。
 // 本文件定义长截图会话级全局状态（g_longCtx / 控制窗口句柄 / 参数默认值），
 // 手动滚动捕获主循环 RunLongCapture，以及会话初始化 BeginLongCapture、
 // JS 线程中止 LongCaptureAbort 与清理入口 DestroyLongCaptureContext。
@@ -23,15 +23,9 @@ HWND g_longToolbarWindow = NULL; // 选区底部工具栏（宽高/方向/自动
 HWND g_longMaskWindow = NULL;    // 长截图全屏灰色蒙版（半透明 + 点击穿透）
 
 // 长截图参数（初值即默认值；每次 start() 会先重置为默认再按 JS 覆盖，避免跨会话粘滞）：
-int g_lcMaxFrames = 100;         // 默认最大拼接帧数（1~200，start() 的 longCapture.maxFrames 可配；
-                                 // 滚动中主动高频采样使帧数消耗更快，默认值随之调高）
 
-int g_lcInterval = 250;          // 默认滚轮防抖间隔 ms（50~2000，start() 的 longCapture.interval 可配）
+int g_lcInterval = 250;          // 默认滚轮停止后等待内容稳定的毫秒数（采样防抖）
 
-
-// 拼接总像素上限：超过即自动完成，防止超大选区/超多帧下内存与编码雪崩（约 800MB BGRA）
-
-const long long LONG_CAPTURE_MAX_PIXELS = 200000000LL;
 
 // 构造失败结果并经截图会话回调回传 JS（success=false）。
 // 统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放防泄漏。
@@ -49,7 +43,6 @@ void LongCaptureEmitFailure() {
 
 void BeginLongCapture(CaptureContext* ctx, HWND overlayHwnd) {
     LongCaptureContext* lc = new LongCaptureContext();
-    lc->maxFrames = g_lcMaxFrames;
     lc->interval = g_lcInterval;
     lc->vx = ctx->virtualX; lc->vy = ctx->virtualY;
     lc->vw = ctx->virtualW; lc->vh = ctx->virtualH;
@@ -251,9 +244,6 @@ bool RunLongCapture(LongCaptureContext* c) {
                 c->frameCount.fetch_add(1);
                 LongCapturePanelUpdate(c);
                 LongCaptureToolbarRepaint();   // 宽×高标签刷新
-                if (c->frameCount.load() >= c->maxFrames) break;   // 帧数上限：自动完成
-                if ((long long)c->physW * c->stitchH >= LONG_CAPTURE_MAX_PIXELS)
-                    break;                                         // 内存上限：自动完成
             } else if (oc == LCSampleOutcome::Repositioned) {
                 // 反向回滚未越出已捕获边界：视口基准已确认推进（小地图当前区域标注随
                 // committedContentTop 移动），无新增行——不计帧数、不重算面板尺寸；
@@ -349,7 +339,7 @@ void LongCaptureAbort() {
 
 
 // 释放长截图上下文的采样 DIB 段（dibDC/dibBmp/dibBits）。
-// CR-021：原 wndproc_windows.cpp 的 WM_LONGCAPTURE_RUN 清理段手动释放 lc->dibDC/dibBmp
+// 原 wndproc_windows.cpp 的 WM_LONGCAPTURE_RUN 清理段手动释放 lc->dibDC/dibBmp
 // 的跨界所有权收进此处统一释放——调用方（wndproc 清理段）改为调用本函数，
 // 释放语义、顺序、守卫（if (lc->dibDC) DeleteDC ...）与原实现逐字一致。
 void DestroyLongCaptureContext(LongCaptureContext* lc) {

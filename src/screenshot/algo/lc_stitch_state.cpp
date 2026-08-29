@@ -1,8 +1,12 @@
 // 长截图子系统：可写累计状态层（提交 / 跟踪 / 历史 / Weak 候选 / 裁剪 / 稳定性 / 管线）。
-// CR-021 拆分自 long_capture_windows.cpp 的「Tentative 跟踪 / 提交阶段 / 单帧管线」段。
+// 拆分自 long_capture_windows.cpp 的「Tentative 跟踪 / 提交阶段 / 单帧管线」段。
 // 本文件是唯一允许修改累计拼接状态（body/headRev/stitchH/lastFrame/lastMatch/offsetHistory）
 // 的位置；LongCaptureTryStitch 是单帧「识别→校验→提交」管线入口。
-#include "internal.h"
+// 平台兼容（算法逻辑零改动）：本文件为纯算法，只依赖 long_capture_internal.h
+// （跨平台唯一权威，双平台同一份定义）与 lc_platform.h（平台类型别名 /
+// WHEEL_DELTA / GetTickCount 等价物，见其头部的依赖剥离验证结论）；
+// internal.h（napi / GDI+ 依赖链）仅 Windows UI/IO 层使用，算法层不再触碰。
+#include "lc_platform.h"
 #include "long_capture_internal.h"
 
 // 可条件编译的调试日志（构建加 /DLC_DEBUG_LOG 启用，经 OutputDebugStringA 输出到调试器）：

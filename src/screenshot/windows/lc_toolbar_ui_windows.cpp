@@ -1,10 +1,10 @@
 // 长截图子系统：选区底部工具栏 UI（工具栏/popover/tooltip/图标缓存/自动滚动/裁剪菜单）。
-// CR-021 拆分自 long_capture_windows.cpp 的「长截图工具栏」段。
+// 拆分自 long_capture_windows.cpp 的「长截图工具栏」段。
 // 工具栏是独立 TOPMOST 分层弹窗（WS_EX_LAYERED），消息由 RunLongCapture 泵循环分发，
 // 全部视觉内容由 LongCaptureToolbarRender 整幅渲染后 UpdateLayeredWindow 原子提交。
 #include "internal.h"
 #include "long_capture_internal.h"
-#include "../generated/icon_svgs.h"   // 工具栏图标 SVG 文本（构建期由 scripts/gen-icons.js 生成）
+#include "../../generated/icon_svgs.h"   // 工具栏图标 SVG 文本（构建期由 scripts/gen-icons.js 生成）
 
 // ==================== 长截图工具栏（选区底部悬浮窗口） ====================
 // 小地图面板只保留预览；全部操作集中到本工具栏，从左到右（图标按钮）：
@@ -159,7 +159,7 @@ static bool LongCaptureMenuRowEnabled(const LongCaptureContext* c, int row) {
 // 预览宽×高标签（逻辑像素，含裁剪窗口；横向模式宽高已回转）
 // 显示空间逻辑尺寸换算统一为：固定轴取 cropRect（逻辑源，无 /ds 舍入往返误差），
 // 滚动轴取 rows / ds（物理行数 ÷ scale）。与 LongCapturePanelUpdate/PanelPreviewRect
-// 同一公式，消除原先三种写法并存（CR-023）。
+// 同一公式，消除原先三种写法并存。
 
 static void LongCaptureOutputSizeLabel(const LongCaptureContext* c, wchar_t* buf, size_t n) {
     double ds = c ? c->dpiScale : 1.0;

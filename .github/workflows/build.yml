@@ -38,20 +38,70 @@ jobs:
         run: |
           mkdir -p lib
 
+          # 长截图算法层 C++ 对象（与 scripts/build-swift.sh
+          # 逐字一致，两处编译参数必须同步修改。Apple clang 的 C++ 不支持 -Osize，
+          # 取等价的 -Oz）
+          LC_CXX_SOURCES=(
+            src/screenshot/algo/lc_match_core.cpp
+            src/screenshot/algo/lc_stitch_state.cpp
+            src/screenshot/macos/lc_bridge_mac.cpp
+          )
+          LC_CXX_FLAGS=(-c -std=c++17 -Oz -DNDEBUG -I src/screenshot/algo)
+
+          echo "Compiling long-capture algorithm layer objects (arm64)..."
+          mkdir -p build/lc-obj-arm64
+          LC_OBJS_ARM64=()
+          for src in "${LC_CXX_SOURCES[@]}"; do
+            obj="build/lc-obj-arm64/$(basename "${src%.cpp}").o"
+            clang++ "${LC_CXX_FLAGS[@]}" -arch arm64 -mmacosx-version-min=11.0 -o "$obj" "$src"
+            LC_OBJS_ARM64+=("$obj")
+          done
+
+          echo "Compiling long-capture algorithm layer objects (x86_64)..."
+          mkdir -p build/lc-obj-x86_64
+          LC_OBJS_X86_64=()
+          for src in "${LC_CXX_SOURCES[@]}"; do
+            obj="build/lc-obj-x86_64/$(basename "${src%.cpp}").o"
+            clang++ "${LC_CXX_FLAGS[@]}" -arch x86_64 -mmacosx-version-min=10.15 -o "$obj" "$src"
+            LC_OBJS_X86_64+=("$obj")
+          done
+
+          # Swift 源文件清单（多文件单模块编译；必须与 scripts/build-swift.sh 保持一致）
+          SWIFT_SOURCES=(
+            src/ZToolsNative.swift
+            src/screenshot/macos/ScreenshotMac.swift
+            src/screenshot/macos/ScreenshotOverlayMac.swift
+            src/screenshot/macos/ScreenshotPaintMac.swift
+            src/screenshot/macos/ScreenshotAnnotationsMac.swift
+            src/screenshot/macos/ScreenshotToolbarMac.swift
+            src/screenshot/macos/ScreenshotTextMac.swift
+            src/screenshot/macos/ScreenshotMosaicMac.swift
+            src/screenshot/macos/ScreenshotOutputMac.swift
+            src/screenshot/macos/ScreenshotLongCaptureMac.swift
+            src/screenshot/macos/ScreenshotLCPanelMac.swift
+            src/screenshot/macos/ScreenshotLCToolbarMac.swift
+            src/screenshot/macos/LCBridgeMac.swift
+            src/generated/icon_svgs.swift
+          )
+
           # 分别编译两个架构
           echo "Building arm64 version..."
           swiftc -emit-library \
             -o lib/libZToolsNative_arm64.dylib \
-            src/ZToolsNative.swift \
+            "${SWIFT_SOURCES[@]}" \
+            "${LC_OBJS_ARM64[@]}" \
             -framework Cocoa \
+            -lc++ \
             -target arm64-apple-macosx11.0 \
             -Osize
 
           echo "Building x86_64 version..."
           swiftc -emit-library \
             -o lib/libZToolsNative_x86_64.dylib \
-            src/ZToolsNative.swift \
+            "${SWIFT_SOURCES[@]}" \
+            "${LC_OBJS_X86_64[@]}" \
             -framework Cocoa \
+            -lc++ \
             -target x86_64-apple-macosx10.15 \
             -Osize
 
@@ -64,6 +114,7 @@ jobs:
 
           # 清理临时文件
           rm lib/libZToolsNative_arm64.dylib lib/libZToolsNative_x86_64.dylib
+          rm -rf build/lc-obj-arm64 build/lc-obj-x86_64
 
       - name: Verify build outputs
         run: |

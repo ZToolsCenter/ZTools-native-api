@@ -207,8 +207,7 @@ LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         LongCaptureContext* lc = g_longCtx.load();
         if (lc) {
             RunLongCapture(lc);
-            // 清理：释放采样 DIB 段（dibDC/dibBmp 跨界所有权收进 DestroyLongCaptureContext，
-            // CR-021）、销毁灰蒙版/小地图面板、释放上下文、结束截图会话
+            // 清理：释放采样 DIB 段（dibDC/dibBmp 跨界所有权收进 DestroyLongCaptureContext）、销毁灰蒙版/小地图面板、释放上下文、结束截图会话
             DestroyLongCaptureContext(lc);
             if (g_longMaskWindow) {
                 DestroyWindow(g_longMaskWindow);

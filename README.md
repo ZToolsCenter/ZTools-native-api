@@ -10,12 +10,13 @@ macOS 和 Windows 原生 API 的 Node.js 封装，使用 Swift + Win32 API + Nod
 4. **设置激活窗口** - 根据标识符激活指定应用
 5. **键盘模拟** - 模拟键盘按键和快捷键（支持修饰键）
 6. **粘贴模拟** - 模拟 Cmd+V (macOS) / Ctrl+V (Windows)
-7. **区域截图** - 选区截图并自动保存到剪贴板（Windows）
-8. **获取选中内容** - 获取当前选中的文本、文件或图像（支持 Cursor/VS Code 等编辑器）
-9. **鼠标监控** - 实时监听鼠标移动、点击事件
-10. **鼠标模拟** - 模拟鼠标移动、点击操作
-11. **取色器** - 全屏取色工具
-12. **设置文件窗口地址栏** - 跳转 Finder/Explorer 或文件选择对话框到指定路径
+7. **区域截图** - 选区截图并自动保存到剪贴板（双平台全功能：选区 + 编辑标注 + 圆角导出 + 保存对话框）
+8. **长截图** - 手动滚动捕获拼接长图（双平台全功能：特征匹配拼接、自动滚动、小地图、裁剪）
+9. **获取选中内容** - 获取当前选中的文本、文件或图像（支持 Cursor/VS Code 等编辑器）
+10. **鼠标监控** - 实时监听鼠标移动、点击事件
+11. **鼠标模拟** - 模拟鼠标移动、点击操作
+12. **取色器** - 全屏取色工具
+13. **设置文件窗口地址栏** - 跳转 Finder/Explorer 或文件选择对话框到指定路径
 
 ## 🔧 系统要求
 
@@ -99,18 +100,21 @@ WindowManager.simulateKeyboardTap('left');
 // 6. 模拟粘贴操作
 WindowManager.simulatePaste();
 
-// 7. 区域截图（仅 Windows）
+// 7. 区域截图（双平台全功能：选区 + 编辑标注 + 长截图）
 const { ScreenCapture } = require('ztools-native-api');
 
+// 默认：拖拽选区松手即出图
 ScreenCapture.start((result) => {
   if (result.success) {
     console.log(`截图成功！尺寸: ${result.width} x ${result.height}`);
-    console.log('截图已保存到剪贴板，可按 Ctrl+V 粘贴');
+    console.log('截图已保存到剪贴板，可按 Ctrl+V / Cmd+V 粘贴');
   } else {
-    console.log('截图已取消');
+    console.log('截图失败或已取消:', result.error || '');
   }
 });
-// 操作：拖拽选择区域后释放鼠标，或按 ESC 取消
+// 双平台流程一致：全屏暗化覆盖层 → 拖拽选区（或单击智能吸附窗口）→ 出图；
+// 按 ESC / 点右键取消；autoConfirm=false 可停留在编辑态进行标注/长截图
+// macOS 需要屏幕录制权限（+辅助功能权限），详见下文 API 说明
 
 // 8. 获取选中内容（支持文本、文件、图像）
 const { getSelectedContent } = require('ztools-native-api');
@@ -313,32 +317,55 @@ WindowManager.simulatePaste();
 
 ### `ScreenCapture`
 
-#### `ScreenCapture.start(callback)`
-启动区域截图（仅 Windows）
-- **参数**: `callback(result)` - 截图完成时的回调函数
-  - `result.success` (boolean) - 是否成功截图
-  - `result.width` (number) - 截图宽度（成功时）
-  - `result.height` (number) - 截图高度（成功时）
-- **平台**: ⚠️ 仅支持 Windows
+#### `ScreenCapture.prime()`
+预抓取当前虚拟屏幕帧（macOS 为所有显示器的并集）。`start()` 会优先消费未过期的预抓帧（2 秒内有效），过期/未命中时现场重抓。
+- **返回**: `boolean` - 是否抓取成功（macOS 未授权屏幕录制时返回 false，但不弹授权框——授权框只在 `start()` 会话内出现）
+- **平台**: ✅ Windows 和 macOS
 
-**功能说明**：
-- 调用后会创建全屏半透明黑色遮罩
-- 鼠标变为十字光标
-- 拖拽鼠标选择截图区域
-- 释放鼠标后自动截图并保存到剪贴板
-- 按 ESC 键可取消截图
+#### `ScreenCapture.start(options, callback)`
+启动区域截图
+- **参数**:
+  - `options` (Object，可选):
+    - `autoConfirm` (boolean，默认 `true`) - 选区确定后直接出图，跳过编辑态
+    - `longCapture.interval` (number，50~2000ms，默认 250) - 长截图采样防抖间隔（拼接无帧数/像素上限，可持续合并至用户主动结束）
+  - `callback(result)` - 截图完成时的回调函数
+    - `result.success` (boolean) - 是否成功截图
+    - `result.x` / `result.y` (number) - 选区左上角（成功时；屏幕全局逻辑坐标，左上原点）
+    - `result.x2` / `result.y2` (number) - 选区右下角（成功时）
+    - `result.width` (number) - 截图宽度（成功时）
+    - `result.height` (number) - 截图高度（成功时）
+    - `result.base64` (string) - 截图 PNG 的 base64，带 `data:image/png;base64,` 前缀（成功时；已同时写入剪贴板）
+    - `result.error` (string，可选) - 失败原因（macOS 屏幕录制权限不足时为 `'screen recording permission required'`）
+- **平台**: ✅ Windows 和 macOS（全功能对等）
+
+**平台差异**：
+- **交互流程一致**：全屏暗化覆盖层 + 拖拽选区/单击智能窗口吸附 → autoConfirm=true 松手直接出图，
+  autoConfirm=false 进入编辑态（工具栏 16 按钮、矩形/圆形/箭头/画笔/文字/马赛克标注、撤销/重做、
+  选区圆角手柄）→ 确定/保存/取消/长截图
+- **macOS**:
+  - 需要屏幕录制权限（未授权时首次 `start()` 弹系统授权框，拒绝后回调 `{ success: false, error: ... }`）
+  - 另需辅助功能权限：ESC/右键兜底取消（覆盖层失焦时仍可取消）、长截图滚轮观察与自动滚动（CGEventTap）
+  - `start()` 会**阻塞 JS 主线程**直至会话收束（覆盖层事件循环运行在调用线程上）；
+    长截图会话期间需从中止时，请从另一进程/线程调用 `abortLongCapture()`
+  - 选区坐标为屏幕全局逻辑坐标（左上原点）；输出图像为逻辑尺寸（Retina 下内部按物理像素捕获后缩回）
+- **Windows**: 全屏遮罩 + 拖拽选区 + 编辑标注 + 长截图全功能（坐标系为虚拟屏绝对坐标）
+- 会话进行中重复调用 `start()` 会抛出 `Error('Screenshot already in progress')`（双平台一致）
 
 **示例**:
 ```javascript
 ScreenCapture.start((result) => {
   if (result.success) {
     console.log(`截图成功！尺寸: ${result.width}x${result.height}`);
-    // 截图已在剪贴板中，可按 Ctrl+V 粘贴
+    // 截图已在剪贴板中，可按 Ctrl+V / Cmd+V 粘贴
   } else {
-    console.log('截图已取消');
+    console.log('截图失败或已取消:', result.error || '');
   }
 });
 ```
+
+#### `ScreenCapture.abortLongCapture()`
+中止进行中的长截图滚动捕获。滚动捕获会以失败结果（`success: false`）回调后结束（ESC/工具栏取消同语义：取消 = 失败收束）；无进行中的长截图时为安全空操作。
+- **平台**: ✅ Windows 和 macOS。macOS 的 `start()` 阻塞 JS 主线程期间，可从另一进程/工作线程调用（参考 `test/test-screenshot-mac.js` 的子进程注入示例）
 
 ---
 
@@ -410,6 +437,7 @@ npm test
 node test/test-keyboard.js         # 完整键盘测试
 node test/test-keyboard-simple.js  # 简单键盘测试
 node test/test-selected-content.js # 获取选中内容测试
+node test/test-screenshot-mac.js   # macOS 区域截图交互测试（真机手工验收，见脚本头说明）
 ```
 
 ## ⚠️ 平台差异
@@ -420,9 +448,13 @@ node test/test-selected-content.js # 获取选中内容测试
 | **激活限制** | 较宽松 | 严格（需要线程附加 hack） |
 | **剪贴板监控** | 轮询 `changeCount` | 消息循环 + `WM_CLIPBOARDUPDATE` |
 | **键盘模拟** | ✅ 需要辅助功能权限 | ✅ 无需特殊权限 |
-| **区域截图** | ❌ 暂不支持 | ✅ 支持（分层窗口 + GDI） |
+| **区域截图** | ✅ 支持（全功能：选区 + 标注 + 圆角导出 + 保存） | ✅ 支持（全功能：选区 + 标注 + 圆角导出 + 保存） |
+| **长截图** | ✅ 支持（拼接/自动滚动/小地图/裁剪） | ✅ 支持（拼接/自动滚动/小地图/裁剪） |
+| **截图线程模型** | ⚠️ `start()` 阻塞 JS 主线程直至会话收束（覆盖层事件循环在调用线程上） | 独立捕获线程，`start()` 立即返回 |
+| **截图标注** | ✅ 矩形/椭圆/箭头/画笔/文字（IME）/马赛克，行为对齐 | ✅ 同左 |
+| **截图输出** | ✅ PNG base64 + 剪贴板（原生支持透明 alpha）+ 保存对话框 + 圆角透明导出 | ✅ 同左（圆角透明走 `CF_DIB(V4)+PNG` 双格式） |
 | **获取选中内容** | ✅ 支持（模拟复制） | ✅ 支持（UI Automation + 剪贴板回退） |
-| **权限要求** | 辅助功能权限（键盘模拟） | 无特殊要求 |
+| **权限要求** | 辅助功能权限（键盘模拟；截图的 ESC 兜底取消/滚轮观察/自动滚动）+ 屏幕录制权限（截图） | 无特殊要求 |
 
 ## 📝 注意事项
 
@@ -433,6 +465,18 @@ node test/test-selected-content.js # 获取选中内容测试
   - 系统偏好设置 → 隐私与安全性 → 辅助功能
   - 将你的应用或终端添加到允许列表
   - 首次调用会自动提示授权
+- **区域截图需要屏幕录制权限**：
+  - 系统设置 → 隐私与安全性 → 屏幕录制
+  - 首次调用 `ScreenCapture.start()` 会自动弹出系统授权框；授权可能需要重启宿主进程后生效
+  - 未授权时回调 `{ success: false, error: 'screen recording permission required' }`
+  - `ScreenCapture.prime()` 预检未授权时直接返回 false，不弹授权框
+- **截图完整体验还建议授予辅助功能权限**：
+  - ESC/右键兜底取消（覆盖层失焦时仍可取消，未授权时降级为覆盖层自身按键处理）
+  - 长截图的滚轮观察与自动滚动（CGEventTap）
+- **macOS 截图会话会阻塞 JS 主线程**：`start()` 从调用起阻塞至会话收束（回调在其后触发）；
+  Electron/Node 宿主如需在会话期间执行其他逻辑，请放在 worker 线程或提前调度
+- **交互测试脚本**：`node test/test-screenshot-mac.js`（权限预检 / 成功回调契约 / 编辑态与
+  ESC 取消 / 长截图 abort，全交互式，需在真机上按脚本指引执行）
 
 ### Windows
 - Process ID 每次启动都会变化，不适合持久化存储

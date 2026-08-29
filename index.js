@@ -113,11 +113,9 @@ class ClipboardMonitor {
       throw new Error('files array cannot be empty');
     }
 
-    if (platform === 'win32') {
+    if (platform === 'win32' || platform === 'darwin') {
+      // Windows 与 macOS 原生层均已实现（macOS 经 Swift NSPasteboard 写入文件 URL）
       return addon.setClipboardFiles(files);
-    } else if (platform === 'darwin') {
-      // macOS 暂不支持
-      throw new Error('setClipboardFiles is not yet supported on macOS');
     }
     return false;
   }
@@ -476,14 +474,11 @@ class ColorPicker {
 // 区域截图类
 class ScreenCapture {
   /**
-   * 预抓取当前虚拟屏幕帧
+   * 预抓取当前虚拟屏幕帧（macOS 为所有显示器的并集）
+   * 帧在 2 秒内有效：start() 会优先消费未过期的预抓帧，过期/未命中时现场重抓
    * @returns {boolean} 是否抓取成功
    */
   static prime() {
-    if (platform === 'darwin') {
-      throw new Error('ScreenCapture is not yet supported on macOS');
-    }
-
     return addon.primeScreenshotFrame();
   }
 
@@ -495,16 +490,28 @@ class ScreenCapture {
    *   点击后进入长截图预览界面：全屏黑色遮罩保留、选区框与底部工具栏保持展示（仅剩完成/取消，
    *   其他操作禁用）；选区内直通底层应用，滚轮滚动页面（鼠标按键被吞，防止误触），
    *   侧边小地图实时展示拼接长图（外框=已捕获区域，蓝色内框=当前可见区域，随滚动移动）；
-   *   向下滚动追加新内容到底部、向上滚动前插到头部；点「完成」出图、「取消」或 ESC 中止
-   * @param {number} [options.longCapture.maxFrames=100] - 最大拼接帧数（1~200，达到上限自动完成）
+   *   向下滚动追加新内容到底部、向上滚动前插到头部；点「完成」出图、「取消」或 ESC 中止；
+   *   拼接无帧数/像素上限，可持续合并至用户主动结束
    * @param {number} [options.longCapture.interval=250] - 滚轮停止后等待内容稳定的毫秒数（50~2000，采样防抖；
    *   滚动进行中也会按不低于 min(interval, 250)ms 的节拍主动采样，保证相邻帧有大重叠区域）
    * @param {Function} [callback] - 截图完成时的回调函数
-   * - 参数: { success: boolean, width?: number, height?: number, base64?: string }
+   * - 参数: { success: boolean, x?: number, y?: number, x2?: number, y2?: number, width?: number, height?: number, base64?: string, error?: string }
    * - success: 是否成功截图
+   * - x/y: 选区左上角（成功时；屏幕全局逻辑坐标，左上原点）
+   * - x2/y2: 选区右下角（成功时）
    * - width: 截图宽度（成功时；长截图为拼接后的总宽度）
    * - height: 截图高度（成功时；长截图为拼接后的总高度）
-   * - base64: 截图 PNG 的 base64（成功时；长截图已同时写入剪贴板）
+   * - base64: 截图 PNG 的 base64，带 data:image/png;base64, 前缀（成功时；已同时写入剪贴板）
+   * - error: 失败原因（可选；macOS 屏幕录制权限不足时为 'screen recording permission required'）
+   *
+   * macOS 说明（macOS 已具备与 Windows 对等的全功能截图）：
+   * - 需要屏幕录制权限，未授权时首次调用会弹出系统授权框，拒绝后回调 { success: false, error: ... }
+   * - 选区 UI（暗化蒙版 + 拖拽框选/窗口吸附/放大镜）、编辑态（工具栏/矢量与文字标注/IME/
+   *   马赛克/撤销重做/选区圆角）、圆角透明导出、保存对话框与长截图全子系统均已实现，
+   *   行为与 Windows 版对齐；差异项见 README「平台差异」表
+   * - 额外需要辅助功能权限：ESC/右键兜底取消、长截图滚轮观察与 autoScroll（CGEventTap）
+   * - macOS 的 start() 会阻塞 JS 主线程直至会话收束（覆盖层事件循环运行在调用线程上），
+   *   会话期间无法用本进程定时器触发 abortLongCapture，需要时请从另一进程/线程调用
    *
    * @example
    * // 默认：框选/点选完成即出图，不再二次编辑
@@ -516,15 +523,10 @@ class ScreenCapture {
    * // 编辑态 + 长截图：选区确定后点工具栏「长截图」按钮进入手动滚动捕获
    * ScreenCapture.start({
    *   autoConfirm: false,
-   *   longCapture: { maxFrames: 100, interval: 250 }
+   *   longCapture: { interval: 250 }
    * }, (result) => { ... });
    */
   static start(options, callback) {
-    if (platform === 'darwin') {
-      // macOS 暂不支持
-      throw new Error('ScreenCapture is not yet supported on macOS');
-    }
-
     // 兼容旧签名 start(callback)
     if (typeof options === 'function') {
       callback = options;
@@ -541,13 +543,12 @@ class ScreenCapture {
   }
 
   /**
-   * 中止进行中的长截图滚动捕获（Windows）
-   * 滚动捕获会以失败结果（success: false）回调后结束
+   * 中止进行中的长截图滚动捕获（Windows / macOS 双平台）
+   * 滚动捕获会以失败结果（success: false）回调后结束（ESC/取消同语义：取消 = 失败收束）；
+   * 无进行中的长截图时为安全空操作。可在任意线程/进程调用（macOS 会话期间 JS 主线程
+   * 被阻塞时，从另一进程或工作线程调用即可，见 test/test-screenshot-mac.js 的注入示例）
    */
   static abortLongCapture() {
-    if (platform === 'darwin') {
-      throw new Error('ScreenCapture is not yet supported on macOS');
-    }
     addon.abortLongCapture();
   }
 }

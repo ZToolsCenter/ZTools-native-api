@@ -28,7 +28,7 @@ std::mutex g_longCtxMutex;
 
 CaptureContext* g_captureCtx = nullptr;
 
-// ==================== SCGdiResources 实现（CR-022 自 internal.h 下沉）====================
+// ==================== SCGdiResources 实现（自 internal.h 下沉）====================
 // 原为 internal.h 内联定义，唯一调用方在本文件（会话初始化/失败清理/退出清理），
 // 下沉为外部定义以减少头文件内联实现体；签名/语义完全不变。
 
@@ -227,7 +227,7 @@ static void CallScreenshotJs(napi_env env, napi_value js_callback, void* context
     }
 }
 
-// 统一 ScreenshotResult 发射口（CR-017）：构造结果并经截图会话 TSFN 回传 JS。
+// 统一 ScreenshotResult 发射口：构造结果并经截图会话 TSFN 回传 JS。
 // 统一守卫：TSFN 未就绪或 napi_tsfn_nonblocking 因队列满返回非 napi_ok 时，自行
 // delete 分配的 result 防泄漏（CallScreenshotJs 只在成功入队时才 delete）。
 // 仅允许在截图线程内调用。各发射点（确认/取消/保存/ESC/长截图完成等）统一走此函数。
@@ -251,7 +251,7 @@ void EmitScreenshotResult(bool success, int x, int y, int x2, int y2,
 }
 
 // 会话初始化失败快速回传：构造 {success:false} 结果并经 EmitScreenshotResult 回传 JS，
-// 唤醒 await 方避免永久挂起（CR-002 早退路径统一收口点）。
+// 唤醒 await 方避免永久挂起（早退路径统一收口点）。
 void FailFast() {
     EmitScreenshotResult(false);
 }
@@ -534,7 +534,7 @@ void ScreenshotCaptureThread() {
     ShutdownGdipResources(&ctx);
     UnregisterClassW(L"ZToolsScreenshotOverlay", GetModuleHandle(NULL));
 
-    // 会话出口统一收口（CR-002）：正常出口均已在确认/取消分支各回调一次
+    // 会话出口统一收口：正常出口均已在确认/取消分支各回调一次
     // （ESC 取消、右键取消、确认/保存完成、长截图 RunLongCapture 各自的结果发射）。
     // 这里兜底：若循环未经任何确认/取消分支退出（如外部投递 WM_QUIT），补发一次
     // 失败结果，保证 JS 端 await 必然被唤醒；随后释放 TSFN，防止每次 start() 的
@@ -575,12 +575,11 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
     //              默认 autoConfirm=true，选区确定后直接出图，跳过编辑态；
     //              传 false 才进入编辑态（工具栏/标注）
     //              longCapture 为编辑态工具栏「长截图」按钮的手动滚动捕获参数：
-    //              { maxFrames?: number, interval?: number }
+    //              { interval?: number }
     // 每次会话显式解析长截图参数到默认值后再按 JS 覆盖，不再依赖跨会话残留的粘滞全局
-    // （旧实现用文件级全局 g_lcMaxFrames/g_lcInterval 承载，第二次 start 不传 longCapture
+    // （旧实现用文件级全局 g_lcInterval 承载，第二次 start 不传 longCapture
     //  时会沿用上一次的值，属跨会话状态泄漏）。
     bool autoConfirm = true;
-    int lcMaxFrames = 100;   // 默认最大拼接帧数（与 LongCaptureContext.maxFrames 一致）
     int lcInterval = 250;    // 默认滚轮防抖间隔 ms
     for (int i = 0; i < (int)info.Length(); i++) {
         if (info[i].IsFunction()) {
@@ -610,13 +609,6 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
                 Napi::Value v = opts.Get("longCapture");
                 if (v.IsObject()) {
                     Napi::Object lc = v.As<Napi::Object>();
-                    if (lc.Has("maxFrames")) {
-                        Napi::Value f = lc.Get("maxFrames");
-                        if (f.IsNumber()) {
-                            int mf = f.As<Napi::Number>().Int32Value();
-                            if (mf >= 1 && mf <= 200) lcMaxFrames = mf;
-                        }
-                    }
                     if (lc.Has("interval")) {
                         Napi::Value t = lc.Get("interval");
                         if (t.IsNumber()) {
@@ -630,7 +622,6 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
     }
     g_autoConfirm = autoConfirm;
     // 每次会话重置为本次解析值（默认值或 JS 覆盖），消除跨会话粘滞
-    g_lcMaxFrames = lcMaxFrames;
     g_lcInterval = lcInterval;
 
     g_isCapturing = true;

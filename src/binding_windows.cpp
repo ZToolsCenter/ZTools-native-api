@@ -40,7 +40,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uiautomationcore.lib")
 
-#include "screenshot/screenshot_windows.h"
+#include "screenshot/windows/screenshot_windows.h"
 
 // DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
 #ifndef DWMWA_CLOAKED
@@ -3972,7 +3972,7 @@ static std::unique_ptr<Gdiplus::Bitmap> CreateBitmapFromIcon(
     return bitmap;
 }
 
-// GetPngEncoderClsid 已迁移至 src/screenshot/output_windows.cpp（CR-019），
+// GetPngEncoderClsid 已迁移至 src/screenshot/output_windows.cpp，
 // 此处经 screenshot_windows.h 声明继续复用（含进程内 CLSID 缓存）。
 
 // 将 HICON 转换为 PNG 字节数组

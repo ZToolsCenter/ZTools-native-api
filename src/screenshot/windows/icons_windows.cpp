@@ -4,12 +4,12 @@
 // ---- nanosvg：SVG 光栅化（单文件库，宏实例化）----
 // 两个 .h 必须在同一编译单元用宏实例化一次；本文件（icons_windows.cpp）为唯一实例化编译单元。
 #define NANOSVG_IMPLEMENTATION
-#include "../third_party/nanosvg.h"
+#include "../../third_party/nanosvg.h"
 #define NANOSVGRAST_IMPLEMENTATION
-#include "../third_party/nanosvgrast.h"
+#include "../../third_party/nanosvgrast.h"
 
 // ---- 截图工具栏图标 SVG 文本（构建期由 scripts/gen-icons.js 从 src/assets 生成）----
-#include "../generated/icon_svgs.h"
+#include "../../generated/icon_svgs.h"
 
 // ---- SVG 图标光栅化 + 缓存 ----
 
@@ -127,7 +127,7 @@ void SCIconCache::Cleanup() {
     inited = false;
 }
 
-// CR-018: 防常量漂移。kIconSvgs（generated/icon_svgs.h，按 ToolButton 枚举顺序）
+// 防常量漂移。kIconSvgs（generated/icon_svgs.h，按 ToolButton 枚举顺序）
 // 元素数必须等于 TB_Count：Init/Cleanup 均以 TB_Count 为循环上界索引 kIconSvgs[i]，
 // 漂移将越界读 nullptr 或漏绘图标。
 static_assert(sizeof(kIconSvgs) / sizeof(kIconSvgs[0]) == TB_Count,

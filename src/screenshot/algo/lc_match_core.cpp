@@ -1,8 +1,12 @@
 // 长截图子系统：纯匹配算法（帧间位移搜索、识别、富验证）。
-// CR-021 拆分自 long_capture_windows.cpp 的「帧间全局位移搜索 / 识别阶段」段。
+// 拆分自 long_capture_windows.cpp 的「帧间全局位移搜索 / 识别阶段」段。
 // 本文件为纯函数：输入 LongMatchData 输出 LongMatchOutcome，不修改任何拼接状态，
 // 天然可单测。识别相关调参常量在此集中定义（extern，供 lc_stitch_state 等块共享）。
-#include "internal.h"
+// 平台兼容（算法逻辑零改动）：本文件为纯算法，只依赖 long_capture_internal.h
+// （跨平台唯一权威，双平台同一份定义）与 lc_platform.h（平台类型别名 /
+// GetTickCount 等价物，见其头部的依赖剥离验证结论）；internal.h（napi / GDI+
+// 依赖链）仅 Windows UI/IO 层使用，算法层不再触碰。
+#include "lc_platform.h"
 #include "long_capture_internal.h"
 
 // 可条件编译的调试日志（构建加 /DLC_DEBUG_LOG 启用，经 OutputDebugStringA 输出到调试器）：
@@ -1394,7 +1398,7 @@ LongMatchOutcome LongCaptureDetectMatch(const LongMatchData& prevM,
     return w.confidence > m.confidence ? w : m;
 }
 
-// CR-018: 防常量漂移。LC_RETRY_DELAY_WEAK 按弱候选重试档分档，调用方以
+// 防常量漂移。LC_RETRY_DELAY_WEAK 按弱候选重试档分档，调用方以
 // LC_WEAK_RETRY_ATTEMPTS 为循环上界索引 LC_RETRY_DELAY_WEAK[weakRetries++]，
 // 档数不一致将越界读或漏掉档位。
 static_assert(sizeof(LC_RETRY_DELAY_WEAK) / sizeof(LC_RETRY_DELAY_WEAK[0]) == LC_WEAK_RETRY_ATTEMPTS,

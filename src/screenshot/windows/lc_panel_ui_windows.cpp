@@ -1,5 +1,5 @@
 // 长截图子系统：侧边小地图面板 + 全屏灰蒙版 UI。
-// CR-021 拆分自 long_capture_windows.cpp 的「预览面板 / 全屏蒙版」段。
+// 拆分自 long_capture_windows.cpp 的「预览面板 / 全屏蒙版」段。
 // 面板分层渲染（UpdateLayeredWindow 原子提交）+ 滚轮观察目标窗口 + 蒙版取景窗。
 // EnsureArgbSurface/FreeArgbSurface 是面板/工具栏/tooltip 共用的 32bpp 预乘 ARGB
 // 后备 DIB 辅助，在此定义（long_capture_internal.h 声明）。
@@ -42,7 +42,7 @@ static RECT LongCapturePanelPreviewRect(LongCaptureContext* c, int cw, int ch) {
     if (rows <= 0) return r;
     // 显示空间（物理像素）宽高：固定轴 = physW（= cropRect 的物理对应，纵向=宽/横向=高），
     // 滚动轴 = rows。输出为面板物理矩形，故用物理量；逻辑标签版见 LongCaptureOutputSizeLabel，
-    // 高度生长版见 LongCapturePanelUpdate，三者同一换算口径（CR-023）。
+    // 高度生长版见 LongCapturePanelUpdate，三者同一换算口径。
     double dispW = c->horizontal ? (double)rows : (double)c->physW;
     double dispH = c->horizontal ? (double)c->physW : (double)rows;
     double scale = (std::min)((double)availW / dispW, (double)availH / dispH);
@@ -395,7 +395,7 @@ void LongCapturePanelUpdate(LongCaptureContext* c) {
     LongCaptureOutputRows(c, rowStart, rowEnd);
     int rows = rowEnd - rowStart;
     if (rows <= 0) return;
-    // 显示空间逻辑尺寸统一公式（CR-023）：固定轴取 cropRect 逻辑尺寸（纵向=宽/横向=高，
+    // 显示空间逻辑尺寸统一公式：固定轴取 cropRect 逻辑尺寸（纵向=宽/横向=高，
     // 无 /ds 舍入往返误差），滚动轴取 rows / ds。与 LongCaptureOutputSizeLabel、
     // LongCapturePanelPreviewRect 同一换算口径。
     double dispWLogical = c->horizontal ? rows / ds : (double)(c->cropRect.right - c->cropRect.left);
