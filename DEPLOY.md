@@ -5,7 +5,12 @@
 本项目编译后会生成两个关键文件：
 
 1. **`build/Release/ztools_native.node`** - Node.js 原生插件（C++ binding）
-2. **`lib/libZToolsNative.dylib`** - Swift 动态库
+2. **`lib/libZToolsNative.dylib`** - Swift 动态库（Universal Binary，arm64 + x86_64）
+
+> 结构说明（macOS 截图子系统合入后核对）：长截图匹配算法层（`lc_match_core.cpp` /
+> `lc_stitch_state.cpp`）与 C ABI shim（`lc_bridge_mac.cpp`）在构建期由 clang++ 编出 .o 后随
+> `swiftc -emit-library` **静态链入 dylib 内部**，不产生额外文件——部署产物仍然只有上面
+> 两个文件，无需调整打包清单。
 
 ## 部署到其他项目
 
@@ -19,7 +24,7 @@ your-project/
 │   └── lib/
 │       └── mac/
 │           ├── ztools_native.node
-│           └── libZToolsNative.dylib    ��� 必须在同一目录
+│           └── libZToolsNative.dylib    ← 必须在同一目录
 ```
 
 **使用方法：**
@@ -95,7 +100,7 @@ const { app } = require('electron');
 if (process.env.NODE_ENV === 'development') {
   const addon = require('ztools-native-api/build/Release/ztools_native.node');
 }
-// 生产环��（打包后）
+// 生产环境（打包后）
 else {
   const resourcePath = process.resourcesPath;
   const addonPath = path.join(resourcePath, 'lib/mac/ztools_native.node');
@@ -141,16 +146,35 @@ else {
 
 ## 权限说明
 
-### macOS 权限（可选）
+### macOS 权限
 
-部分功能可能需要：
-- **辅助功能权限**：窗口监控功能
-- **屏幕录制权限**：某些窗口信息获取
+按功能需要授予（系统设置 → 隐私与安全性）：
+
+- **辅助功能权限**：窗口监控、键盘模拟；截图功能的 ESC/右键兜底取消、长截图滚轮观察与自动滚动（未授权时截图仍可用，兜底能力降级）
+- **屏幕录制权限**：区域截图/长截图（`ScreenCapture.start()` 首次调用会弹系统授权框，授权后可能需重启宿主进程；`prime()` 预检未授权时直接返回 false，不弹框）
 
 授权方式：
 ```
-系统设置 → 隐私与安全性 → 辅助功能
+系统设置 → 隐私与安全性 → 辅助功能 / 屏幕录制
 ```
+
+### macOS 屏幕共享 / 远程桌面注意事项
+
+截图捕获底层使用 `CGWindowListCreateImage`（macOS 14 起被系统标记 deprecated，目前仍可用；
+升级 ScreenCaptureKit 的评估见 `docs/SCK_UPGRADE_EVALUATION.md`）。其内容来自 WindowServer
+的合成结果，在屏幕共享 / 远程桌面会话（如 Safari 网页共享屏幕、macOS「屏幕共享」、第三方
+远程桌面）下，合成路径与本地会话存在差异，且此类环境无法被 CI 覆盖——发布前建议开启屏幕
+共享后人工回归以下场景：
+
+- 权限预检与授权框弹出行为（`prime()` 不弹框、`start()` 弹框）
+- 整屏底图与选区裁剪正确性（多屏 + Retina）
+- 放大镜取色与坐标/HEX/RGB 显示
+- 长截图滚动拼接正确率与到底判定
+- ESC 兜底取消（覆盖层失焦时）
+
+与 Windows 版的 RDP 场景对应：Windows 侧已针对 RDP 鼠标事件节流/合并做了实时命中测试
+（不依赖 hover 缓存，见 `src/screenshot/overlay_input_windows.cpp` 注释）；macOS 侧交互为
+NSView 事件 + 实时命中、同样不依赖 hover 缓存，具备对应鲁棒性，仍建议按上表人工回归。
 
 ---
 

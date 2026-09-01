@@ -37,7 +37,7 @@ static size_t GetStreamLength(IStream* stream) {
     return (size_t)st.cbSize.QuadPart;
 }
 
-// 获取 PNG 编码器 CLSID（从 binding_windows.cpp 迁入截图目录，CR-019）。
+// 获取 PNG 编码器 CLSID（从 binding_windows.cpp 迁入截图目录）。
 // 进程内 PNG 编码器 CLSID 不变，首次查找后用 static 缓存，后续直接返回缓存值，
 // 避免每次编码都分配并遍历编码器表。返回值 >= 0 表示成功（返回的是匹配到的编码器索引）。
 // 仍返回 int 索引以保持原有调用契约（调用方判 >= 0 / == -1）；CLSID 经 pClsid 带出。
@@ -460,7 +460,7 @@ static HBITMAP BuildRoundedArgbFinal(HDC memDC, const RECT& rect, int vx, int vy
 
 // 不透明位图路径（radius==0）的公共合成：从预截屏位图按选区提取区域，若有 DPI 缩放则
 // 缩放回逻辑尺寸，再合成标注。ExtractRegionResult（base64+剪贴板）与 SaveRegionToPngFile
-// （落盘）的 radius==0 分支此前为近逐行两份重复，CR-019 收口至此单一实现。
+// （落盘）的 radius==0 分支此前为近逐行两份重复，收口至此单一实现。
 // 成功时经 outFinalDC/outFinalBmp 带出已合成的位图（调用方负责 DeleteDC/DeleteObject）；
 // 失败时内部已清理全部 GDI 资源、out* 保持 NULL，返回 false。
 // mosaicSizeIdx：马赛克块大小索引（显式传参，消除对全局 g_captureCtx 的穿透耦合）。
@@ -571,7 +571,7 @@ ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
         return result;
     }
 
-    // radius==0：原有不透明位图路径（公共合成，CR-019 收口至 ComposeSelectedBitmap）
+    // radius==0：原有不透明位图路径（公共合成，收口至 ComposeSelectedBitmap）
     HDC finalDC = NULL; HBITMAP finalBmp = NULL;
     if (ComposeSelectedBitmap(memDC, rect, vx, vy, dpiScale, anns, mosaicSizeIdx,
                               finalDC, finalBmp)) {
@@ -693,7 +693,7 @@ bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
         return ok;
     }
 
-    // radius==0：原有不透明位图路径（公共合成，CR-019 收口至 ComposeSelectedBitmap）
+    // radius==0：原有不透明位图路径（公共合成，收口至 ComposeSelectedBitmap）
     HDC finalDC = NULL; HBITMAP finalBmp = NULL;
     bool ok = false;
     if (ComposeSelectedBitmap(memDC, rect, vx, vy, dpiScale, anns, mosaicSizeIdx,

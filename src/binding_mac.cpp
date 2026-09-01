@@ -3,6 +3,7 @@
 #include <napi.h>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <unistd.h>  // For usleep
 
 // Swift 动态库函数类型定义
@@ -34,6 +35,10 @@ typedef void (*StopColorPickerFunc)();                             // 停止取�
 typedef void *(*FetchFileIconFunc)(const char *, size_t *);        // 获取文件图标 PNG
 typedef char *(*GetAllFinderWindowsFunc)();                        // 获取所有 Finder 窗口
 typedef int (*SetAddressBarFunc)(const char *, const char *);       // 设置 Finder/文件对话框地址
+typedef void (*ScreenshotResultCB)(const char *);                   // 截图会话结果回调（JSON 字符串）
+typedef int (*PrimeScreenshotFrameFunc)();                          // 预抓整屏帧（返回 1/0）
+typedef int (*StartRegionCaptureFunc)(const char *, ScreenshotResultCB); // 启动区域截图会话（返回 1 受理/0 拒绝）
+typedef void (*AbortLongCaptureFunc)();                             // 中止长截图滚动捕获
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -66,6 +71,16 @@ static FetchFileIconFunc fetchFileIconFunc = nullptr;
 static GetAllFinderWindowsFunc getAllFinderWindowsFunc = nullptr;
 static SetAddressBarFunc setAddressBarFunc = nullptr;
 static bool g_isPaused = false; // 剪贴板监控暂停状态
+
+// 截图模块（Swift 实现，见 src/screenshot/macos/ScreenshotMac.swift）
+static napi_threadsafe_function screenshotTsfn = nullptr;   // 截图结果回调线程安全函数
+static PrimeScreenshotFrameFunc primeScreenshotFrameFunc = nullptr;
+static StartRegionCaptureFunc startRegionCaptureFunc = nullptr;
+static AbortLongCaptureFunc abortLongCaptureFunc = nullptr;
+// 截图会话进行中标志（重入保护，对齐 Windows g_isCapturing）：start 受理前置 true，
+// Swift 会话出口回调（OnScreenshotResult）或 Swift 拒绝受理时复位 false。
+// JS 线程串行读写，Swift 侧仅通过回调间接复位，无需更强同步。
+static std::atomic<bool> g_screenshotInProgress(false);
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -241,6 +256,12 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (GetAllFinderWindowsFunc)dlsym(swiftLibHandle, "getAllFinderWindows");
   setAddressBarFunc =
       (SetAddressBarFunc)dlsym(swiftLibHandle, "setAddressBar");
+  primeScreenshotFrameFunc =
+      (PrimeScreenshotFrameFunc)dlsym(swiftLibHandle, "primeScreenshotFrame");
+  startRegionCaptureFunc =
+      (StartRegionCaptureFunc)dlsym(swiftLibHandle, "startRegionCaptureWithPrimedFrame");
+  abortLongCaptureFunc =
+      (AbortLongCaptureFunc)dlsym(swiftLibHandle, "abortLongCapture");
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
@@ -249,7 +270,9 @@ bool LoadSwiftLibrary(Napi::Env env) {
       !simulateMouseDoubleClickFunc || !simulateMouseRightClickFunc ||
       !startMouseMonitorFunc || !stopMouseMonitorFunc ||
       !startColorPickerFunc || !stopColorPickerFunc ||
-      !setClipboardFilesFunc || !fetchFileIconFunc) {
+      !setClipboardFilesFunc || !fetchFileIconFunc ||
+      !primeScreenshotFrameFunc || !startRegionCaptureFunc ||
+      !abortLongCaptureFunc) {
     Napi::Error::New(env, "Failed to load Swift functions")
         .ThrowAsJavaScriptException();
     dlclose(swiftLibHandle);
@@ -1289,6 +1312,218 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo &info) {
   return Napi::Boolean::New(env, success == 1);
 }
 
+// ==================== 区域截图（macOS，Swift 实现见 src/screenshot/macos/ScreenshotMac.swift）====================
+
+// 在主线程调用 JS 回调（截图结果）：解析 Swift 会话出口的结果 JSON 并构造契约对象。
+// 契约字段与 Windows CallScreenshotJs 一致：success=true 时输出
+// x/y/x2/y2/width/height/base64；success=false 时仅输出 success 与可选 error
+//（macOS 在既有契约上新增的可选字段，如屏幕录制权限不足），不改既有字段。
+// data 所有权归本函数（strdup 副本，进入时释放）。
+void CallScreenshotJs(napi_env env, napi_value js_callback, void *context,
+                      void *data) {
+  if (env != nullptr && js_callback != nullptr && data != nullptr) {
+    char *jsonStr = static_cast<char *>(data);
+    Napi::Env napiEnv(env);
+    std::string jsonString(jsonStr);
+    free(jsonStr);
+
+    Napi::Object result = Napi::Object::New(napiEnv);
+
+    Napi::Value parsed = ParseJsonValue(napiEnv, jsonString);
+    bool success = false;
+    if (parsed.IsObject()) {
+      Napi::Object source = parsed.As<Napi::Object>();
+      if (source.Has("success") && source.Get("success").IsBoolean()) {
+        success = source.Get("success").As<Napi::Boolean>().Value();
+      }
+
+      result.Set("success", Napi::Boolean::New(napiEnv, success));
+
+      if (success) {
+        // 数值字段缺省 0、base64 缺省空串，保证契约字段齐全
+        const char *numFields[] = {"x", "y", "x2", "y2", "width", "height"};
+        for (const char *fieldName : numFields) {
+          int value = 0;
+          if (source.Has(fieldName) && source.Get(fieldName).IsNumber()) {
+            value = source.Get(fieldName).As<Napi::Number>().Int32Value();
+          }
+          result.Set(fieldName, Napi::Number::New(napiEnv, value));
+        }
+        std::string base64;
+        if (source.Has("base64") && source.Get("base64").IsString()) {
+          base64 = source.Get("base64").As<Napi::String>().Utf8Value();
+        }
+        result.Set("base64", Napi::String::New(napiEnv, base64));
+      } else if (source.Has("error") && source.Get("error").IsString()) {
+        result.Set("error", source.Get("error").As<Napi::String>());
+      }
+    } else {
+      // 非对象 JSON（理论不可达，Swift 出口恒产出合法 JSON）：按失败收口
+      result.Set("success", Napi::Boolean::New(napiEnv, false));
+    }
+
+    napi_value global;
+    napi_get_global(env, &global);
+    napi_value resultValue = result;
+    napi_call_function(env, global, js_callback, 1, &resultValue, nullptr);
+  }
+}
+
+// 统一发射口（对齐 Windows session_windows.cpp 的 EmitScreenshotResult）：
+// Swift 会话出口的结果 JSON 经 screenshotTsfn 回传 JS。守卫：TSFN 未就绪或
+// napi_tsfn_nonblocking 因队列满返回非 napi_ok 时，自行释放分配的副本防泄漏
+//（CallScreenshotJs 只在成功入队时才 free）。
+void EmitScreenshotResult(const char *jsonStr) {
+  if (screenshotTsfn == nullptr || jsonStr == nullptr) {
+    return;
+  }
+  char *jsonCopy = strdup(jsonStr);
+  if (jsonCopy == nullptr) {
+    return;
+  }
+  if (napi_call_threadsafe_function(screenshotTsfn, jsonCopy,
+                                    napi_tsfn_nonblocking) != napi_ok) {
+    // 入队失败：回调不会取走所有权，自行释放防泄漏
+    free(jsonCopy);
+  }
+}
+
+// 会话出口统一收口：释放截图会话 TSFN 并置空（进程唯一释放点，保证 Node 优雅退出）。
+// 前提：Swift 会话出口恰好回调一次（成功/失败均必达——FailFast 语义），释放时已无
+// 后续发射点；释放后已入队的结果仍会送达 JS（与 Windows ReleaseScreenshotTsfn 一致）。
+void ReleaseScreenshotTsfn() {
+  if (screenshotTsfn != nullptr) {
+    napi_release_threadsafe_function(screenshotTsfn, napi_tsfn_release);
+    screenshotTsfn = nullptr;
+  }
+}
+
+// Swift 截图会话出口回调（注册给 startRegionCaptureWithPrimedFrame；每会话恰好调用
+// 一次，任何初始化/执行失败都由 Swift FailFast 保证走到此处）：先经统一发射口把结果
+// 回传 JS，再释放 TSFN 并复位进行中标志，允许下一次 start（时序对齐 Windows 捕获线程末尾）。
+void OnScreenshotResult(const char *jsonStr) {
+  EmitScreenshotResult(jsonStr);
+  ReleaseScreenshotTsfn();
+  g_screenshotInProgress = false;
+}
+
+// 供 JS 主动触发的整屏预抓帧（对齐 Windows PrimeScreenshotFrame 导出）。
+// 返回 boolean：true 抓帧成功；false 失败（无屏幕录制权限或抓帧失败）。
+Napi::Value PrimeScreenshotFrame(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return Napi::Boolean::New(env, false);
+  }
+
+  const bool success = primeScreenshotFrameFunc() == 1;
+  return Napi::Boolean::New(env, success);
+}
+
+// 启动区域截图（macOS 最小闭环：权限预检 → 整屏底图 → PNG → 剪贴板 → 回调）。
+// 参数解析对齐 Windows session_windows.cpp：回调函数 + 可选选项对象
+// { autoConfirm: boolean（默认 true）, longCapture: { interval: 50~2000 默认 250 } }，
+// 越界值忽略保持默认；长截图功能已落地，参数先行按契约钳制并透传给 Swift。
+Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return env.Undefined();
+  }
+
+  // 重入保护（对齐 Windows g_isCapturing）：会话进行中再次 start 直接抛错
+  if (g_screenshotInProgress) {
+    Napi::Error::New(env, "Screenshot already in progress")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  bool autoConfirm = true;
+  int lcInterval = 250;
+  bool hasCallback = false;
+  Napi::Function callback;
+  for (size_t i = 0; i < info.Length(); i++) {
+    if (info[i].IsFunction()) {
+      callback = info[i].As<Napi::Function>();
+      hasCallback = true;
+    } else if (info[i].IsObject()) {
+      Napi::Object opts = info[i].As<Napi::Object>();
+      if (opts.Has("autoConfirm")) {
+        Napi::Value v = opts.Get("autoConfirm");
+        if (v.IsBoolean()) {
+          autoConfirm = v.As<Napi::Boolean>().Value();
+        }
+      }
+      if (opts.Has("longCapture")) {
+        Napi::Value v = opts.Get("longCapture");
+        if (v.IsObject()) {
+          Napi::Object lc = v.As<Napi::Object>();
+          if (lc.Has("interval")) {
+            Napi::Value t = lc.Get("interval");
+            if (t.IsNumber()) {
+              int iv = t.As<Napi::Number>().Int32Value();
+              if (iv >= 50 && iv <= 2000) lcInterval = iv;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!hasCallback) {
+    Napi::TypeError::New(env, "Callback must be a function")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // 创建截图 TSFN（queue 0/1，对齐 Windows 会话模型；会话出口统一释放）
+  napi_value resource_name;
+  napi_create_string_utf8(env, "ScreenshotCallback", NAPI_AUTO_LENGTH,
+                          &resource_name);
+  napi_status status = napi_create_threadsafe_function(
+      env, callback, nullptr, resource_name, 0, 1, nullptr, nullptr, nullptr,
+      CallScreenshotJs, &screenshotTsfn);
+  if (status != napi_ok) {
+    Napi::Error::New(env, "Failed to create threadsafe function")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // 组装 options JSON 传给 Swift（钳制已在上方完成，Swift 侧二次校验兜底）
+  std::string optionsJson = std::string("{\"autoConfirm\":") +
+                            (autoConfirm ? "true" : "false") +
+                            ",\"longCapture\":{\"interval\":" +
+                            std::to_string(lcInterval) +
+                            "}}";
+
+  g_screenshotInProgress = true;
+  int accepted = startRegionCaptureFunc(optionsJson.c_str(), OnScreenshotResult);
+  if (accepted != 1) {
+    // Swift 拒绝受理（重入兜底/参数非法）：回滚会话状态，保证下次 start 可用；
+    // 此路径 Swift 不会回调，TSFN 必须就地释放防泄漏
+    ReleaseScreenshotTsfn();
+    g_screenshotInProgress = false;
+  }
+
+  return env.Undefined();
+}
+
+// 中止进行中的长截图滚动捕获（对齐 Windows AbortLongCapture 导出）。
+// 仅设置锁内中止标记：无长截图会话时为安全 no-op。
+Napi::Value AbortLongCapture(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return env.Undefined();
+  }
+
+  if (abortLongCaptureFunc != nullptr) {
+    abortLongCaptureFunc();
+  }
+
+  return env.Undefined();
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -1325,6 +1560,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("getAllExplorerWindows", Napi::Function::New(env, GetAllExplorerWindows));
   exports.Set("setAddressBar", Napi::Function::New(env, SetAddressBar));
   exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
+  exports.Set("primeScreenshotFrame", Napi::Function::New(env, PrimeScreenshotFrame));
+  exports.Set("startRegionCaptureWithPrimedFrame",
+              Napi::Function::New(env, StartRegionCaptureWithPrimedFrame));
+  exports.Set("abortLongCapture", Napi::Function::New(env, AbortLongCapture));
   return exports;
 }
 

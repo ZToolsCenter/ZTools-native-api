@@ -1,5 +1,5 @@
 // 长截图子系统：抓帧 / DIB / 缩略图 / 位图构建 / 消息泵。
-// CR-021 拆分自 long_capture_windows.cpp 的「滚轮观察 / 逐帧采样」与
+// 拆分自 long_capture_windows.cpp 的「滚轮观察 / 逐帧采样」与
 // 「缩略图 / 输出行窗口 / 结果位图 / 消息泵 / 首帧初始化」段。
 #include "internal.h"
 #include "long_capture_internal.h"
