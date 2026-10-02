@@ -156,6 +156,17 @@ struct CaptureContext {
     RECT popupRect = {};
     SCPopupMetrics popupMetrics;
 
+    // ---- 翻译覆盖（工具栏「翻译」按钮：OCR 识别选区文字 → 翻译 → 译文覆盖原区域）----
+    // 状态机与数据结构见 sc_types.h；全部字段仅截图线程读写（工作线程经结果槽 +
+    // WM_SCREENSHOT_TRANSLATE_RESULT 消息回投，见 translate_windows.cpp）。
+    TranslateOverlayState translateState = TRL_Idle;   // 翻译覆盖状态机
+    std::vector<TranslateBlock> translateBlocks;        // 译文覆盖块（TRL_Shown 时有效）
+    bool translateStatusShown = false;                  // 状态气泡是否在屏（进度/错误）
+    bool translateStatusError = false;                  // 气泡是否为错误态（错误 TTL 自动消失）
+    DWORD translateStatusAt = 0;                        // 气泡出现时刻（TTL 计时）
+    RECT translateStatusRect = {};                      // 气泡矩形（backDC 相对坐标）
+    std::wstring translateStatusText;                   // 气泡文本
+
     // ---- 文字输入（CS_TextEditing）----
     std::wstring textBuf;                  // 正在输入的文字缓冲
     int textAnchorX = 0, textAnchorY = 0;          // 文字锚点（绝对虚拟屏幕坐标）

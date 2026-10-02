@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <chrono>
 #include <string>
+#include <vector>
 
 static const auto SC_PRIMED_FRAME_TTL = std::chrono::seconds(2);
 
@@ -203,6 +204,34 @@ struct ScreenshotResult {
     int width;
     int height;
     std::string base64;
+};
+
+// ==================== 翻译覆盖（工具栏「翻译」按钮） ====================
+
+// 翻译覆盖状态机：点击「翻译」→ Busy（OCR+翻译进行中，显示进度气泡）→
+// Shown（译文块覆盖原文字区域）或回退 Idle（失败，错误气泡数秒后自动消失）；
+// Shown 下再次点击「翻译」清除覆盖回到 Idle（切换语义，不重跑）
+
+enum TranslateOverlayState {
+    TRL_Idle = 0,   // 无翻译内容
+    TRL_Busy = 1,   // 识别/翻译进行中
+    TRL_Shown = 2   // 译文覆盖展示中
+};
+
+// 一个译文覆盖块：OCR 识别出的原文字区域（绝对虚拟屏幕逻辑坐标，与标注同坐标系，
+// 选区移动/缩放时保持不动）+ 译文文本 + 原段落行数。绘制与导出合成见
+// translate_windows.cpp：字号按段落独立搜索（行距对齐 + 框高可行性收缩，见
+// FitParagraph），搜索含多次真实排版测量，结果缓存在 fit* 字段（键 = 绘制时框宽高）。
+
+struct TranslateBlock {
+    RECT box;               // 原文字区域（绝对虚拟屏幕逻辑坐标，已与选区求交）
+    std::wstring text;      // 译文
+    int origLineCount = 0;  // 原段落行数（整图兜底块 = 0 表示未知，用默认字号上限）
+    // ---- 排版缓存（绘制线程写；fitKeyW/H 命中时复用以下三字段，免每帧重排）----
+    int fitKeyW = -1, fitKeyH = -1;      // 缓存键：绘制时（与选区交集后的）框宽高
+    int fitFontPx = 0;                   // 搜索定出的最终字号
+    float fitLineH = 0.0f;               // 该字号下行高（font.GetHeight）
+    std::vector<std::wstring> fitLines;  // 最终折行结果
 };
 
 // GDI 资源缓存

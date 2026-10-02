@@ -1,6 +1,8 @@
 // 截图模块：屏幕捕获管线（预截屏、GDI 采集、DPI/显示器/窗口枚举）
 #include "internal.h"
 
+#include "../../logger.h"
+
 static void ReleasePrimedScreenshotFrameLocked() {
     if (g_primedScreenshotFrame.bitmap) {
         DeleteObject(g_primedScreenshotFrame.bitmap);
@@ -152,6 +154,7 @@ bool PrimeScreenshotFrameNow() {
     int vx = 0, vy = 0, vw = 0, vh = 0;
     double dpiScale = 1.0;
     if (!CaptureVirtualScreen(memDC, bitmap, vx, vy, vw, vh, dpiScale)) {
+        ZLOG_WARN("screenshot", "prime frame: CaptureVirtualScreen failed");
         return false;
     }
 
@@ -169,6 +172,7 @@ bool PrimeScreenshotFrameNow() {
     g_primedScreenshotFrame.dpiScale = dpiScale;
     g_primedScreenshotFrame.capturedAt = std::chrono::steady_clock::now();
     g_primedScreenshotFrame.valid = true;
+    ZLOG_DEBUG("screenshot", "prime frame ok (%dx%d)", vw, vh);
     return true;
 }
 

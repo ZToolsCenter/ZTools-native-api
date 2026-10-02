@@ -106,7 +106,7 @@ enum ScreenshotToolButton: Int {
     case brush           // TB_Brush 画笔
     case mosaic          // TB_Mosaic 马赛克
     case text            // TB_Text 文字
-    case translate       // TB_Translate 翻译（占位，无点击处理，与 Windows 一致）
+    case translate       // TB_Translate 翻译（OCR → 翻译 → 译文覆盖，与 Windows 一致）
     case longCapture     // TB_LongCapture 长截图
     case separator1      // TB_Separator1 分隔线
     case undo            // TB_Undo 撤销
@@ -811,8 +811,9 @@ final class ScreenshotToolbarController {
 
     // MARK: 按钮可用态
 
-    /// 按钮是否可用（马赛克/文字可用；保存可用；长截图仍置灰；
-    /// 撤销/重做按快照栈状态；翻译占位无点击处理但保留 hover/tooltip 与 Windows 一致）。
+    /// 按钮是否可用（马赛克/文字可用；保存可用；长截图已启用；
+    /// 撤销/重做按快照栈状态；翻译可用——未注册 ProviderBridge 时点击由
+    /// 原生层转为错误气泡提示）。
     /// 保存按钮启用规则对齐 Windows：overlay_input_windows.cpp 的 TB_Save 分支无任何
     /// 禁用判定（工具栏仅在确认态出现，编辑态恒可用），故此处恒返回 true。
     func isButtonEnabled(_ button: ScreenshotToolButton) -> Bool {
@@ -821,7 +822,7 @@ final class ScreenshotToolbarController {
         case .save:               return true    // 保存对话框（Windows 编辑态恒可用）
         case .undo:               return !(session?.undoStack.isEmpty ?? true)
         case .redo:               return !(session?.redoStack.isEmpty ?? true)
-        default:                  return true    // mosaic/text/cancel/confirm/drag/矢量工具/translate(占位)
+        default:                  return true    // mosaic/text/cancel/confirm/drag/矢量工具/translate
         }
     }
 
@@ -840,7 +841,7 @@ final class ScreenshotToolbarController {
         return ScreenshotGeometry.cgPoint(fromNS: NSEvent.mouseLocation)
     }
 
-    /// 泵循环逐拍轮询（对齐 TickToolbarTooltip：覆盖层不接收稳定鼠标流，停顿判定靠轮询）：
+    /// 会话定时器逐拍轮询（对齐 TickToolbarTooltip：覆盖层不接收稳定鼠标流，停顿判定靠轮询）：
     /// 1) hover 高亮变化重绘工具栏；2) 停顿满 500ms 显示 tooltip 气泡；
     /// 3) 工具栏/子菜单区域接管光标（箭头/把手四向/子菜单手型）。
     /// - Parameter now: 单调时钟（ProcessInfo.systemUptime）

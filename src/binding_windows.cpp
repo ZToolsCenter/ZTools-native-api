@@ -41,6 +41,8 @@
 #pragma comment(lib, "uiautomationcore.lib")
 
 #include "screenshot/windows/screenshot_windows.h"
+#include "provider_bridge.h"
+#include "logger_binding.h"
 
 // DWMWA_CLOAKED 在较新的 Windows SDK 中定义，为了兼容性手动定义
 #ifndef DWMWA_CLOAKED
@@ -176,6 +178,7 @@ LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                 KillTimer(hwnd, CLIPBOARD_DEBOUNCE_TIMER_ID);
                 // 仅在未暂停时触发回调
                 if (g_tsfn != nullptr && !g_isPaused) {
+                    ZLOG_DEBUG("clipboard", "changed -> notify JS (debounced)");
                     napi_call_threadsafe_function(g_tsfn, nullptr, napi_tsfn_nonblocking);
                 }
             }
@@ -236,6 +239,7 @@ Napi::Value StartMonitor(const Napi::CallbackInfo& info) {
     );
 
     g_isMonitoring = true;
+    ZLOG_INFO("clipboard", "monitor starting");
 
     // 启动消息循环线程
     g_messageThread = std::thread([]() {
@@ -246,6 +250,7 @@ Napi::Value StartMonitor(const Napi::CallbackInfo& info) {
         wc.lpszClassName = L"ZToolsClipboardMonitor";
 
         if (!RegisterClassW(&wc)) {
+            ZLOG_ERROR("clipboard", "RegisterClassW failed");
             return;
         }
 
@@ -259,18 +264,21 @@ Napi::Value StartMonitor(const Napi::CallbackInfo& info) {
         );
 
         if (g_hwnd == NULL) {
+            ZLOG_ERROR("clipboard", "create message window failed");
             UnregisterClassW(L"ZToolsClipboardMonitor", GetModuleHandle(NULL));
             return;
         }
 
         // 注册剪贴板监听
         if (!AddClipboardFormatListener(g_hwnd)) {
+            ZLOG_ERROR("clipboard", "AddClipboardFormatListener failed");
             DestroyWindow(g_hwnd);
             UnregisterClassW(L"ZToolsClipboardMonitor", GetModuleHandle(NULL));
             return;
         }
 
         // 消息循环
+        ZLOG_INFO("clipboard", "monitor started");
         MSG msg;
         while (g_isMonitoring && GetMessageW(&msg, NULL, 0, 0)) {
             TranslateMessage(&msg);
@@ -307,6 +315,7 @@ Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
         g_tsfn = nullptr;
     }
 
+    ZLOG_INFO("clipboard", "monitor stopped");
     return env.Undefined();
 }
 
@@ -314,6 +323,7 @@ Napi::Value StopMonitor(const Napi::CallbackInfo& info) {
 Napi::Value PauseMonitor(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     g_isPaused = true;
+    ZLOG_DEBUG("clipboard", "paused");
     return env.Undefined();
 }
 
@@ -321,6 +331,7 @@ Napi::Value PauseMonitor(const Napi::CallbackInfo& info) {
 Napi::Value ResumeMonitor(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     g_isPaused = false;
+    ZLOG_DEBUG("clipboard", "resumed");
     return env.Undefined();
 }
 
@@ -532,8 +543,11 @@ void CALLBACK WinEventProc(
         WindowInfo* info = GetWindowInfo(hwnd);
         if (info != nullptr) {
             g_lastMonitoredTitle = info->title;
+            ZLOG_DEBUG("window", "foreground changed: %s", info->title.c_str());
             // 通过线程安全函数传递到 JS
             napi_call_threadsafe_function(g_windowTsfn, info, napi_tsfn_nonblocking);
+        } else {
+            ZLOG_WARN("window", "GetWindowInfo failed on foreground change");
         }
     }
     // 处理窗口标题变化事件
@@ -647,11 +661,13 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo& info) {
     );
 
     if (status != napi_ok) {
+        ZLOG_ERROR("window", "create threadsafe function failed");
         Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
     g_isWindowMonitoring = true;
+    ZLOG_INFO("window", "monitor starting");
 
     // 启动消息循环线程（钩子将在线程内设置）
     g_windowMessageThread = std::thread(WindowMonitorThread);
@@ -661,6 +677,7 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo& info) {
 
     // 检查是否成功启动
     if (!g_isWindowMonitoring) {
+        ZLOG_ERROR("window", "set window event hook failed");
         if (g_windowMessageThread.joinable()) {
             g_windowMessageThread.join();
         }
@@ -670,6 +687,8 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
+    ZLOG_INFO("window", "monitor started");
+
     // 立即回调当前激活的窗口
     HWND currentWindow = GetForegroundWindow();
     if (currentWindow != NULL) {
@@ -677,6 +696,7 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo& info) {
         WindowInfo* info = GetWindowInfo(currentWindow);
         if (info != nullptr) {
             g_lastMonitoredTitle = info->title;
+            ZLOG_DEBUG("window", "current foreground: %s", info->title.c_str());
             napi_call_threadsafe_function(g_windowTsfn, info, napi_tsfn_nonblocking);
         }
     }
@@ -710,6 +730,7 @@ Napi::Value StopWindowMonitor(const Napi::CallbackInfo& info) {
     g_lastMonitoredWindow = NULL;
     g_lastMonitoredTitle.clear();
 
+    ZLOG_INFO("window", "monitor stopped");
     return env.Undefined();
 }
 
@@ -793,6 +814,7 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
     // 获取前台窗口句柄
     HWND hwnd = GetForegroundWindow();
     if (hwnd == NULL) {
+        ZLOG_DEBUG("window", "getActiveWindow: no foreground window");
         return env.Null();
     }
 
@@ -896,6 +918,7 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
     // 窗口句柄（用于 COM IShellWindows 查询 Explorer 目录路径）
     result.Set("hwnd", Napi::Number::New(env, (double)(uint64_t)hwnd));
 
+    ZLOG_DEBUG("window", "getActiveWindow -> hwnd=%p", hwnd);
     return result;
 }
 
@@ -947,6 +970,7 @@ Napi::Value ActivateWindow(const Napi::CallbackInfo& info) {
     EnumWindows(EnumWindowsCallback, (LPARAM)&args);
 
     if (args.foundWindow == NULL) {
+        ZLOG_WARN("window", "activate: no visible window for pid %lu", (unsigned long)processId);
         return Napi::Boolean::New(env, false);
     }
 
@@ -990,7 +1014,10 @@ Napi::Value ActivateWindow(const Napi::CallbackInfo& info) {
 
     // 验证是否成功
     HWND newForeground = GetForegroundWindow();
-    return Napi::Boolean::New(env, newForeground == hwnd);
+    const bool activated = (newForeground == hwnd);
+    ZLOG_INFO("window", "activate pid %lu -> %s", (unsigned long)processId,
+              activated ? "ok" : "failed");
+    return Napi::Boolean::New(env, activated);
 }
 
 // ==================== 剪贴板文件功能 ====================
@@ -1023,6 +1050,7 @@ Napi::Value GetClipboardFiles(const Napi::CallbackInfo& info) {
     // 打开剪贴板失败
     if (!clipboardOpened) {
         // Windows 11: 剪贴板可能被系统或其他程序占用
+        ZLOG_WARN("clipboard", "getClipboardFiles: open clipboard failed after retries");
         return result;  // 返回空数组
     }
 
@@ -1086,12 +1114,14 @@ Napi::Value GetClipboardFiles(const Napi::CallbackInfo& info) {
     }
 
     CloseClipboard();
+    ZLOG_DEBUG("clipboard", "getClipboardFiles -> %u files", (unsigned)fileCount);
     return result;
 }
 
 // 设置剪贴板中的文件列表
 Napi::Value SetClipboardFiles(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
+    ZLOG_DEBUG("clipboard", "setClipboardFiles requested");
 
     // 参数验证：需要一个数组参数
     if (info.Length() < 1 || !info[0].IsArray()) {
@@ -1225,10 +1255,12 @@ Napi::Value SetClipboardFiles(const Napi::CallbackInfo& info) {
 
     if (hResult == NULL) {
         GlobalFree(hGlobal);
+        ZLOG_WARN("clipboard", "setClipboardFiles: SetClipboardData failed");
         return Napi::Boolean::New(env, false);
     }
 
     // 注意：成功后不要释放 hGlobal，剪贴板会接管内存
+    ZLOG_DEBUG("clipboard", "setClipboardFiles -> %zu files", filePaths.size());
     return Napi::Boolean::New(env, true);
 }
 
@@ -1516,6 +1548,8 @@ void MouseMonitorThread() {
 
             if (elapsed >= g_mouseLongPressMs) {
                 g_mouseLongPressTriggered = true;
+                ZLOG_INFO("mouse", "long press triggered (%s, %ld ms)",
+                          g_mouseButtonType.c_str(), (long)elapsed);
                 if (g_mouseTsfn != nullptr) {
                     napi_call_threadsafe_function(g_mouseTsfn, nullptr, napi_tsfn_nonblocking);
                 }
@@ -1609,6 +1643,9 @@ Napi::Value StartMouseMonitor(const Napi::CallbackInfo& info) {
     g_mouseReplayOnRelease = false;
     g_isMouseMonitoring = true;
 
+    ZLOG_INFO("mouse", "monitor started (button=%s, longPressMs=%d)",
+              g_mouseButtonType.c_str(), g_mouseLongPressMs);
+
     // 启动监控线程
     g_mouseMessageThread = std::thread(MouseMonitorThread);
 
@@ -1644,6 +1681,7 @@ Napi::Value StopMouseMonitor(const Napi::CallbackInfo& info) {
     g_mouseButtonType.clear();
     g_mouseLongPressMs = 0;
 
+    ZLOG_INFO("mouse", "monitor stopped");
     return env.Undefined();
 }
 
@@ -2003,6 +2041,7 @@ void OptimizedShortcutThread() {
                 OptimizedShortcutTrigger* trigger = new OptimizedShortcutTrigger();
                 trigger->shortcut = it->second.shortcut;
                 trigger->primed = PrimeScreenshotFrameNow();
+                ZLOG_INFO("shortcut", "hotkey triggered: %s", trigger->shortcut.c_str());
                 if (g_optimizedShortcutTsfn != nullptr) {
                     napi_call_threadsafe_function(g_optimizedShortcutTsfn, trigger, napi_tsfn_nonblocking);
                 } else {
@@ -2103,12 +2142,14 @@ Napi::Value EnsureOptimizedShortcutListener(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
+    ZLOG_INFO("shortcut", "listener started");
     return env.Undefined();
 }
 
 // 停止 native 优化快捷键监听并释放资源。
 Napi::Value StopOptimizedShortcutListener(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
+    ZLOG_INFO("shortcut", "listener stopping");
     StopOptimizedShortcutListenerInternal("optimized shortcut listener stopped");
     return env.Undefined();
 }
@@ -2176,6 +2217,10 @@ Napi::Value RegisterOptimizedShortcut(const Napi::CallbackInfo& info) {
 
     const OptimizedShortcutRegistrationResult result = g_optimizedShortcutRefreshResult;
     g_optimizedShortcutRefreshCompleted = false;
+    ZLOG_INFO("shortcut", "register \"%s\" -> %s%s%s", shortcut.c_str(),
+              result.success ? "ok" : "failed",
+              result.error.empty() ? "" : " (", result.error.c_str(),
+              result.error.empty() ? "" : ")");
     return CreateOptimizedShortcutRegistrationResult(env, result.success, result.error);
 }
 
@@ -2241,6 +2286,10 @@ Napi::Value UnregisterOptimizedShortcut(const Napi::CallbackInfo& info) {
 
     const OptimizedShortcutRegistrationResult result = g_optimizedShortcutRefreshResult;
     g_optimizedShortcutRefreshCompleted = false;
+    ZLOG_INFO("shortcut", "unregister \"%s\" -> %s%s%s", shortcut.c_str(),
+              result.success ? "ok" : "failed",
+              result.error.empty() ? "" : " (", result.error.c_str(),
+              result.error.empty() ? "" : ")");
     return CreateOptimizedShortcutRegistrationResult(env, result.success, result.error);
 }
 
@@ -2518,6 +2567,7 @@ Napi::Value GetSelectedContent(const Napi::CallbackInfo& info) {
         item.Set("type", "text");
         item.Set("data", uiaText);
         result.Set(uint32_t(0), item);
+        ZLOG_DEBUG("selection", "got text via UIA (%zu chars)", uiaText.size());
         return result;
     }
 
@@ -2666,6 +2716,8 @@ Napi::Value GetSelectedContent(const Napi::CallbackInfo& info) {
         g_isPaused = false;
     }
 
+    ZLOG_DEBUG("selection", "getSelectedContent -> %u items (via ctrl+c)",
+               (unsigned)result.Length());
     return result;
 }
 
@@ -2699,6 +2751,7 @@ Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
     // 发送输入事件
     UINT result = SendInput(4, inputs, sizeof(INPUT));
 
+    ZLOG_DEBUG("input", "simulatePaste -> %u/4 events", result);
     // 返回是否成功（应该发送了4个事件）
     return Napi::Boolean::New(env, result == 4);
 }
@@ -2777,6 +2830,7 @@ Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo& info) {
     // 发送输入事件
     UINT result = SendInput(static_cast<UINT>(eventCount), inputs.data(), sizeof(INPUT));
 
+    ZLOG_DEBUG("input", "simulateKeyboardTap \"%s\" -> %u/%zu events", key.c_str(), result, eventCount);
     // 返回是否成功
     return Napi::Boolean::New(env, result == eventCount);
 }
@@ -3021,6 +3075,7 @@ static void QueueUwpPackageChange(const char* type, const winrt::hstring& packag
     auto event = std::make_unique<UwpPackageChangeEvent>();
     event->type = type;
     event->packageFullName = winrt::to_string(packageFullName);
+    ZLOG_INFO("uwp", "package %s: %s", type, event->packageFullName.c_str());
 
     // 与停止流程串行，确保 TSFN 不会在排队过程中被释放。
     std::lock_guard<std::mutex> lock(g_uwpPackageMonitorMutex);
@@ -3168,6 +3223,7 @@ static Napi::Value StartUwpPackageMonitor(const Napi::CallbackInfo& info) {
         &g_uwpPackageTsfn
     );
     if (status != napi_ok) {
+        ZLOG_ERROR("uwp", "create package monitor callback failed");
         Napi::Error::New(env, "Failed to create UWP package monitor callback").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -3196,12 +3252,15 @@ static Napi::Value StartUwpPackageMonitor(const Napi::CallbackInfo& info) {
 
     if (!startError.empty()) {
         // 初始化失败时先回收线程和 TSFN，再把错误返回 JavaScript。
+        ZLOG_ERROR("uwp", "package monitor start failed: %s", startError.c_str());
         if (g_uwpPackageMonitorThread.joinable()) {
             g_uwpPackageMonitorThread.join();
         }
         napi_release_threadsafe_function(g_uwpPackageTsfn, napi_tsfn_release);
         g_uwpPackageTsfn = nullptr;
         Napi::Error::New(env, startError).ThrowAsJavaScriptException();
+    } else {
+        ZLOG_INFO("uwp", "package monitor started");
     }
 
     return env.Undefined();
@@ -3238,6 +3297,7 @@ static Napi::Value StopUwpPackageMonitor(const Napi::CallbackInfo& info) {
         g_uwpPackageMonitorError.clear();
     }
 
+    ZLOG_DEBUG("uwp", "package monitor stopped");
     return env.Undefined();
 }
 
@@ -3880,6 +3940,8 @@ Napi::Value LaunchUwpApp(const Napi::CallbackInfo& info) {
         CoUninitialize();
     }
 
+    ZLOG_INFO("uwp", "launch \"%s\" -> %s (pid=%lu, hresult=0x%08X)", appIdUtf8.c_str(),
+              SUCCEEDED(hr) ? "ok" : "failed", (unsigned long)pid, (unsigned)hr);
     return CreateUwpLaunchResult(
         env,
         SUCCEEDED(hr),
@@ -4205,10 +4267,12 @@ class IconWorker : public Napi::AsyncWorker {
         }
         void OnOK() override {
             if (result_.empty()) {
+                ZLOG_WARN("icon", "getFileIcon -> empty (path=%ls)", path_.c_str());
                 auto emptyBuffer = Napi::Buffer<unsigned char>::New(Env(), 0);
                 deferred_.Resolve(emptyBuffer);
                 return;
             }
+            ZLOG_DEBUG("icon", "getFileIcon -> %zu bytes (path=%ls)", result_.size(), path_.c_str());
             auto buffer = Napi::Buffer<unsigned char>::Copy(
                 Env(), result_.data(), result_.size());
             deferred_.Resolve(buffer);
@@ -4330,6 +4394,7 @@ Napi::Value ResolveMuiStrings(const Napi::CallbackInfo& info) {
     Napi::Array refs = info[0].As<Napi::Array>();
     Napi::Object result = Napi::Object::New(env);
 
+    uint32_t resolvedCount = 0;
     for (uint32_t i = 0; i < refs.Length(); i++) {
         Napi::Value val = refs[i];
         if (!val.IsString()) continue;
@@ -4352,8 +4417,10 @@ Napi::Value ResolveMuiStrings(const Napi::CallbackInfo& info) {
         WideCharToMultiByte(CP_UTF8, 0, resolved.c_str(), -1, &resolvedUtf8[0], utf8Size, NULL, NULL);
 
         result.Set(refUtf8, Napi::String::New(env, resolvedUtf8));
+        resolvedCount++;
     }
 
+    ZLOG_DEBUG("mui", "resolveMuiStrings -> %u/%u resolved", resolvedCount, refs.Length());
     return result;
 }
 
@@ -4369,6 +4436,8 @@ struct ColorPickerResult {
 void CallColorPickerJs(napi_env env, napi_value js_callback, void* context, void* data) {
     if (env != nullptr && js_callback != nullptr && data != nullptr) {
         ColorPickerResult* result = static_cast<ColorPickerResult*>(data);
+        ZLOG_INFO("colorpicker", "finished: success=%d hex=%s", result->success ? 1 : 0,
+                  result->success ? result->hex.c_str() : "-");
 
         Napi::Env napiEnv(env);
         Napi::Object obj = Napi::Object::New(napiEnv);
@@ -4806,6 +4875,7 @@ Napi::Value StartColorPicker(const Napi::CallbackInfo& info) {
     );
 
     g_isColorPickerActive = true;
+    ZLOG_INFO("colorpicker", "started");
 
     // 启动取色器线程
     g_colorPickerThread = std::thread(ColorPickerThreadFunc);
@@ -4822,6 +4892,7 @@ Napi::Value StopColorPicker(const Napi::CallbackInfo& info) {
     }
 
     g_isColorPickerActive = false;
+    ZLOG_INFO("colorpicker", "stop requested");
 
     if (g_colorPickerWindow != NULL) {
         PostMessage(g_colorPickerWindow, WM_CLOSE, 0, 0);
@@ -5392,6 +5463,7 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo& info) {
     std::wstring address = Utf8ToWideString(addressUtf8);
 
     if (address.empty() || !IsFileLocationWindow(targetHwnd)) {
+        ZLOG_WARN("explorer", "setAddressBar: not a file location window (hwnd=%p)", targetHwnd);
         return Napi::Boolean::New(env, false);
     }
 
@@ -5399,10 +5471,14 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo& info) {
     GetClassNameW(targetHwnd, className, 256);
     if (wcscmp(className, L"CabinetWClass") == 0 ||
         wcscmp(className, L"ExploreWClass") == 0) {
-        return Napi::Boolean::New(env, NavigateExplorerWindow(targetHwnd, address));
+        const bool navigated = NavigateExplorerWindow(targetHwnd, address);
+        ZLOG_INFO("explorer", "setAddressBar (Explorer, hwnd=%p) -> %s", targetHwnd,
+                  navigated ? "ok" : "failed");
+        return Napi::Boolean::New(env, navigated);
     }
 
     if (!FocusTargetWindow(targetHwnd)) {
+        ZLOG_WARN("explorer", "setAddressBar: focus failed (hwnd=%p)", targetHwnd);
         return Napi::Boolean::New(env, false);
     }
 
@@ -5413,6 +5489,8 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo& info) {
     Sleep(30);
     success = SendVirtualKeyTap(VK_RETURN) && success;
 
+    ZLOG_INFO("explorer", "setAddressBar (dialog, hwnd=%p) -> %s", targetHwnd,
+              success ? "ok" : "failed");
     return Napi::Boolean::New(env, success);
 }
 
@@ -5939,6 +6017,7 @@ Napi::Value ScanWindowsShortcuts(const Napi::CallbackInfo& info) {
         }
         ResolveShortcutTargetsInParallel(entries);
 
+        ZLOG_DEBUG("shortcut", "scanWindowsShortcuts -> %zu entries", entries.size());
         Napi::Array result = Napi::Array::New(env, entries.size());
         for (uint32_t i = 0; i < entries.size(); i++) {
             const auto& entry = entries[i];
@@ -5955,9 +6034,11 @@ Napi::Value ScanWindowsShortcuts(const Napi::CallbackInfo& info) {
 
         return result;
     } catch (const std::exception& error) {
+        ZLOG_ERROR("shortcut", "scanWindowsShortcuts failed: %s", error.what());
         Napi::Error::New(env, std::string("Windows shortcut scan failed: ") + error.what())
             .ThrowAsJavaScriptException();
     } catch (...) {
+        ZLOG_ERROR("shortcut", "scanWindowsShortcuts failed with an unknown native error");
         Napi::Error::New(env, "Windows shortcut scan failed with an unknown native error")
             .ThrowAsJavaScriptException();
     }
@@ -6498,6 +6579,9 @@ public:
     }
 
     void OnOK() override {
+        ZLOG_INFO("explorer", "launchViaExplorer %ls -> %s (hresult=0x%08X, stage=%s)",
+                  target_.c_str(), SUCCEEDED(result_.hr) ? "ok" : "failed",
+                  (unsigned)result_.hr, result_.stage);
         Napi::Object result = Napi::Object::New(Env());
         result.Set("success", Napi::Boolean::New(Env(), SUCCEEDED(result_.hr)));
         result.Set(
@@ -6509,6 +6593,8 @@ public:
     }
 
     void OnError(const Napi::Error& error) override {
+        ZLOG_ERROR("explorer", "launchViaExplorer %ls rejected: %s", target_.c_str(),
+                   error.Message().c_str());
         deferred_.Reject(error.Value());
     }
 
@@ -6774,6 +6860,8 @@ Napi::Value LaunchCuiShell(const Napi::CallbackInfo& info)
     if (!created)
     {
         errorCode = GetLastError();
+        ZLOG_ERROR("shell", "launchCuiShell %ls: CreateProcessW failed (error %lu)",
+                   applicationPath.c_str(), (unsigned long)errorCode);
         Napi::Error::New(
             env,
             "CreateProcessW failed (Windows error " +
@@ -6784,11 +6872,17 @@ Napi::Value LaunchCuiShell(const Napi::CallbackInfo& info)
     CloseHandle(processInfo.hThread);
     CloseHandle(processInfo.hProcess);
 
+    ZLOG_INFO("shell", "launchCuiShell %ls (cwd=%ls, pid=%lu)", applicationPath.c_str(),
+              currentDirectory.c_str(), (unsigned long)processInfo.dwProcessId);
     return Napi::Boolean::New(env, true);
 }
 
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    // 应用 ZTOOLS_LOG_LEVEL 环境变量（须在其他日志写入前调用）
+    ztools_log::InitFromEnv();
+    ZLOG_INFO("core", "=== ztools_native loaded (pid=%u, win32) ===", ztools_log::ProcessId());
+    ZLOG_DEBUG("core", "log file: %s", ztools_log::FilePath().c_str());
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
     exports.Set("stopMonitor", Napi::Function::New(env, StopMonitor));
     exports.Set("pauseMonitor", Napi::Function::New(env, PauseMonitor));
@@ -6841,6 +6935,17 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("launchViaExplorer", Napi::Function::New(env, LaunchViaExplorer));
     exports.Set("getSelectedContent", Napi::Function::New(env, GetSelectedContent));
     exports.Set("launchCuiShell", Napi::Function::New(env, LaunchCuiShell));
+    // Provider 桥接：让原生层（任意 native 线程）调用 JS 侧注册的方法
+    exports.Set("startProviderBridge", Napi::Function::New(env, ztools_provider_bridge::StartProviderBridge));
+    exports.Set("stopProviderBridge", Napi::Function::New(env, ztools_provider_bridge::StopProviderBridge));
+    exports.Set("resolveProviderBridge", Napi::Function::New(env, ztools_provider_bridge::ResolveProviderBridge));
+    exports.Set("rejectProviderBridge", Napi::Function::New(env, ztools_provider_bridge::RejectProviderBridge));
+    exports.Set("isProviderBridgeReady", Napi::Function::New(env, ztools_provider_bridge::IsProviderBridgeReady));
+    exports.Set("invokeProviderFromNative", Napi::Function::New(env, ztools_provider_bridge::InvokeProviderFromNative));
+    exports.Set("invokeProviderAsyncFromNative", Napi::Function::New(env, ztools_provider_bridge::InvokeProviderAsyncFromNative));
+    exports.Set("cancelProviderAsyncFromNative", Napi::Function::New(env, ztools_provider_bridge::CancelProviderAsyncFromNative));
+    // 日志管理：等级查询/设置、日志文件路径、JS 侧写入同一日志文件
+    ztools_log_binding::Register(env, exports);
     return exports;
 }
 

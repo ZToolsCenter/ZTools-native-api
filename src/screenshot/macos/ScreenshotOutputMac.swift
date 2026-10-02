@@ -58,7 +58,7 @@ func scMakeDefaultScreenshotName() -> String {
 ///   置灰不可选、用户未输扩展名时自动补 .png）
 /// - 覆盖提示：NSSavePanel 对已存在文件自带「替换确认」弹窗，与 Windows OFN_OVERWRITEPROMPT
 ///   同为系统对话框自带覆盖确认（非自绘），语义一致
-/// 须在主线程调用（runModal 为模态事件循环，运行在会话泵所在的主线程；模态期间会话泵
+/// 须在主线程调用（runModal 为模态事件循环，运行在会话所在的主线程；模态期间会话
 /// 暂停属预期，对齐 Windows GetSaveFileNameW 模态循环）。调用方须先临时降覆盖层/工具栏
 /// 浮层族层级（Windows 弹出前摘除 TOPMOST 的等价处理，见 ScreenshotOverlaySession.
 /// saveSelectionToFile 与 duckOverlayLevelsForSaveModal）。
@@ -213,19 +213,24 @@ extension ScreenshotOverlaySession {
         ctx.interpolationQuality = .high
         ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
 
-        // 标注合成（原 compositeAnnotationsToPng 并入统一管线；无标注时跳过，保持
-        // 直角空标注路径行为不变）：raw CGContext 原点在左下，翻转为左上原点后复用
-        // 覆盖层同款绘制函数（final 位图原点 = 选区左上角，ox/oy 对齐 CompositeAnnotations）。
-        // 马赛克先从裁剪底图现场重算，矢量/文字标注清晰覆盖其上（对齐 CompositeAnnotations
-        // 的马赛克先行揭示 + 标注覆盖次序）。
-        if !annotations.isEmpty {
+        // 标注 + 译文覆盖合成（原 compositeAnnotationsToPng 并入统一管线；两者均无时
+        // 跳过，保持直角空标注路径行为不变）：raw CGContext 原点在左下，翻转为左上
+        // 原点后复用覆盖层同款绘制函数（final 位图原点 = 选区左上角，ox/oy 对齐
+        // CompositeAnnotations / CompositeTranslateBlocks）。
+        // 马赛克先从裁剪底图现场重算，矢量/文字标注清晰覆盖其上；译文面板最后合成
+        //（对齐 Windows 导出管线 DrawAnnotations → CompositeTranslateBlocks 次序）。
+        let hasTranslateOutput = translateState == .shown && !translateBlocks.isEmpty
+        if !annotations.isEmpty || hasTranslateOutput {
             ctx.saveGState()
             ctx.translateBy(x: 0, y: CGFloat(height))
             ctx.scaleBy(x: 1, y: -1)
-            compositeMosaicLayer(ctx, cropped: cropped, region: sel)
-            for a in annotations {
-                scDrawAnnotation(ctx, a, ox: -sel.minX, oy: -sel.minY)
+            if !annotations.isEmpty {
+                compositeMosaicLayer(ctx, cropped: cropped, region: sel)
+                for a in annotations {
+                    scDrawAnnotation(ctx, a, ox: -sel.minX, oy: -sel.minY)
+                }
             }
+            compositeTranslateBlocks(ctx, sel: sel)
             ctx.restoreGState()
         }
 
@@ -249,7 +254,7 @@ extension ScreenshotOverlaySession {
     /// 1) 弹出前临时下调覆盖层/工具栏浮层族窗口层级 + event tap 放行模态期间按键
     ///   （对齐 Windows 弹出前摘除 TOPMOST：PromptSaveFilePath 注释「覆盖层是 WS_EX_TOPMOST
     ///   全屏窗口，通用对话框可能被遮挡」，L608-609/L632-636）
-    /// 2) NSSavePanel 模态（runModal 在主线程=会话泵线程执行；模态期间会话泵暂停属预期，
+    /// 2) NSSavePanel 模态（runModal 在主线程=会话主线程执行；模态期间会话定时器暂停属预期，
     ///   对齐 GetSaveFileNameW 模态循环；面板自成模态，键盘/鼠标不会误触覆盖层）
     /// 3) 取消对话框：层级恢复（defer）、回到编辑态继续会话、无回调（对齐 Windows
     ///   L358「用户取消保存对话框：不关闭，留在编辑态」）

@@ -19,13 +19,13 @@ import ApplicationServices
 // - 终止全集：完成 / 取消 / ESC / abortLongCapture（对齐 lc_session_windows.cpp 主循环各 break 分支；
 //   拼接无帧数/像素上限，可持续合并至用户主动结束）
 //
-// 线程模型：长截图会话由覆盖层会话的手动泵（pumpTick → lcTick）在主线程驱动，算法层调用
+// 线程模型：长截图会话由覆盖层会话的定时器 tick（sessionTick → lcTick）在主线程驱动，算法层调用
 // 全部串行（LCAlgorithmSession 线程约定）；CGEventTap 回调线程只写滚轮缓冲（锁内），
-// 泵循环逐拍消费（沿用覆盖层会话的事件模式）。
+// 会话定时器逐拍消费（沿用覆盖层会话的事件模式）。
 //
 // 与 Windows 的既知语义差异（均为有意映射，其余逐条对齐）：
 // - Windows 在独立捕获线程用阻塞式 LongCaptureWaitMessages 等待重试间隔；macOS 无第二
-//   消息循环，重试梯以「下次尝试时刻」在泵循环 tick 中推进，UI 同期保持响应。
+//   消息循环，重试梯以「下次尝试时刻」在会话定时器 tick 中推进，UI 同期保持响应。
 // - autoScroll 注入语义差异见 tickAutoScroll 注释。
 
 // MARK: - 常量（Windows 出处集中标注）
@@ -94,9 +94,9 @@ func lcNSRect(fromCG rect: CGRect) -> NSRect {
     return NSRect(x: rect.minX, y: top - rect.height, width: rect.width, height: rect.height)
 }
 
-// MARK: - 滚轮观察缓冲（tap 回调线程只写、泵循环消费）
+// MARK: - 滚轮观察缓冲（tap 回调线程只写、会话定时器消费）
 
-/// 滚轮事件原始增量条目（tap 回调线程合并写入；方向解析延迟到泵消费时按当前模式进行，
+/// 滚轮事件原始增量条目（tap 回调线程合并写入；方向解析延迟到消费时按当前模式进行，
 /// 避免 tap 线程读会话状态）。line* 为整数行增量（滚轮一格 = ±1 行），point* 为像素级
 /// 增量（触控板亚行滚动），shift = 事件携带的 Shift 修饰键。
 struct ScreenshotLCWheelSample {
@@ -132,7 +132,7 @@ final class ScreenshotLCWheelBuffer {
         }
     }
 
-    /// 取出并清空缓冲（泵循环消费；无未消费事件返回 nil）。
+    /// 取出并清空缓冲（会话定时器消费；无未消费事件返回 nil）。
     func take() -> ScreenshotLCWheelSample? {
         lock.lock()
         defer { lock.unlock() }
@@ -167,7 +167,7 @@ private func lcWheelTapCallback(
 /// 长截图滚轮观察 tap（对齐 lc_frame_io_windows.cpp LongCaptureRegisterWheelObserver 的 Raw Input
 /// RIDEV_INPUTSINK：非前台也接收广播、不拦截输入）。macOS 用 `.listenOnly` CGEventTap 监听
 /// scrollWheel——事件原样放行（照常送达选区下的目标窗口），这里只被动解析方向与时机。
-/// tap 回调线程只把原始增量写入共享缓冲（ScreenshotLCWheelBuffer），泵循环逐拍消费。
+/// tap 回调线程只把原始增量写入共享缓冲（ScreenshotLCWheelBuffer），会话定时器逐拍消费。
 final class ScreenshotLCWheelTap {
     private let buffer: ScreenshotLCWheelBuffer
     private var tap: CFMachPort?
@@ -331,7 +331,7 @@ final class ScreenshotLCMaskView: NSView {
 /// 算法层会话与全部会话侧簿记字段（lc_session_windows.cpp 中归属会话层的 wheelPending/lastDir/
 /// noChangeCount/reachedBottom/weakTries/frameCount/autoFailStreak 等；拼接累计状态全部
 /// 在算法层 LCAlgorithmSession 内，会话层绝不直接触碰）。生命周期：beginLongCapture 创建
-/// → start()（蒙版/首帧/浮层/tap）→ lcTick() 由覆盖层泵循环逐拍驱动 → 终止条件收束
+/// → start()（蒙版/首帧/浮层/tap）→ lcTick() 由覆盖层会话定时器逐拍驱动 → 终止条件收束
 /// （完成/保存成功 → success 回调；取消/ESC/abort/失败 → 整会话 {success:false} 收束，
 /// 对齐 wndproc_windows.cpp WM_LONGCAPTURE_RUN 结束后 ctx->state = CS_Done + DestroyWindow）。
 final class ScreenshotLongCaptureSession {
@@ -397,7 +397,7 @@ final class ScreenshotLongCaptureSession {
     private var lastFailReason: LCFailReason = .none
     private var lastResult: LCTryStitchResult?
 
-    // ---- 工具栏动作标志（工具栏控制器在主线程泵内置位；lc->finishFlag/saveFlag/abortFlag）----
+    // ---- 工具栏动作标志（工具栏控制器在主线程会话 tick 内置位；lc->finishFlag/saveFlag/abortFlag）----
     var finishRequested = false
     var saveRequested = false
 
@@ -469,7 +469,7 @@ final class ScreenshotLongCaptureSession {
     /// 启动长截图会话：隐藏覆盖层 → 创建灰蒙版 → 算法层会话 + 首帧基准 → 小地图/工具栏
     /// → 滚轮观察 tap。任一关键步骤失败时 FailFast 收束整个截图会话（对齐 Windows
     /// LongCaptureInitFirstFrame 失败 → LongCaptureEmitFailure → 会话清理，矩阵 #48）。
-    /// - Returns: true 会话就绪（state 置 .longCapturing 后由泵循环驱动）；false 已收束
+    /// - Returns: true 会话就绪（state 置 .longCapturing 后由会话定时器驱动）；false 已收束
     func start() -> Bool {
         guard let ov = overlay else { return false }
 
@@ -574,9 +574,9 @@ final class ScreenshotLongCaptureSession {
         return true
     }
 
-    // MARK: 泵循环驱动（Windows RunLongCapture 主循环的 tick 化等价物）
+    // MARK: 会话 tick 驱动（Windows RunLongCapture 主循环的 tick 化等价物）
 
-    /// 泵循环逐拍入口（覆盖层 pumpTick 在 .longCapturing 态调用）：检查点消费 + 采样轮推进
+    /// 会话逐拍入口（覆盖层 sessionTick 在 .longCapturing 态调用）：检查点消费 + 采样轮推进
     /// + autoScroll 节拍 + UI 维护节拍。单次调用内不做任何阻塞等待（重试梯以「下次尝试
     /// 时刻」表达，等价 Windows LongCaptureWaitMessages 的有界等待）。
     func lcTick() {
@@ -601,7 +601,7 @@ final class ScreenshotLongCaptureSession {
             if ended { return }
         }
 
-        // 消费滚轮观察缓冲（tap 线程只写缓冲，方向解析在泵线程按当前模式进行）
+        // 消费滚轮观察缓冲（tap 线程只写缓冲，方向解析在主线程按当前模式进行）
         drainWheel(now: now)
 
         // 采样轮（三条件触发 + 重试梯推进 + 结局簿记）
@@ -626,7 +626,7 @@ final class ScreenshotLongCaptureSession {
     // MARK: 滚轮消费（lc_panel_ui_windows.cpp WM_INPUT 分支逐条照搬）
 
     /// 解析并消费滚轮观察缓冲：纵向模式消费纵滚轮（忽略横滚轮）；横向模式消费横滚轮与
-    /// Shift+纵滚轮。方向解析在泵线程按当前模式进行（tap 线程只缓冲原始增量）。
+    /// Shift+纵滚轮。方向解析在主线程按当前模式进行（tap 线程只缓冲原始增量）。
     /// 行增量按 1 行 = 1 notch 归一到 Windows WHEEL_DELTA=120 计入软先验（只参与候选
     /// 排序加分，绝不约束搜索范围）；亚行像素级滚动（触控板慢滚，行增量 = 0）只驱动
     /// 采样时机与方向，不计入 notch 先验，保持 px/notch 估计的量纲诚实。
@@ -1258,7 +1258,7 @@ extension ScreenshotOverlaySession {
         longCaptureFlag.set()   // event tap 的 ESC 从此刻起路由到 longCancelFlag
     }
 
-    /// 取消长截图（泵循环消费 ESC/兜底取消标志）：整会话按失败收束（对齐 Windows
+    /// 取消长截图（会话定时器消费 ESC/兜底取消标志）：整会话按失败收束（对齐 Windows
     /// lc_session_windows.cpp 取消路径 abortFlag → LongCaptureEmitFailure → 会话 CS_Done 结束；
     /// 不回编辑态）。
     func cancelLongCaptureSession() {

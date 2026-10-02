@@ -319,6 +319,7 @@ static bool SaveArgbBitmapToClipboard(HBITMAP hbmp, int w, int h,
 
 static HBITMAP BuildRoundedArgbFinal(HDC memDC, const RECT& rect, int vx, int vy,
     double dpiScale, const std::vector<Annotation>& anns, int radius, int mosaicSizeIdx,
+    const std::vector<TranslateBlock>& translateBlocks,
     HDC& outDC, void*& outBits, int& outW, int& outH) {
     outDC = NULL; outBits = NULL; outW = 0; outH = 0;
     int width = rect.right - rect.left;
@@ -402,6 +403,8 @@ static HBITMAP BuildRoundedArgbFinal(HDC memDC, const RECT& rect, int vx, int vy
     }
     CompositeAnnotations(finalDC, memDC, anns, rect, vx, vy, dpiScale,
                          SC_MOSAIC_SIZES[mosaicSizeIdx]);
+    // 翻译覆盖块随标注一起合成（白底面板盖住原文字 + 译文，见 translate_windows.cpp）
+    CompositeTranslateBlocks(finalDC, translateBlocks, rect);
 
     // 圆角蒙版：同尺寸 32bpp DIB，不透明黑底 + GDI+ 填白圆角路径，取 RGB 通道作 coverage
     int r = (std::min)(radius, (std::min)(finalW, finalH) / 2);
@@ -467,6 +470,7 @@ static HBITMAP BuildRoundedArgbFinal(HDC memDC, const RECT& rect, int vx, int vy
 
 static bool ComposeSelectedBitmap(HDC memDC, const RECT& rect, int vx, int vy,
     double dpiScale, const std::vector<Annotation>& anns, int mosaicSizeIdx,
+    const std::vector<TranslateBlock>& translateBlocks,
     HDC& outFinalDC, HBITMAP& outFinalBmp) {
     outFinalDC = NULL; outFinalBmp = NULL;
     int width = rect.right - rect.left;
@@ -516,6 +520,8 @@ static bool ComposeSelectedBitmap(HDC memDC, const RECT& rect, int vx, int vy,
         // 合成标注进最终图像（finalDC 原点 = 选区原点，标注为绝对坐标，偏移 = -rect.left/top）
         CompositeAnnotations(finalDC, memDC, anns, rect, vx, vy, dpiScale,
                              SC_MOSAIC_SIZES[mosaicSizeIdx]);
+        // 翻译覆盖块随标注一起合成（圆角路径在后续 radius>0 分支处理，此处为不透明路径）
+        CompositeTranslateBlocks(finalDC, translateBlocks, rect);
     }
 
     ReleaseDC(NULL, screenDC);
@@ -536,11 +542,12 @@ static bool ComposeSelectedBitmap(HDC memDC, const RECT& rect, int vx, int vy,
 // anns：可选的标注列表，会合成进最终 PNG（选区相对坐标，finalDC 原点 = 选区原点）。
 // radius>0 走圆角透明导出（32bpp ARGB + 圆角蒙版 + PNG/PNG剪贴板）；radius==0 维持不透明位图路径不变。
 // mosaicSizeIdx：马赛克块大小索引（显式传参，消除对全局 g_captureCtx 的穿透耦合）。
+// translateBlocks：已展示的翻译覆盖块，随标注一起合成进导出图像（默认空 = 无翻译内容）。
 // 拷贝/缩放失败时 success 保持 false 且不产出 base64/剪贴板数据（资源全量清理）。
 
 ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
     int vx, int vy, double dpiScale, const std::vector<Annotation>& anns,
-    int radius, int mosaicSizeIdx) {
+    int radius, int mosaicSizeIdx, const std::vector<TranslateBlock>& translateBlocks) {
     ScreenshotResult* result = new ScreenshotResult();
     result->success = false;
     int width = rect.right - rect.left;
@@ -558,7 +565,7 @@ ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
     if (radius > 0) {
         HDC fDC = NULL; void* fBits = NULL; int fw = 0, fh = 0;
         HBITMAP fbmp = BuildRoundedArgbFinal(memDC, rect, vx, vy, dpiScale, anns, radius,
-                                             mosaicSizeIdx, fDC, fBits, fw, fh);
+                                             mosaicSizeIdx, translateBlocks, fDC, fBits, fw, fh);
         if (fbmp && fBits) {
             std::string rawPng, b64;
             if (EncodePremulArgbPng(fBits, fw, fh, fw * 4, &b64, &rawPng)) {
@@ -574,7 +581,7 @@ ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect,
     // radius==0：原有不透明位图路径（公共合成，收口至 ComposeSelectedBitmap）
     HDC finalDC = NULL; HBITMAP finalBmp = NULL;
     if (ComposeSelectedBitmap(memDC, rect, vx, vy, dpiScale, anns, mosaicSizeIdx,
-                              finalDC, finalBmp)) {
+                              translateBlocks, finalDC, finalBmp)) {
         // 生成 base64
         result->base64 = BitmapToBase64Png(finalBmp);
         // 复制到剪贴板
@@ -666,11 +673,13 @@ std::wstring PromptSaveFilePath(HWND hwndOwner) {
 // 将已合成标注的选区 HBITMAP 保存为 PNG 文件。
 // 返回 true 表示保存成功。
 // mosaicSizeIdx：马赛克块大小索引（显式传参，消除对全局 g_captureCtx 的穿透耦合）。
+// translateBlocks：已展示的翻译覆盖块，随标注一起合成进落盘图像（默认空 = 无翻译内容）。
 // 选区拷贝/缩放任一环节失败时同样返回 false 并清理全部已建 GDI 资源，不会落盘黑图。
 
 bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
                                 double dpiScale, const std::vector<Annotation>& anns,
-                                const std::wstring& filePath, int radius, int mosaicSizeIdx) {
+                                const std::wstring& filePath, int radius, int mosaicSizeIdx,
+                                const std::vector<TranslateBlock>& translateBlocks) {
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
     if (width <= 0 || height <= 0 || filePath.empty()) return false;
@@ -679,7 +688,7 @@ bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
     if (radius > 0) {
         HDC fDC = NULL; void* fBits = NULL; int fw = 0, fh = 0;
         HBITMAP fbmp = BuildRoundedArgbFinal(memDC, rect, vx, vy, dpiScale, anns, radius,
-                                             mosaicSizeIdx, fDC, fBits, fw, fh);
+                                             mosaicSizeIdx, translateBlocks, fDC, fBits, fw, fh);
         bool ok = false;
         if (fbmp && fBits) {
             CLSID pngClsid;
@@ -697,7 +706,7 @@ bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy,
     HDC finalDC = NULL; HBITMAP finalBmp = NULL;
     bool ok = false;
     if (ComposeSelectedBitmap(memDC, rect, vx, vy, dpiScale, anns, mosaicSizeIdx,
-                              finalDC, finalBmp)) {
+                              translateBlocks, finalDC, finalBmp)) {
         // 用 GDI+ 保存为 PNG 文件（GDI+ 已由会话级 InitGdipResources 启动）
         Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(finalBmp, NULL);
         if (bmp) {

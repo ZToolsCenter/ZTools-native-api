@@ -66,6 +66,11 @@ namespace Gdiplus {
 
 #define WM_LONGCAPTURE_RUN (WM_APP + 200)
 
+// 翻译完成回投消息：翻译工作线程经「单飞行结果槽 + PostMessage」通知截图线程
+// 取走结果并落到 CaptureContext（槽协议见 translate_windows.cpp）
+
+#define WM_SCREENSHOT_TRANSLATE_RESULT (WM_APP + 201)
+
 // ---- 可变全局变量（定义见各归属 .cpp）----
 // 访问规则（此前线程归属散落在各字段注释，现集中声明）：
 //   线程模型——本模块仅两条线程访问这些全局：JS 线程（NAPI 导出 start/abort 等）与
@@ -196,6 +201,19 @@ void DrawToolbar(HDC hdc, const RECT& toolbarRect, int hoverBtn, int activeTool,
 // Draw 在 OnPaint 工具栏之后调用（气泡画进 backDC，盖在工具栏/子菜单之上）。
 void TickToolbarTooltip(CaptureContext* ctx, HWND overlayWnd);
 void DrawToolbarTooltip(HDC hdc, CaptureContext* ctx);
+// ---- 工具栏「翻译」按钮（OCR 识别选区文字 → 翻译 → 译文覆盖原区域，见 translate_windows.cpp）----
+// 点击入口（截图线程）：裁剪选区编码 PNG → 转入 TRL_Busy → 起翻译工作线程
+bool BeginTranslateOverlay(CaptureContext* ctx, HWND overlayHwnd);
+// WM_SCREENSHOT_TRANSLATE_RESULT 接管（截图线程）：从结果槽取走翻译结果落到 ctx
+void HandleTranslateJobResult(CaptureContext* ctx, HWND hwnd);
+// 会话空闲循环节拍：错误状态气泡超时收起
+void TickTranslateStatus(CaptureContext* ctx, HWND hwnd);
+// OnPaint 入口：确认态下绘制译文覆盖块与状态气泡（标注之上、轮廓/工具栏之下）
+void DrawTranslateOverlay(HDC hdc, CaptureContext* ctx);
+// 导出合成入口：把译文覆盖块合成进最终位图（finalDC 原点 = 选区左上角，逻辑像素）
+void CompositeTranslateBlocks(HDC finalDC, const std::vector<TranslateBlock>& blocks, const RECT& rect);
+// 会话收尾清槽：释放仍在结果槽中未被取走的翻译结果（防跨会话泄漏）
+void TeardownTranslateJobs();
 bool MosaicBlitRect(HDC targetDC, HDC srcDC, int dstX0, int dstY0, int dstW, int dstH, int srcAbsX0, int srcAbsY0, int blockPx, int virtualX, int virtualY, double dpiScale);
 void FreeMosaicBase(CaptureContext* ctx);
 void InitMosaicBrushCursors(CaptureContext* ctx);
@@ -216,8 +234,10 @@ bool EncodeHBitmapPng(HBITMAP hBitmap, std::string* base64Out, std::string* rawO
 // 因此同时把画刷原点复位到 (0,0) 避免抖动（MSDN 推荐配套调用）。
 void SetHalftoneStretchMode(HDC dc);
 
+// translateBlocks：已展示的翻译覆盖块，会随标注一起合成进导出图像（默认空 = 无翻译内容）。
 ScreenshotResult* ExtractRegionResult(HDC memDC, const RECT& rect, int vx, int vy,
-    double dpiScale, const std::vector<Annotation>& anns, int radius, int mosaicSizeIdx);
+    double dpiScale, const std::vector<Annotation>& anns, int radius, int mosaicSizeIdx,
+    const std::vector<TranslateBlock>& translateBlocks = {});
 // 统一的 ScreenshotResult 发射口：字段参数化构造结果并经截图会话 TSFN 回传 JS。
 // 内部统一处理守卫：TSFN 未就绪或 napi_tsfn_nonblocking 因队列满返回非 napi_ok 时，
 // 自行 delete 分配的 result 防泄漏（CallScreenshotJs 只在成功入队时才 delete）。
@@ -233,7 +253,8 @@ bool RunLongCapture(LongCaptureContext* c);
 void LongCaptureAbort();
 std::wstring PromptSaveFilePath(HWND hwndOwner);
 bool SaveRegionToPngFile(HDC memDC, const RECT& rect, int vx, int vy, double dpiScale,
-    const std::vector<Annotation>& anns, const std::wstring& filePath, int radius, int mosaicSizeIdx);
+    const std::vector<Annotation>& anns, const std::wstring& filePath, int radius, int mosaicSizeIdx,
+    const std::vector<TranslateBlock>& translateBlocks = {});
 void ClampCornerRadius(CaptureContext* ctx);
 bool CalcAnnotationsBounds(std::vector<Annotation>& anns, RECT& out, HDC hdc);
 RECT MeasureTextAnnotation(HDC hdc, Annotation& a);

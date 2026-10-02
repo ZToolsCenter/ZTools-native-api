@@ -6,7 +6,11 @@ import ApplicationServices
 //
 // 本文件承载会话主体（绘制扩展见 ScreenshotPaintMac.swift）：
 // - 多屏覆盖层：每个 NSScreen 一个无边框透明 NSWindow，共享同一会话状态单例
-// - 手动泵主循环：NSApp.nextEvent/sendEvent 驱动 AppKit 事件直至会话收束（取色器模式）
+// - 非阻塞会话：start() 创建窗口/事件源/逐拍定时器后立即返回，AppKit 事件
+//   （鼠标/键盘/绘制）由宿主进程自己的主事件循环分发（Electron 主进程的
+//   Chromium 消息泵天然驱动 NSApp），会话只在事件回调里做短促状态推进；
+//   周期性任务（插入符闪烁/翻译邮箱 drain/长截图采样/工具栏 tooltip）由
+//   主 RunLoop 上的 16ms 定时器（sessionTick）驱动
 // - 选区状态机：Idle → Selecting → Confirmed → (Resizing | Moving) → Done/Cancelled
 //  （对齐 Windows internal.h CaptureState）
 // - 鼠标/键盘交互由覆盖层 NSView 处理；ESC 与右键取消另有 CGEventTap 兜底（失焦仍可取消）
@@ -72,7 +76,7 @@ struct ScreenshotRGB: Equatable {
     let b: UInt8
 }
 
-/// 线程安全的取消标志：CGEventTap 回调在 tap 自有后台线程置位，泵循环（主线程）逐拍消费。
+/// 线程安全的取消标志：CGEventTap 回调在 tap 自有后台线程置位，会话逐拍定时器（主线程）消费。
 final class ScreenshotAtomicFlag {
     private let lock = NSLock()
     private var value = false
@@ -272,7 +276,7 @@ private func screenshotOverlayEventTapCallback(
 }
 
 /// 覆盖层 CGEventTap 兜底（对齐 Windows 失焦后 GetAsyncKeyState 轮询兜底，矩阵 #49）：
-/// 会话期间拦截 ESC keyDown 与右键按下并置取消标志（泵循环 ≤16ms 内消费收束），
+/// 会话期间拦截 ESC keyDown 与右键按下并置取消标志（会话定时器 ≤16ms 内消费收束），
 /// 解决覆盖层失焦时 ESC/右键仍可取消。文字编辑态例外：ESC 放行给覆盖层视图
 ///（NSTextInputClient 键系路径清缓冲回确认态——不是取消截图）。
 /// 长截图态例外：ESC 置 longCancelFlag 取消长截图（整会话 {success:false} 收束，
@@ -283,7 +287,7 @@ private func screenshotOverlayEventTapCallback(
 final class ScreenshotOverlayEventTap {
     /// 共享取消标志（与会话交换的唯一通道）。
     let cancelFlag: ScreenshotAtomicFlag
-    /// 文字编辑态标志（编辑态 ESC 放行不取消；由泵循环/状态迁移在主线程同步）。
+    /// 文字编辑态标志（编辑态 ESC 放行不取消；由会话定时器/状态迁移在主线程同步）。
     let textEditingFlag: ScreenshotAtomicFlag
     /// 保存对话框模态标志（模态期间 ESC/右键放行给 NSSavePanel 自消费，不触发会话取消；
     /// 主线程保存流在 runModal 前后同步置位/复位——对齐 Windows GetSaveFileNameW 模态
@@ -291,7 +295,7 @@ final class ScreenshotOverlayEventTap {
     let saveModalFlag: ScreenshotAtomicFlag
     /// 长截图态标志（置位期间 ESC → longCancelFlag 而非取消整个会话；主线程同步）。
     let longCaptureFlag: ScreenshotAtomicFlag
-    /// 长截图取消标志（长截图态下 ESC 置位；泵循环消费 → 取消长截图，整会话失败收束）。
+    /// 长截图取消标志（长截图态下 ESC 置位；会话定时器消费 → 取消长截图，整会话失败收束）。
     let longCancelFlag: ScreenshotAtomicFlag
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -428,8 +432,10 @@ final class ScreenshotOverlayEventTap {
 
 /// 覆盖层选区会话主体。每个 NSScreen 一个覆盖层窗口共享本实例；选区用 CG 全局
 /// 逻辑坐标跨屏统一表达，事件按窗口换算，绘制把 CG 坐标平移为窗口本地坐标。
-/// 生命周期：runOverlayCaptureSession 创建 → start()（窗口 + event tap）→ runEventPump()
-/// 手动泵直至 confirmSelection/cancelSession 收束 → finish() 完整清理并回调恰好一次。
+/// 生命周期：startOverlayCaptureSession 创建 → start()（窗口 + event tap + 逐拍定时器
+/// + 激活策略切换 + 自持有）后立即返回；此后 AppKit 事件回调与 16ms 定时器 tick
+/// 推进状态直至 confirmSelection/cancelSession 收束 → finish() 完整清理、回调恰好
+/// 一次并释放自持有（会话对象随之析构）。
 final class ScreenshotOverlaySession {
     // ---- 会话配置与基础设施（以下成员供 ScreenshotPaintMac.swift 的绘制扩展跨文件访问）----
     let options: ScreenshotSessionOptions
@@ -511,14 +517,14 @@ final class ScreenshotOverlaySession {
     var fontSizeIdx = SC.defaultFontIdx                 // 当前选中字号索引（文字工具子菜单）
     /// 上帧插入符矩形（CG 全局坐标；isNull = 无缓存），供闪烁/键系局部失效（对齐 lastCaretRect）
     var lastCaretRect = CGRect.null
-    /// 编辑态 ESC 放行标志（event tap 后台线程读取；主线程在状态迁移/泵循环同步）
+    /// 编辑态 ESC 放行标志（event tap 后台线程读取；主线程在状态迁移/会话定时器同步）
     let textEditingFlag = ScreenshotAtomicFlag()
     /// 保存对话框模态标志（模态期间 event tap 放行 ESC/右键给保存面板；保存流在
     /// runModal 前后置位/复位，见 ScreenshotOutputMac.swift 的 saveSelectionToFile）
     let saveModalFlag = ScreenshotAtomicFlag()
-    /// 长截图态标志（event tap 据此把 ESC 路由到 longCancelFlag；泵循环同步置位/复位）
+    /// 长截图态标志（event tap 据此把 ESC 路由到 longCancelFlag；会话定时器同步置位/复位）
     let longCaptureFlag = ScreenshotAtomicFlag()
-    /// 长截图取消标志（长截图态下 ESC 由 event tap 置位；泵循环消费 → 取消长截图整会话失败收束）
+    /// 长截图取消标志（长截图态下 ESC 由 event tap 置位；会话定时器消费 → 取消长截图整会话失败收束）
     let longCancelFlag = ScreenshotAtomicFlag()
     /// 长截图滚动捕获会话（进入长截图时创建，收束/取消后置 nil。
     /// 定义见 ScreenshotLongCaptureMac.swift）
@@ -532,6 +538,19 @@ final class ScreenshotOverlaySession {
     var mosaicBaseCache: ScreenshotMosaicBase? = nil
     /// 工具栏/子菜单/tooltip 浮层族控制器（生命周期挂会话 start/finish；lazy 便于引用 self）
     lazy var toolbar = ScreenshotToolbarController(session: self)
+
+    // ---- 截图翻译（对齐 CaptureContext 的 TRL_* 字段组；逻辑见 ScreenshotTranslateMac.swift）----
+    var translateState: ScreenshotTranslateState = .idle   // 异步状态机（idle/ocrPending/clustering/translationPending/layout/shown）
+    var translateBlocks: [ScreenshotTranslateBlock] = []   // 译文覆盖块（CG 全局逻辑坐标）
+    var translateStatusShown = false                       // 状态气泡（进度/错误）可见
+    var translateStatusError = false                       // 气泡是否错误态（淡红文本 + TTL）
+    var translateStatusText = ""                           // 气泡文本
+    var translateStatusRect = CGRect.null                  // 气泡矩形（CG 全局逻辑坐标）
+    var translateStatusAt: TimeInterval = 0                // 气泡展示时刻（TTL 判定）
+    /// 进行中的异步翻译任务（requestId 驱动的 OCR/翻译请求登记与队列；会话主线程
+    /// 独占读写，provider 回投经全局邮箱转入。会话收尾 cancelTranslateJob 取消全部
+    /// 在飞请求，对齐 Windows TeardownTranslateJobs——晚到回投被 requestId 反查丢弃）
+    var translateJob: ScreenshotTranslateJob?
 
     // 脏区追踪（上帧浮层并集；局部失效与绘制共用几何，等价 Windows last*Rect 语义）
     private var lastIdleOverlayRect: CGRect?
@@ -555,9 +574,20 @@ final class ScreenshotOverlaySession {
 
     // MARK: 生命周期
 
-    /// 创建多屏覆盖层窗口并显示，启动 ESC/右键 event tap 兜底。
-    /// - Returns: true 会话就绪（随后 runEventPump）；false 初始化失败（内部已 FailFast 回调并复位标志）
+    /// 创建多屏覆盖层窗口并显示，启动 ESC/右键 event tap 兜底、逐拍定时器与自持有，
+    /// 然后立即返回——会话此后完全由宿主主事件循环驱动（AppKit 事件回调 + 定时器 tick），
+    /// 不再存在任何阻塞调用栈。
+    /// - Returns: true 会话已就绪并开始运行；false 初始化失败（内部已 FailFast 回调并复位标志）
     func start() -> Bool {
+        // 宿主激活策略切换：覆盖层以 accessory 策略运行（不作为常规应用出现在
+        // Dock/切换器，对齐 Windows 无窗口线程行为；纯 Node 宿主默认 prohibited，
+        // 不切换窗口无法正常服务）。finish 时恢复快照。
+        let app = NSApplication.shared
+        let currentPolicy = app.activationPolicy()
+        if currentPolicy != .accessory {
+            savedActivationPolicy = currentPolicy
+            app.setActivationPolicy(.accessory)
+        }
         guard setupOverlayWindows() else {
             finish("{\"success\":false,\"error\":\"failed to create overlay windows\"}")
             return false
@@ -574,38 +604,30 @@ final class ScreenshotOverlaySession {
                                              longCaptureFlag: longCaptureFlag,
                                              longCancelFlag: longCancelFlag)
         eventTap?.start()
+        // 逐拍定时器（16ms，对齐原泵循环节奏）：兜底取消标志消费、插入符闪烁、翻译
+        // 邮箱 drain 与超时扫描、长截图采样轮、工具栏 tooltip 轮询等周期任务。
+        let timer = Timer(timeInterval: 0.016, repeats: true) { [weak self] _ in
+            self?.sessionTick()
+        }
+        RunLoop.main.add(timer, forMode: .default)
+        tickTimer = timer
+        selfRetain = self
         return true
     }
 
-    /// 手动泵主循环（取色器模式扩展）：Node 主线程不跑 NSRunLoop，
-    /// 会话期间由本循环驱动 AppKit 事件分发（窗口绘制/鼠标/键盘），直至确认或取消收束。
-    /// nextEvent 带超时返回，保证泵循环能逐拍消费 CGEventTap 兜底取消标志
-    ///（对齐 Windows 空闲循环的 GetAsyncKeyState 轮询节奏）。
+    /// 逐拍任务（原泵循环 pumpTick 的定时器化等价物）：消费兜底取消标志 + 工具栏
+    /// 浮层族的状态/位置同步与 tooltip 轮询（tooltip 定时进 tick，走定时任务位）
+    /// + 编辑态插入符 500ms 闪烁（对齐 Windows 空闲循环 GetTickCount 分支）
+    /// + 编辑态标志同步（event tap ESC 放行）。
     ///
-    /// 功耗审计结论：16ms 超时是有意的事件等待节奏而非忙等——无事件时线程阻塞在
-    /// nextEvent 上（空闲唤醒率上限 62.5/s），且泵循环仅在有截图会话期间运行（本就阻塞
-    /// JS 主线程的瞬态交互期）。不能拉长超时换功耗：cancelFlag/event tap 兜底取消、
-    /// 插入符闪烁、长截图采样轮都依赖 ≤16ms 的逐拍消费（event tap 注释的契约），
-    /// 拉长即违反响应性兜底；取色器用阻塞式 nextEvent(until: nil) 是其无轮询任务的
-    /// 特例，不适用本会话。
-    func runEventPump() {
-        while isRunning {
-            autoreleasepool {
-                if let event = NSApp.nextEvent(matching: .any, until: Date(timeIntervalSinceNow: 0.016),
-                                               inMode: .default, dequeue: true) {
-                    NSApp.sendEvent(event)
-                }
-                pumpTick()
-            }
-        }
-    }
-
-    /// 泵循环逐拍任务：消费兜底取消标志 + 工具栏浮层族的状态/位置同步与 tooltip 轮询
-    ///（tooltip 定时进 pumpTick，走泵循环定时任务位）+ 编辑态插入符 500ms 闪烁
-    ///（对齐 Windows 空闲循环 GetTickCount 分支）+ 编辑态标志同步（event tap ESC 放行）。
-    private func pumpTick() {
+    /// 功耗审计结论：16ms 节奏是有意的逐拍消费频率（继承原泵契约）——cancelFlag/
+    /// event tap 兜底取消、插入符闪烁、长截图采样轮都依赖 ≤16ms 的逐拍消费，
+    /// 拉长即违反响应性兜底。定时器挂在主 RunLoop default mode：宿主（Electron
+    /// 主进程等）正常驱动主事件循环时逐拍触发；保存对话框模态期间暂停（对齐
+    /// 原泵在 runModal 内停转的行为）。
+    private func sessionTick() {
         guard isRunning else { return }
-        // 长截图态：泵循环驱动长截图采样/autoScroll/浮层刷新（ScreenshotLongCaptureMac.swift
+        // 长截图态：tick 驱动长截图采样/autoScroll/浮层刷新（ScreenshotLongCaptureMac.swift
         // 的 lcTick；对齐 Windows RunLongCapture 在覆盖层窗口过程内自泵消息的语义）。
         // ESC（event tap → longCancelFlag）取消长截图：整会话 {success:false} 收束
         //（对齐 lc_session_windows.cpp abortFlag → LongCaptureEmitFailure）；cancelFlag 兜底同义。
@@ -633,6 +655,10 @@ final class ScreenshotOverlaySession {
         }
         // 编辑态插入符 500ms 闪烁（局部失效光标区域）
         tickTextCaret(now: ProcessInfo.processInfo.systemUptime)
+        // 截图翻译：provider 异步回投路由 + 超时扫描 + 错误气泡 TTL
+        //（对齐 Windows 空闲循环的 TickTranslateStatus + WM_SCREENSHOT_TRANSLATE_RESULT；
+        // Node/JS 侧事件循环由宿主自身驱动，结果邮箱在 tickTranslate 内 drain）
+        tickTranslate(now: ProcessInfo.processInfo.systemUptime)
         // 工具栏可见性随状态同步（对齐 OnPaint：Confirmed/Moving/Drawing/TextEditing 显示，
         // Resizing 隐藏）；!toolbarPlaced 时随选区自动重算位置（toolbarPlaced 语义）。
         let toolbarVisible = (state == .confirmed || state == .moving || state == .drawing
@@ -689,12 +715,27 @@ final class ScreenshotOverlaySession {
         return true
     }
 
-    /// 会话统一出口：停 event tap → 销毁长截图会话 → 销毁工具栏浮层 → 销毁窗口
-    /// → 回调（恰好一次）→ 复位重入标志（会话结束顺序；对齐 Windows 捕获线程末尾清理）。
+    // ---- 非阻塞生命周期（自持有 + 逐拍定时器 + 激活策略）----
+    /// 会话自持有：非阻塞会话没有调用栈锚点，start() 置为 self 防止无人引用被析构，
+    /// finish() 置 nil 释放（会话恰好一次收束后对象随窗口/视图引用图一并释放）。
+    private var selfRetain: ScreenshotOverlaySession?
+    /// 逐拍定时器（主 RunLoop default mode）：承载原泵循环的周期任务（插入符闪烁/
+    /// 翻译邮箱 drain/超时扫描/长截图采样轮/工具栏 tooltip），16ms 对齐原泵节奏。
+    /// default mode 下保存对话框模态期间暂停（对齐原泵在 runModal 内停转的行为）。
+    private var tickTimer: Timer?
+    /// 会话启动前的宿主激活策略快照（finish 时恢复；嵌入宿主如 Electron 主进程
+    /// policy = .regular，不恢复会永久隐藏宿主 Dock 图标）。
+    private var savedActivationPolicy: NSApplication.ActivationPolicy?
+
+    /// 会话统一出口：停定时器 → 停 event tap → 销毁长截图会话 → 销毁工具栏浮层 →
+    /// 销毁窗口 → 恢复激活策略 → 回调（恰好一次）→ 复位重入标志并释放自持有
+    ///（会话结束顺序；对齐 Windows 捕获线程末尾清理）。
     /// （internal：ScreenshotOutputMac.swift 的保存流 saveSelectionToFile 复用。）
     func finish(_ payload: String) {
         guard !hasFinished else { return }
         hasFinished = true
+        tickTimer?.invalidate()
+        tickTimer = nil
         NSCursor.arrow.set()
         // 长截图会话随会话收束销毁（abort/save/finish 收束路径已在 LC 侧先行清理，
         // 此处兜底防残余窗口/滚轮 tap 泄漏）
@@ -705,18 +746,24 @@ final class ScreenshotOverlaySession {
         toolbar.destroy()
         ScreenshotMosaicCursors.reset()   // 圆环光标随会话生命周期释放
         mosaicBaseCache = nil             // 马赛克 base 随会话释放
+        cancelTranslateJob()             // 翻译任务取消（对齐 TeardownTranslateJobs）
         for window in windows {
             window.orderOut(nil)
             window.contentView = nil
         }
         windows.removeAll()
         views.removeAll()
+        if let saved = savedActivationPolicy {
+            savedActivationPolicy = nil
+            NSApplication.shared.setActivationPolicy(saved)   // 恢复宿主激活策略，幂等
+        }
         payload.withCString { cStr in
             callback(cStr)
         }
         screenshotStateLock.lock()
         screenshotSessionActive = false
         screenshotStateLock.unlock()
+        selfRetain = nil
     }
 
     /// 构造失败回调 JSON（macOS 契约新增可选 error 字段，不改既有字段）。
@@ -1480,8 +1527,10 @@ final class ScreenshotOverlaySession {
             invalidateAll()
             toolbar.refresh()
         case .translate:
-            // 翻译：占位图标，无点击处理（与 Windows TB_Translate 行为一致）
-            break
+            // 翻译：OCR 识别选区文字 → 翻译 → 译文覆盖原文字区域（对齐 Windows
+            // TB_Translate 分支；Shown 态再点 = 切换退出，见 ScreenshotTranslateMac.swift）
+            beginTranslateOverlay()
+            return
         case .longCapture:
             // 长截图：进入长截图滚动捕获（隐藏覆盖层 → 灰蒙版 + 小地图 + 长截图
             // 工具栏接管；会话不销毁，完成/保存成功按成功收束、取消/ESC/abort 按失败收束）。
@@ -1597,7 +1646,7 @@ final class ScreenshotOverlaySession {
         state = .confirmed
         invalidateAll()
         // 工具栏：确认态默认回到纯选择模式（对齐 EnterConfirmed 的 activeTool 缺省 TB_Drag），
-        // 工具栏/子菜单浮层随状态机在 pumpTick 同步显隐与位置（首拍即出现）。
+        // 工具栏/子菜单浮层随状态机在会话定时器 tick 同步显隐与位置（首拍即出现）。
         if activeTool == nil { activeTool = .drag }
         toolbar.syncVisibility(true)
         toolbar.syncPlacement()

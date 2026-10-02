@@ -3,8 +3,11 @@
 // 本文件定义长截图会话级全局状态（g_longCtx / 控制窗口句柄 / 参数默认值），
 // 手动滚动捕获主循环 RunLongCapture，以及会话初始化 BeginLongCapture、
 // JS 线程中止 LongCaptureAbort 与清理入口 DestroyLongCaptureContext。
+// 截图模块拆分文件统一经由 internal.h 引入公共依赖；logger.h 单独引入
 #include "internal.h"
 #include "long_capture_internal.h"
+
+#include "../../logger.h"
 
 // g_longControlWindow 为侧边小地图面板（完成/取消按钮也在此）。
 
@@ -44,6 +47,9 @@ void LongCaptureEmitFailure() {
 void BeginLongCapture(CaptureContext* ctx, HWND overlayHwnd) {
     LongCaptureContext* lc = new LongCaptureContext();
     lc->interval = g_lcInterval;
+    ZLOG_INFO("longcapture", "begin (interval=%dms, selection=(%ld,%ld)-(%ld,%ld))",
+              g_lcInterval, (long)ctx->selection.left, (long)ctx->selection.top,
+              (long)ctx->selection.right, (long)ctx->selection.bottom);
     lc->vx = ctx->virtualX; lc->vy = ctx->virtualY;
     lc->vw = ctx->virtualW; lc->vh = ctx->virtualH;
     lc->dpiScale = ctx->dpiScale;
@@ -297,7 +303,11 @@ bool RunLongCapture(LongCaptureContext* c) {
 
     LongCaptureUnregisterWheelObserver();
 
-    if (c->abortFlag.load()) { LongCaptureEmitFailure(); return false; }
+    if (c->abortFlag.load()) {
+        ZLOG_INFO("longcapture", "aborted by user after %d frames", c->frameCount.load());
+        LongCaptureEmitFailure();
+        return false;
+    }
 
     // 拼接 + 输出（复用截图输出管线）：
     //   · 完成并复制：拼接结果缩放回逻辑尺寸 → base64 + 剪贴板；
@@ -314,6 +324,10 @@ bool RunLongCapture(LongCaptureContext* c) {
         }
     }
     c->success = ok;
+
+    ZLOG_INFO("longcapture", "finished: ok=%d frames=%d out=%dx%d %s", ok ? 1 : 0,
+              c->frameCount.load(), c->outWidth, c->outHeight,
+              savedToFile ? "(saved to file)" : "(clipboard)");
 
     // 回调（统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放防泄漏；
     // 原代码先 new 后判 TSFN 且不查 nonblocking 返回值，TSFN 为空或队列满时 result 泄漏

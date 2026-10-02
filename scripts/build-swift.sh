@@ -21,14 +21,18 @@ echo "📱 当前架构: $ARCH"
 # 长截图算法层 C++ 对象（lc_match_core + lc_stitch_state
 # 纯算法层与 lc_bridge C ABI shim，clang++ 编出 .o 后随 swiftc -emit-library 链入
 # dylib；Swift 侧经 src/screenshot/macos/LCBridgeMac.swift 的 @_silgen_name 调用。
+# 翻译聚类算法（translate_cluster）与其 C ABI shim 同链路（ScreenshotTranslateMac.swift
+# 经 @_silgen_name 调用）。
 # 注意：本段与 .github/workflows/build.yml「Build Swift library」步骤内联实现逐字一致
 # （两处编译参数必须同步修改）。Apple clang 的 C++ 不支持 -Osize，取等价的 -Oz。
-# -I：算法层头文件目录（lc_bridge_mac.cpp 位于 macos/，需检索 ../algo 的
-# long_capture_internal.h / lc_platform.h）。
+# -I：算法层头文件目录（lc_bridge_mac.cpp / translate_bridge_mac.cpp 位于 macos/，
+# 需检索 ../algo 的 long_capture_internal.h / translate_cluster_internal.h / lc_platform.h）。
 LC_CXX_SOURCES=(
   src/screenshot/algo/lc_match_core.cpp
   src/screenshot/algo/lc_stitch_state.cpp
   src/screenshot/macos/lc_bridge_mac.cpp
+  src/screenshot/algo/translate_cluster.cpp
+  src/screenshot/macos/translate_bridge_mac.cpp
 )
 LC_CXX_FLAGS=(-c -std=c++17 -Oz -DNDEBUG -I src/screenshot/algo)
 
@@ -63,6 +67,7 @@ SWIFT_SOURCES=(
   src/screenshot/macos/ScreenshotTextMac.swift
   src/screenshot/macos/ScreenshotMosaicMac.swift
   src/screenshot/macos/ScreenshotOutputMac.swift
+  src/screenshot/macos/ScreenshotTranslateMac.swift
   src/screenshot/macos/ScreenshotLongCaptureMac.swift
   src/screenshot/macos/ScreenshotLCPanelMac.swift
   src/screenshot/macos/ScreenshotLCToolbarMac.swift

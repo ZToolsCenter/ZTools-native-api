@@ -248,7 +248,7 @@ LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         if ((ctx->state == CS_Confirmed) && PointInRect(ctx->mouseX, ctx->mouseY, ctx->selection)) {
             ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
                 ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius,
-                ctx->mosaicSizeIdx);
+                ctx->mosaicSizeIdx, ctx->translateBlocks);
             // 统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放 result 防泄漏。
             EmitScreenshotResult(result->success, result->x, result->y, result->x2, result->y2,
                                  result->width, result->height, result->base64);
@@ -256,6 +256,13 @@ LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             ctx->state = CS_Done;
             DestroyWindow(hwnd);
         }
+        return 0;
+    }
+
+    case WM_SCREENSHOT_TRANSLATE_RESULT: {
+        // 翻译工作线程完成回投：取走结果槽负载并落到 ctx（成功 → 译文覆盖展示；
+        // 失败 → 错误气泡，数秒自动消失）。见 translate_windows.cpp。
+        HandleTranslateJobResult(ctx, hwnd);
         return 0;
     }
 

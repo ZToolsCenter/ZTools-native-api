@@ -415,6 +415,9 @@ LRESULT OnPaint(HWND hwnd, CaptureContext* ctx) {
                 }
             }
         }
+        // 翻译覆盖（工具栏「翻译」按钮）：译文块盖住原文字区域 + 进行中/错误状态气泡。
+        // 画在标注之上、选区轮廓/工具栏/tooltip 之下，确认态/绘制/文字编辑各态均保持展示。
+        DrawTranslateOverlay(backDC, ctx);
         // 确认态边框和调整手柄最后绘制，避免马赛克及其他标注覆盖交互轮廓。
         DrawConfirmedBorder(backDC, curSelRect, ctx->gdi, ctx->selectionCornerRadius);
         // 正在拖拽倒角手柄（CS_Resizing + 角手柄）：此时隐藏选区 resize 手柄，仅留被拖的倒角手柄。

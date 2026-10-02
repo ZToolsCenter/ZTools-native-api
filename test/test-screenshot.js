@@ -7,6 +7,10 @@ console.log('2. 鼠标会变成十字光标');
 console.log('3. 拖拽鼠标选择要截图的区域');
 console.log('4. 释放鼠标后截图会自动保存到剪贴板');
 console.log('5. 按 ESC 键可以取消截图');
+if (process.platform === 'darwin') {
+  console.log('\n⚠️  macOS：截图会话依赖宿主进程驱动 macOS 主事件循环，请用 Electron 宿主运行：');
+  console.log('   npx electron test/electron-host.cjs test/test-screenshot.js');
+}
 console.log('\n准备启动...\n');
 
 setTimeout(() => {

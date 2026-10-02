@@ -1170,6 +1170,9 @@ private var colorPickerCallback: ColorPickerCallback? = nil
 private var colorPickerWindow: NSWindow? = nil
 private var colorPickerView: ColorPickerGridView? = nil
 private var isColorPickerActive = false
+/// 取色启动前宿主进程的激活策略（accessory 运行期间的保存值，stop 时恢复；
+/// 嵌入宿主如 Electron 为 .regular，不恢复会永久隐藏宿主 Dock 图标）
+private var colorPickerSavedPolicy: NSApplication.ActivationPolicy? = nil
 private var lastColorPickerUpdateTime: TimeInterval = 0
 private let colorPickerUpdateInterval: TimeInterval = 1.0 / 30.0 // 30 FPS
 private var colorPickerEventTap: CFMachPort? = nil
@@ -1532,9 +1535,15 @@ public func startColorPicker(_ callback: ColorPickerCallback?) {
     colorPickerCallback = callback
     isColorPickerActive = true
 
-    // 确保 NSApplication 完整初始化（N-API 调用在主线程上）
+    // 确保 NSApplication 完整初始化（N-API 调用在主线程上）。
+    // accessory 策略记录宿主原值，stopColorPicker 收束时恢复——嵌入宿主
+    //（如 Electron 主进程，policy = .regular）不恢复会永久隐藏宿主 Dock 图标。
     let app = NSApplication.shared
-    app.setActivationPolicy(.accessory)
+    let currentPolicy = app.activationPolicy()
+    if currentPolicy != .accessory {
+        colorPickerSavedPolicy = currentPolicy
+        app.setActivationPolicy(.accessory)
+    }
     app.finishLaunching()
 
     // 在主线程创建窗口（AppKit 要求 NSWindow 必须在主线程创建）
@@ -1650,6 +1659,11 @@ public func stopColorPicker() {
     colorPickerWindow = nil
     colorPickerView = nil
     colorPickerCallback = nil
+    // 恢复宿主激活策略（取色以 accessory 运行；见 startColorPicker 的保存点）
+    if let saved = colorPickerSavedPolicy {
+        colorPickerSavedPolicy = nil
+        NSApplication.shared.setActivationPolicy(saved)
+    }
 
     print("Color picker stopped")
 }

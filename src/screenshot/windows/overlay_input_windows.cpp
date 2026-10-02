@@ -213,11 +213,11 @@ LRESULT OnLButtonDown(HWND hwnd, CaptureContext* ctx) {
                     }
                 }
             }
-            // 确定：提取选区并完成截图
+            // 确定：提取选区并完成截图（含已展示的翻译覆盖块）
             if (b == TB_Confirm) {
                 ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
                     ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius,
-                    ctx->mosaicSizeIdx);
+                    ctx->mosaicSizeIdx, ctx->translateBlocks);
                 // 统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放 result 防泄漏。
                 EmitScreenshotResult(result->success, result->x, result->y, result->x2, result->y2,
                                      result->width, result->height, result->base64);
@@ -339,7 +339,8 @@ LRESULT OnLButtonDown(HWND hwnd, CaptureContext* ctx) {
                 if (!filePath.empty()) {
                     bool saved = SaveRegionToPngFile(ctx->memDC, ctx->selection,
                         ctx->virtualX, ctx->virtualY, ctx->dpiScale,
-                        ctx->annotations, filePath, ctx->selectionCornerRadius, ctx->mosaicSizeIdx);
+                        ctx->annotations, filePath, ctx->selectionCornerRadius, ctx->mosaicSizeIdx,
+                        ctx->translateBlocks);
                     // 无论保存成功与否，均关闭截图窗口（用户已选择保存路径）
                     // 通过回调告知 JS 结果（成功/失败），不回传路径。
                     // 统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放防泄漏
@@ -356,6 +357,12 @@ LRESULT OnLButtonDown(HWND hwnd, CaptureContext* ctx) {
                     DestroyWindow(hwnd);
                 }
                 // 用户取消保存对话框：不关闭，留在编辑态
+                return 0;
+            }
+            // 翻译：OCR 识别选区文字 → 翻译 → 译文覆盖原文字区域（流程见 translate_windows.cpp）。
+            // 进行中重复点击忽略；译文展示中再次点击退出翻译状态（清除覆盖，不重跑）。
+            if (b == TB_Translate) {
+                BeginTranslateOverlay(ctx, hwnd);
                 return 0;
             }
             // 长截图：复用当前选区进入手动滚动捕获（隐藏覆盖层 → 预览面板 → 滚轮增量拼接）
@@ -1164,7 +1171,7 @@ LRESULT OnLButtonUp(HWND hwnd, CaptureContext* ctx) {
         if (ctx->autoConfirm) {
             ScreenshotResult* result = ExtractRegionResult(ctx->memDC, finalRect,
                 ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius,
-                ctx->mosaicSizeIdx);
+                ctx->mosaicSizeIdx, ctx->translateBlocks);
             // 统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放 result 防泄漏。
             EmitScreenshotResult(result->success, result->x, result->y, result->x2, result->y2,
                                  result->width, result->height, result->base64);
@@ -1321,7 +1328,7 @@ LRESULT OnKeyDown(HWND hwnd, WPARAM wParam, CaptureContext* ctx) {
         if (ctx->state == CS_Confirmed) {
             ScreenshotResult* result = ExtractRegionResult(ctx->memDC, ctx->selection,
                 ctx->virtualX, ctx->virtualY, ctx->dpiScale, ctx->annotations, ctx->selectionCornerRadius,
-                ctx->mosaicSizeIdx);
+                ctx->mosaicSizeIdx, ctx->translateBlocks);
             // 统一走 EmitScreenshotResult：TSFN 空 / nonblocking 失败均自动释放 result 防泄漏。
             EmitScreenshotResult(result->success, result->x, result->y, result->x2, result->y2,
                                  result->width, result->height, result->base64);

@@ -554,7 +554,7 @@ extension ScreenshotOverlaySession {
 
     // MARK: 闪烁 / 局部失效 / 渲染
 
-    /// 泵循环逐拍任务：编辑态插入符 500ms 闪烁（对齐 session_windows.cpp 空闲循环分支），
+    /// 会话定时器逐拍任务：编辑态插入符 500ms 闪烁（对齐 session_windows.cpp 空闲循环分支），
     /// 仅失效光标附近区域。
     /// - Parameter now: 单调时钟（ProcessInfo.systemUptime）
     func tickTextCaret(now: TimeInterval) {

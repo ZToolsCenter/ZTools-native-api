@@ -1,6 +1,8 @@
 // 截图模块：会话线程、TSFN 桥与 NAPI 入口（公共 API 见 screenshot_windows.h）
 #include "internal.h"
 
+#include "../../logger.h"
+
 // 全局变量 - 区域截图
 
 HWND g_screenshotOverlayWindow = NULL;
@@ -234,6 +236,12 @@ static void CallScreenshotJs(napi_env env, napi_value js_callback, void* context
 // success=false 时坐标/尺寸/base64 全置 0/空（与取消路径语义一致）。
 void EmitScreenshotResult(bool success, int x, int y, int x2, int y2,
                           int width, int height, const std::string& base64) {
+    if (success) {
+        ZLOG_INFO("screenshot", "session result: success rect=(%d,%d)-(%d,%d) size=%dx%d pngBytes=%zu",
+                  x, y, x2, y2, width, height, base64.size());
+    } else {
+        ZLOG_INFO("screenshot", "session result: cancelled/failed");
+    }
     ScreenshotResult* result = new ScreenshotResult();
     result->success = success;
     result->x = x; result->y = y;
@@ -253,6 +261,7 @@ void EmitScreenshotResult(bool success, int x, int y, int x2, int y2,
 // 会话初始化失败快速回传：构造 {success:false} 结果并经 EmitScreenshotResult 回传 JS，
 // 唤醒 await 方避免永久挂起（早退路径统一收口点）。
 void FailFast() {
+    ZLOG_ERROR("screenshot", "capture session init failed (fail-fast)");
     EmitScreenshotResult(false);
 }
 
@@ -289,16 +298,20 @@ void ScreenshotCaptureThread() {
     HBITMAP screenBitmap = NULL;
     int vx, vy, vw, vh;
     if (!AcquireScreenshotBase(memDC, screenBitmap, vx, vy, vw, vh, dpiScale)) {
+        ZLOG_ERROR("screenshot", "AcquireScreenshotBase failed (virtual screen %dx%d)", vw, vh);
         FailFast();
         ReleaseScreenshotTsfn();
         g_isCapturing = false;
         return;
     }
+    ZLOG_INFO("screenshot", "session thread started (virtual screen %dx%d at %d,%d, uiScale=%.2f)",
+              vw, vh, vx, vy, uiScale);
 
     // 创建双缓冲
     HDC backDC = NULL;
     HBITMAP backBmp = NULL;
     if (!CreateBackBuffer(backDC, backBmp, vw, vh)) {
+        ZLOG_ERROR("screenshot", "CreateBackBuffer failed (%dx%d)", vw, vh);
         DeleteDC(memDC);
         DeleteObject(screenBitmap);
         FailFast();
@@ -363,6 +376,7 @@ void ScreenshotCaptureThread() {
     // GDI+ 会话级初始化（必须在 InitMosaicBrushCursors 及任何 GDI+ 调用之前）：
     // 会话内单次 Startup，避免每帧反复初始化导致拖拽卡顿。
     if (!InitGdipResources(&ctx)) {
+        ZLOG_ERROR("screenshot", "InitGdipResources failed");
         gdi.Cleanup();
         ctx.iconCache.Cleanup();
         DeleteDC(backDC); DeleteObject(backBmp);
@@ -442,6 +456,7 @@ void ScreenshotCaptureThread() {
     wc.lpszClassName = L"ZToolsScreenshotOverlay";
 
     if (!RegisterClassExW(&wc)) {
+        ZLOG_ERROR("screenshot", "RegisterClassExW(overlay) failed");
         gdi.Cleanup();
         ctx.iconCache.Cleanup();
         DeleteDC(backDC); DeleteObject(backBmp);
@@ -464,6 +479,7 @@ void ScreenshotCaptureThread() {
     );
 
     if (g_screenshotOverlayWindow == NULL) {
+        ZLOG_ERROR("screenshot", "create overlay window failed");
         UnregisterClassW(L"ZToolsScreenshotOverlay", GetModuleHandle(NULL));
         gdi.Cleanup();
         ctx.iconCache.Cleanup();
@@ -478,6 +494,7 @@ void ScreenshotCaptureThread() {
 
     ShowWindow(g_screenshotOverlayWindow, SW_SHOW);
     SetForegroundWindow(g_screenshotOverlayWindow);
+    ZLOG_INFO("screenshot", "overlay shown (autoConfirm=%d)", ctx.autoConfirm ? 1 : 0);
 
     // 消息循环
     MSG msg;
@@ -491,6 +508,9 @@ void ScreenshotCaptureThread() {
         } else {
             // 工具栏 title 式 tooltip 停顿轮询（悬停 ~0.5s 出气泡；内部按状态门控）
             TickToolbarTooltip(&ctx, g_screenshotOverlayWindow);
+
+            // 翻译状态气泡节拍（错误气泡超时收起；进度气泡由结果消息收起）
+            TickTranslateStatus(&ctx, g_screenshotOverlayWindow);
 
             // 文字编辑态：光标闪烁（每 500ms 切换）
             if (ctx.state == CS_TextEditing) {
@@ -523,7 +543,12 @@ void ScreenshotCaptureThread() {
     }
 
     // 清理
+    ZLOG_INFO("screenshot", "session message loop exited (state=%s)",
+              ctx.state == CS_Done ? "done" : (ctx.state == CS_Cancelled ? "cancelled" : "quit"));
     g_captureCtx = nullptr;
+    // 翻译结果槽清零：仍在槽中未被取走的翻译结果在此释放，防止跨会话泄漏
+    //（迟到的发布者随后 PostMessage 失败会自行回收，协议见 translate_windows.cpp）
+    TeardownTranslateJobs();
     gdi.Cleanup();
     ctx.iconCache.Cleanup();
     FreeMosaicBase(&ctx);
@@ -565,6 +590,7 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
     if (g_isCapturing) {
+        ZLOG_WARN("screenshot", "start requested while a session is already in progress");
         Napi::Error::New(env, "Screenshot already in progress").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -594,6 +620,7 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
             );
 
             if (status != napi_ok) {
+                ZLOG_ERROR("screenshot", "create threadsafe function failed");
                 Napi::Error::New(env, "Failed to create threadsafe function").ThrowAsJavaScriptException();
                 return env.Undefined();
             }
@@ -625,6 +652,8 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
     g_lcInterval = lcInterval;
 
     g_isCapturing = true;
+    ZLOG_INFO("screenshot", "capture session requested (autoConfirm=%d, longCaptureInterval=%dms)",
+              autoConfirm ? 1 : 0, lcInterval);
 
     g_screenshotThread = std::thread(ScreenshotCaptureThread);
     g_screenshotThread.detach();
@@ -636,6 +665,7 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo& info) {
 // 仅设置中止标记：由滚动循环在下一帧检查点退出，并按失败结果回调 JS。
 
 Napi::Value AbortLongCapture(const Napi::CallbackInfo& info) {
+    ZLOG_INFO("longcapture", "abort requested from JS");
     LongCaptureAbort();
     return info.Env().Undefined();
 }

@@ -522,6 +522,11 @@ extension ScreenshotOverlaySession {
         //（对齐 OnPaint CS_TextEditing 分支）
         paintTextEditingLayer(ctx: ctx, view: view)
 
+        // 译文覆盖层：译文面板（白底盖原文字）+ 状态气泡（进度/错误）。画在标注/
+        // 文字编辑之上、选区边框/手柄之下（对齐 OnPaint 的 DrawTranslateOverlay 层序，
+        // 确认/绘制/文字编辑各态均保持展示；见 ScreenshotTranslateMac.swift）
+        paintTranslateOverlay(ctx: ctx, view: view)
+
         // 确认边框（对齐 DrawConfirmedBorder：radius≥1 用圆角路径，否则 1px 直角框）
         paintConfirmedBorder(ctx: ctx, view: view)
 

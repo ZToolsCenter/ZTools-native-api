@@ -19,7 +19,7 @@ import CoreGraphics
 //
 // 刷新时机（LongCapturePanelUpdate / InvalidateRect 对齐）：拼接成功（contentChanged =
 // 尺寸重算 + 重绘）、tentative 跟踪变化（trackingChanged = 仅重绘）、裁剪应用
-//（contentChanged）。全部由泵循环在主线程驱动（CATransaction 隐式提交）。
+//（contentChanged）。全部由会话定时器在主线程驱动（CATransaction 隐式提交）。
 
 // MARK: - 面板视图
 

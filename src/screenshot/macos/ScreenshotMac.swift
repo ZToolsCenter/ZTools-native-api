@@ -9,10 +9,17 @@ import CoreGraphics
 // - 屏幕录制权限预检/请求
 // - prime() 预抓帧（2 秒 TTL、互斥锁保护、锁内所有权转移，对齐 Windows capture_windows.cpp）
 // - start() 闭环：权限 →（预抓帧或现场重抓）整屏底图 → 多屏覆盖层选区会话
-//   （ScreenshotOverlayMac.swift：手动泵主循环 + 选区状态机）→ 确认时按选区裁剪底图
-//   → PNG 编码 → NSPasteboard 写入 → 经 C++ screenshotTsfn 回调契约结果
+//   （ScreenshotOverlayMac.swift：非阻塞生命周期对象，AppKit 事件与 16ms 定时器
+//   由宿主主事件循环驱动）→ 确认时按选区裁剪底图 → PNG 编码 → NSPasteboard 写入
+//   → 经 C++ screenshotTsfn 回调契约结果
 // - abortLongCapture() 中止标记：锁内置标志 set/consume/reset（长截图采样循环
 //   在检查点消费并按失败结果收束会话，对齐 Windows LongCaptureAbort 语义）
+//
+// 线程模型：start() 为非阻塞启动——前置检查（权限/底图抓取）在 N-API 调用栈内
+// 同步完成（有界短耗时），会话交互期不占用 JS 主线程：AppKit 事件（鼠标/键盘/
+// 绘制）与周期任务（定时器）全部由宿主进程自己的主事件循环驱动（Electron 主进程
+// 的 Chromium 消息泵天然运转 NSApp 与 libuv；纯 Node 宿主不驱动 AppKit 主循环，
+// 无法使用 macOS 截图会话，见 README「平台差异」）。
 //
 // 坐标系约定：会话内统一 CG 全局坐标（左上原点、逻辑点），
 // 回调的 x/y/x2/y2/width/height 均为逻辑尺寸；base64 图像为物理像素（Retina 2x，
@@ -280,16 +287,17 @@ struct ScreenshotSessionOptions {
 
 // MARK: - 会话入口（覆盖层与选区）
 
-/// 启动覆盖层选区会话的统一入口：权限预检 → NSApplication 初始化 → 底图获取（预抓帧优先）
-/// → 窗口吸附枚举 → 多屏覆盖层 + 手动泵主循环（ScreenshotOverlayMac.swift）。
-/// 任一前置失败都恰好回调一次 {success:false, error:...}（FailFast 语义）；
-/// 会话正常结束（确认/取消）由覆盖层会话负责回调并复位重入标志。
+/// 启动覆盖层选区会话的非阻塞入口：权限预检 → NSApplication 初始化 → 底图获取（预抓帧优先）
+/// → 窗口吸附枚举 → 创建多屏覆盖层会话（ScreenshotOverlayMac.swift：start 后自持有，
+/// 由宿主主事件循环驱动）→ 立即返回。任一前置失败都恰好回调一次 {success:false, error:...}
+/// （FailFast 语义）并复位重入标志；会话正常结束（确认/取消）由覆盖层会话负责回调并复位。
 /// - Parameters:
 ///   - options: 已解析的会话选项（autoConfirm / longCapture 参数均生效）
 ///   - callback: C++ 层注册的结果回调（JSON 字符串参数）
-func runOverlayCaptureSession(options: ScreenshotSessionOptions, callback: ScreenshotResultCallback) {
-    // 单一出口：结果 JSON 回调一次并复位会话标志（重入保护随之解除）
-    func finish(_ payload: String) {
+func startOverlayCaptureSession(options: ScreenshotSessionOptions, callback: ScreenshotResultCallback) {
+    // 单一出口（仅覆盖前置失败路径）：结果 JSON 回调一次并复位会话标志；
+    // 会话创建成功后由 ScreenshotOverlaySession.finish 承担同一职责。
+    func finishEarly(_ payload: String) {
         payload.withCString { cStr in
             callback(cStr)
         }
@@ -302,10 +310,10 @@ func runOverlayCaptureSession(options: ScreenshotSessionOptions, callback: Scree
         return "{\"success\":false,\"error\":\"\(error)\"}"
     }
 
-    // 0) AppKit 主线程硬要求：NSWindow 创建与手动泵事件循环只能在主线程执行
+    // 0) AppKit 主线程硬要求：NSWindow 创建与事件处理只能在主线程执行
     //    （线程模型：start() 的 N-API 调用线程即 AppKit 主线程）。
     guard Thread.isMainThread else {
-        finish(failurePayload("screenshot session must run on the main thread"))
+        finishEarly(failurePayload("screenshot session must run on the main thread"))
         return
     }
 
@@ -315,30 +323,30 @@ func runOverlayCaptureSession(options: ScreenshotSessionOptions, callback: Scree
     if !CGPreflightScreenCaptureAccess() {
         _ = CGRequestScreenCaptureAccess()
         if !CGPreflightScreenCaptureAccess() {
-            finish(failurePayload("screen recording permission required"))
+            finishEarly(failurePayload("screen recording permission required"))
             return
         }
     }
 
-    // 2) NSApplication 初始化（取色器模式：accessory policy；Node 主线程不跑 NSRunLoop，
-    //    覆盖层窗口由会话内的手动泵循环驱动）
+    // 2) NSApplication 基础初始化（激活策略切换由会话 start 负责、finish 恢复；
+    //    纯 Node 进程默认 prohibited，不切换窗口无法正常服务）
     let app = NSApplication.shared
-    app.setActivationPolicy(.accessory)
     app.finishLaunching()
 
     // 3) 底图获取：优先消费 prime() 预抓帧（未过期），过期/未命中时现场重抓
     //    （对齐 Windows AcquireScreenshotBase：预抓帧命中即用，否则 CaptureVirtualScreen 兜底）
     guard let baseFrame = primedFrameStore.consume() ?? screenshotBackend.captureVirtualScreenBase() else {
-        finish(failurePayload("failed to capture screen"))
+        finishEarly(failurePayload("failed to capture screen"))
         return
     }
 
     guard let virtualBounds = ScreenshotGeometry.virtualScreenBounds() else {
-        finish(failurePayload("failed to query screen layout"))
+        finishEarly(failurePayload("failed to query screen layout"))
         return
     }
 
-    // 4) 覆盖层选区会话（会话内手动泵直至确认/取消；结束前回调恰好一次）
+    // 4) 覆盖层选区会话：start 后立即返回——会话由宿主主事件循环驱动（AppKit 事件
+    //    回调 + 16ms 定时器 tick），结束前回调恰好一次并自清理（含激活策略恢复）
     let session = ScreenshotOverlaySession(
         options: options,
         callback: callback,
@@ -349,7 +357,6 @@ func runOverlayCaptureSession(options: ScreenshotSessionOptions, callback: Scree
         // 会话初始化失败：start 内部已 FailFast 回调并复位标志
         return
     }
-    session.runEventPump()
 }
 
 // MARK: - C 导出（binding_mac.cpp 经 dlsym 调用）
@@ -367,8 +374,9 @@ public func primeScreenshotFrame() -> Int32 {
 }
 
 /// 启动区域截图会话（覆盖层与选区；对齐 Windows startRegionCaptureWithPrimedFrame 导出）。
-/// 与 Windows 会话线程模型的差异：macOS 的 N-API 调用线程即 AppKit 主线程，覆盖层
-/// 会话在本调用内以手动泵循环运行直至确认/取消，故本函数阻塞至会话结束。
+/// 非阻塞：前置检查（权限/底图）同步完成后创建会话并立即返回，会话交互期由宿主
+/// 进程的主事件循环驱动（AppKit 事件回调 + 16ms 定时器），结果经回调异步送达——
+/// N-API 调用栈不再长期占用 JS 主线程，Node/libuv/V8 始终由宿主自身事件循环驱动。
 /// - Parameters:
 ///   - optionsJson: C++ 层解析并钳制后的 options JSON（autoConfirm / longCapture 参数）
 ///   - callback: 结果回调；会话出口恰好回调一次（成功/失败均必达——FailFast 语义）
@@ -390,12 +398,12 @@ public func startRegionCaptureWithPrimedFrame(
     screenshotStateLock.unlock()
 
     let options = ScreenshotSessionOptions.parse(from: optionsJson.map { String(cString: $0) })
-    runOverlayCaptureSession(options: options, callback: callback)
+    startOverlayCaptureSession(options: options, callback: callback)
     return 1
 }
 
 /// 请求中止进行中的长截图滚动捕获（对齐 Windows LongCaptureAbort：锁内置 abortFlag，
-/// 与清理互斥防 use-after-free；长截图采样循环在下一检查点（泵循环 tick）消费本标志，
+/// 与清理互斥防 use-after-free；长截图采样循环在下一检查点（会话定时器 tick）消费本标志，
 /// 销毁长截图浮层并按失败结果收束整个会话回调 JS {success:false}）。
 /// 无长截图会话时置位后即被下次会话创建的 reset 清除，等价 Windows 的空指针分支。
 @_cdecl("abortLongCapture")

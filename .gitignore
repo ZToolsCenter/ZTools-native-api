@@ -2,6 +2,7 @@ node_modules/
 build/
 *.dylib
 *.log
+*.obj
 .DS_Store
 
 # 构建产物：由 scripts/gen-icons.js 从 src/assets/*.svg 生成

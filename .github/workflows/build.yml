@@ -38,13 +38,15 @@ jobs:
         run: |
           mkdir -p lib
 
-          # 长截图算法层 C++ 对象（与 scripts/build-swift.sh
+          # 长截图 + 翻译聚类算法层 C++ 对象（与 scripts/build-swift.sh
           # 逐字一致，两处编译参数必须同步修改。Apple clang 的 C++ 不支持 -Osize，
           # 取等价的 -Oz）
           LC_CXX_SOURCES=(
             src/screenshot/algo/lc_match_core.cpp
             src/screenshot/algo/lc_stitch_state.cpp
             src/screenshot/macos/lc_bridge_mac.cpp
+            src/screenshot/algo/translate_cluster.cpp
+            src/screenshot/macos/translate_bridge_mac.cpp
           )
           LC_CXX_FLAGS=(-c -std=c++17 -Oz -DNDEBUG -I src/screenshot/algo)
 
@@ -77,6 +79,7 @@ jobs:
             src/screenshot/macos/ScreenshotTextMac.swift
             src/screenshot/macos/ScreenshotMosaicMac.swift
             src/screenshot/macos/ScreenshotOutputMac.swift
+            src/screenshot/macos/ScreenshotTranslateMac.swift
             src/screenshot/macos/ScreenshotLongCaptureMac.swift
             src/screenshot/macos/ScreenshotLCPanelMac.swift
             src/screenshot/macos/ScreenshotLCToolbarMac.swift

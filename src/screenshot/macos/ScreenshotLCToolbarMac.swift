@@ -22,7 +22,7 @@ import CoreGraphics
 // - title 式 tooltip：悬停 500ms（LC_TIP_DELAY_MS）深色圆角气泡，锚定目标上方/下方
 // - 按钮按下-抬起同目标校验（防「进入长截图瞬间残留的鼠标抬起」误触自动滚动等按钮）
 //
-// 事件模型：NOACTIVATE 浮层无焦点，hover/菜单/tooltip 全部由泵循环 100ms UI 节拍轮询
+// 事件模型：NOACTIVATE 浮层无焦点，hover/菜单/tooltip 全部由会话 tick 100ms UI 节拍轮询
 // （NSEvent.mouseLocation / pressedMouseButtons，对齐 Windows LongCaptureToolbarUiTick 的
 // GetAsyncKeyState + GetCursorPos 轮询）；点击由浮层视图 mouseDown/Up 承接。
 
@@ -208,7 +208,7 @@ final class ScreenshotLCTipView: NSView {
 
 /// 长截图工具栏控制器：底条/popover/tooltip 三浮层 + 全部 UI 状态，按钮动作回话给
 /// ScreenshotLongCaptureSession（finish/save/abort 标志 + 自动滚动/方向/裁剪）。
-/// 100ms UI 节拍由长截图会话泵循环驱动（uiTick）。
+/// 100ms UI 节拍由长截图会话 tick 驱动（uiTick）。
 final class ScreenshotLCToolbarController {
     private weak var session: ScreenshotLongCaptureSession?
 
@@ -487,7 +487,7 @@ final class ScreenshotLCToolbarController {
 
     // MARK: UI 维护节拍（100ms；LongCaptureToolbarUiTick 逐段移植）
 
-    /// UI 维护节拍（由长截图会话泵循环每 100ms 调用）：
+    /// UI 维护节拍（由长截图会话 tick 每 100ms 调用）：
     /// 1) popover 展开时检测「窗口外左键按下」并关闭（底条∪popover 区域外的透底不算）；
     /// 2) 悬停意图：方向/裁剪锚点按钮停留 300ms 后展开（另一菜单已展开时直接切换；扫过
     ///    不误触）；离开「锚点∪popover」超过 250ms 后收起（宽限期足够跨过透底间隙）；
