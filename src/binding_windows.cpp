@@ -4828,16 +4828,21 @@ LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
             HPEN pen = CreatePen(PS_SOLID, 1, RGB(191, 191, 191));
             HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+            // 最后一条线钳到 totalGridWidth-1：客户区只有 144px（列 0~143），
+            // 画在 x=144 的线整条落在客户区外被裁掉，右/下边框会消失
             for (int i = 0; i <= gridSize; i++) {
-                MoveToEx(memDC, i * cellSize, 0, NULL);
-                LineTo(memDC, i * cellSize, totalGridWidth);
-                MoveToEx(memDC, 0, i * cellSize, NULL);
-                LineTo(memDC, totalGridWidth, i * cellSize);
+                const int c = std::min(i * cellSize, totalGridWidth - 1);
+                MoveToEx(memDC, c, 0, NULL);
+                LineTo(memDC, c, totalGridWidth - 1);
+                MoveToEx(memDC, 0, c, NULL);
+                LineTo(memDC, totalGridWidth - 1, c);
             }
             SelectObject(memDC, oldPen);
             DeleteObject(pen);
 
-            // 绘制中心十字准星
+            // 绘制中心十字准星：黑框 2px + 白框 1px。黑框用两条 1px 描边叠加——
+            // GDI 宽笔触是居中渲染的，2px 黑框被相邻的 1px 白框盖掉内侧一半后，
+            // 右/下侧只剩一丝（左/上却是完整的 2px），不对称
             RECT centerRect = {
                 4 * cellSize,
                 4 * cellSize,
@@ -4845,10 +4850,11 @@ LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 5 * cellSize
             };
 
-            // 外层黑框
-            HPEN blackPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
+            // 外层黑框（两条 1px 描边 = 2px 厚，完全落在白框外侧）
+            HPEN blackPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
             oldPen = (HPEN)SelectObject(memDC, blackPen);
             SelectObject(memDC, GetStockObject(NULL_BRUSH));
+            Rectangle(memDC, centerRect.left - 2, centerRect.top - 2, centerRect.right + 2, centerRect.bottom + 2);
             Rectangle(memDC, centerRect.left - 1, centerRect.top - 1, centerRect.right + 1, centerRect.bottom + 1);
             SelectObject(memDC, oldPen);
             DeleteObject(blackPen);
