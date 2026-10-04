@@ -1,6 +1,8 @@
 #include <napi.h>
 #include <windows.h>
 #include <windowsx.h>  // For GET_X_LPARAM, GET_Y_LPARAM
+#include <d3d11.h>
+#include <dxgi1_2.h>   // 取色器 DDA（桌面复制接口 IDXGIOutputDuplication 只在这个头）
 #include <psapi.h>
 #include <commctrl.h>      // For image list
 #include <commoncontrols.h> // For IImageList
@@ -104,9 +106,30 @@ static HWND g_colorPickerWindow = NULL;
 static std::atomic<bool> g_isColorPickerActive(false);
 static napi_threadsafe_function g_colorPickerTsfn = nullptr;
 static std::thread g_colorPickerThread;
-static HDC g_colorPickerMemDC = NULL;
+// 取样源：优先 DXGI 桌面复制（DDA）实时采样，逐帧反映真实屏幕（Win8+）。
+// 「每帧 GDI 回读」的路线已实测排除：BitBlt 回读会让光标闪烁（带不带 CAPTUREBLT、
+// 是否排除自身窗口都一样），逐点 GetPixel 则慢到卡顿。
+// DDA 不可用的场景（Win7/RDP/安全桌面，以及我们不支持的旋转屏）自动退回
+// 「启动时一次虚拟桌面快照」：同样修了副屏坐标（SM_XVIRTUALSCREEN 原点），
+// 只是不实时——旧版既有行为，非回归。
+static const int COLOR_PICKER_GRID = 9;
+// 帧预算：AcquireNextFrame 的阻塞上限，兼作 ~30 FPS 的采样节拍（桌面静止时即休眠时长）
+static const UINT COLOR_PICKER_FRAME_BUDGET_MS = 33;
+static HDC g_colorPickerMemDC = NULL;            // 快照回退模式
 static HBITMAP g_colorPickerBitmap = NULL;
-static std::string g_colorPickerResult;
+static POINT g_colorPickerSnapshotOrigin = { 0, 0 };
+static bool g_colorPickerUseSnapshot = false;    // 会话启动时决定，之后不变
+// DDA 采样器状态（仅取色器线程访问）
+static ID3D11Device* g_pickerD3dDevice = NULL;
+static ID3D11DeviceContext* g_pickerD3dCtx = NULL;
+static IDXGIOutputDuplication* g_pickerDup = NULL;
+static ID3D11Texture2D* g_pickerLastFrame = NULL;   // 最近一帧整屏 GPU 副本
+static ID3D11Texture2D* g_pickerStaging = NULL;     // 9x9 CPU 可读
+static HMONITOR g_pickerDdaMonitor = NULL;
+static int g_pickerFrameW = 0;
+static int g_pickerFrameH = 0;
+static int g_pickerDdaOriginX = 0;
+static int g_pickerDdaOriginY = 0;
 static HHOOK g_colorPickerMouseHook = NULL;
 static HHOOK g_colorPickerKeyboardHook = NULL;
 static std::atomic<bool> g_colorPickerCallbackCalled(false);
@@ -4458,27 +4481,201 @@ void CallColorPickerJs(napi_env env, napi_value js_callback, void* context, void
     }
 }
 
-// 获取屏幕上指定位置的像素颜色
-COLORREF GetPixelColorAt(HDC memDC, int x, int y) {
-    return GetPixel(memDC, x, y);
-}
-
-// 捕获鼠标周围 9x9 像素的颜色
-void CapturePixelsAroundCursor(HDC memDC, int mouseX, int mouseY, COLORREF colors[9][9], COLORREF& centerColor) {
+// 捕获鼠标周围 9x9 像素的颜色：从虚拟桌面快照的内存位图里取样（快照回退模式用）。
+// 网格点落在屏幕外时钳到最近的边缘像素（对齐 Windows 放大镜行为）。
+static void CapturePixelsFromSnapshot(int mouseX, int mouseY, COLORREF colors[9][9], COLORREF& centerColor) {
     const int gridSize = 9;
     const int halfGrid = gridSize / 2;
+
+    int screenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int screenTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int screenRight = screenLeft + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int screenBottom = screenTop + GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     for (int row = 0; row < gridSize; row++) {
         for (int col = 0; col < gridSize; col++) {
             int px = mouseX - halfGrid + col;
             int py = mouseY - halfGrid + row;
-            colors[row][col] = GetPixelColorAt(memDC, px, py);
+
+            px = (px < screenLeft) ? screenLeft : ((px > screenRight - 1) ? screenRight - 1 : px);
+            py = (py < screenTop) ? screenTop : ((py > screenBottom - 1) ? screenBottom - 1 : py);
+
+            colors[row][col] = GetPixel(g_colorPickerMemDC,
+                px - g_colorPickerSnapshotOrigin.x, py - g_colorPickerSnapshotOrigin.y);
 
             if (row == halfGrid && col == halfGrid) {
                 centerColor = colors[row][col];
             }
         }
     }
+}
+
+// ---- DDA 实时采样（DXGI 桌面复制，Win8+；不可用的会话退回上面的快照模式）----
+// 每来一帧做一次整屏 GPU 拷贝，再 CopySubresourceRegion 9x9 到 staging 读出。
+// 不碰 GDI 屏幕回读（实测 BitBlt 回读会让光标闪烁，逐点 GetPixel 则慢到卡顿），
+// 且桌面图像天然不含光标。
+// 光标跨显示器 / 桌面切换 / 分辨率变化 → 重建 duplication；锁屏等暂时不可用 → 沿用旧帧。
+static void ReleaseColorPickerDda() {
+    if (g_pickerStaging) { g_pickerStaging->Release(); g_pickerStaging = NULL; }
+    if (g_pickerLastFrame) { g_pickerLastFrame->Release(); g_pickerLastFrame = NULL; }
+    if (g_pickerDup) { g_pickerDup->Release(); g_pickerDup = NULL; }
+    if (g_pickerD3dCtx) { g_pickerD3dCtx->Release(); g_pickerD3dCtx = NULL; }
+    if (g_pickerD3dDevice) { g_pickerD3dDevice->Release(); g_pickerD3dDevice = NULL; }
+    g_pickerDdaMonitor = NULL;
+    g_pickerFrameW = 0;
+    g_pickerFrameH = 0;
+}
+
+static bool InitColorPickerDda(HMONITOR monitor) {
+    ReleaseColorPickerDda();
+    g_pickerDdaMonitor = monitor;
+
+    IDXGIFactory1* factory = NULL;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return false;
+
+    bool found = false;
+    IDXGIAdapter* adapter = NULL;
+    for (UINT a = 0; !found && factory->EnumAdapters(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+        IDXGIOutput* output = NULL;
+        for (UINT o = 0; !found && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; ++o) {
+            DXGI_OUTPUT_DESC desc = {};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == monitor) {
+                // 旋转屏的帧方向与桌面坐标不一致，暂不支持，让调用方走快照回退
+                if (desc.Rotation == DXGI_MODE_ROTATION_IDENTITY ||
+                    desc.Rotation == DXGI_MODE_ROTATION_UNSPECIFIED) {
+                    IDXGIOutput1* output1 = NULL;
+                    if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1))) {
+                        D3D_FEATURE_LEVEL fl = {};
+                        if (SUCCEEDED(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+                                NULL, 0, D3D11_SDK_VERSION,
+                                &g_pickerD3dDevice, &fl, &g_pickerD3dCtx)) &&
+                            SUCCEEDED(output1->DuplicateOutput(g_pickerD3dDevice, &g_pickerDup))) {
+                            g_pickerDdaOriginX = desc.DesktopCoordinates.left;
+                            g_pickerDdaOriginY = desc.DesktopCoordinates.top;
+                            D3D11_TEXTURE2D_DESC sd = {};
+                            sd.Width = COLOR_PICKER_GRID;
+                            sd.Height = COLOR_PICKER_GRID;
+                            sd.MipLevels = 1;
+                            sd.ArraySize = 1;
+                            sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                            sd.SampleDesc.Count = 1;
+                            sd.Usage = D3D11_USAGE_STAGING;
+                            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                            found = SUCCEEDED(g_pickerD3dDevice->CreateTexture2D(&sd, NULL, &g_pickerStaging));
+                        }
+                        output1->Release();
+                    }
+                }
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    if (!found) ReleaseColorPickerDda();
+    return found;
+}
+
+// 推进 DDA：必要时按光标所在显示器（重）建，有新帧就整屏拷到 GPU 副本。
+// 返回 true 表示屏幕内容有更新。
+static bool ColorPickerPumpDdaFrame(POINT pt) {
+    if (g_colorPickerUseSnapshot) return false;
+
+    HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (monitor != g_pickerDdaMonitor || g_pickerDup == NULL) {
+        if (!InitColorPickerDda(monitor)) {
+            // 暂时不可用（锁屏等）：歇一个周期再试，否则循环会全速空转刷重建
+            Sleep(COLOR_PICKER_FRAME_BUDGET_MS);
+            return false;
+        }
+    }
+
+    IDXGIResource* resource = NULL;
+    DXGI_OUTDUPL_FRAME_INFO info = {};
+    // 阻塞一个帧预算：桌面静止时即休眠，变化时立即返回；
+    // 首帧/重建后的第一帧由同一语义自然等到，无特判
+    HRESULT hr = g_pickerDup->AcquireNextFrame(COLOR_PICKER_FRAME_BUDGET_MS, &info, &resource);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;      // 画面无更新，GPU 副本仍有效
+    if (FAILED(hr)) {
+        // ACCESS_LOST 等：桌面切换/改分辨率，丢弃当前，下个 tick 自动重建
+        ReleaseColorPickerDda();
+        return false;
+    }
+
+    ID3D11Texture2D* tex = NULL;
+    if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+        D3D11_TEXTURE2D_DESC d;
+        tex->GetDesc(&d);
+        if (g_pickerLastFrame && (g_pickerFrameW != (int)d.Width || g_pickerFrameH != (int)d.Height)) {
+            g_pickerLastFrame->Release();
+            g_pickerLastFrame = NULL;
+        }
+        if (!g_pickerLastFrame) {
+            // 必须用最小化 desc，不能沿用桌面纹理的 GetDesc()：继承其 MiscFlags 等
+            // 附加属性后 CopyResource 会静默产出全黑帧（宿主进程内必现），导致取色恒为 #000000
+            D3D11_TEXTURE2D_DESC fd = {};
+            fd.Width = d.Width;
+            fd.Height = d.Height;
+            fd.MipLevels = 1;
+            fd.ArraySize = 1;
+            fd.Format = d.Format;
+            fd.SampleDesc.Count = 1;
+            fd.Usage = D3D11_USAGE_DEFAULT;
+            if (SUCCEEDED(g_pickerD3dDevice->CreateTexture2D(&fd, NULL, &g_pickerLastFrame))) {
+                g_pickerFrameW = (int)d.Width;
+                g_pickerFrameH = (int)d.Height;
+                ZLOG_INFO("colorpicker", "dda frame ready %dx%d", g_pickerFrameW, g_pickerFrameH);
+            }
+        }
+        if (g_pickerLastFrame) g_pickerD3dCtx->CopyResource(g_pickerLastFrame, tex);
+        tex->Release();
+    }
+    resource->Release();
+    g_pickerDup->ReleaseFrame();
+    return true;
+}
+
+// 从 DDA 的 GPU 副本里取光标周围 9x9（网格点落在该显示器外时钳到显示器边缘）
+static void SamplePixelsFromDdaFrame(int mouseX, int mouseY, COLORREF colors[9][9], COLORREF& centerColor) {
+    if (!g_pickerLastFrame || !g_pickerStaging || !g_pickerD3dCtx) return;
+
+    const int half = COLOR_PICKER_GRID / 2;
+    int fx[COLOR_PICKER_GRID];
+    int fy[COLOR_PICKER_GRID];
+    for (int i = 0; i < COLOR_PICKER_GRID; i++) {
+        fx[i] = std::max(0, std::min(mouseX - half + i - g_pickerDdaOriginX, g_pickerFrameW - 1));
+        fy[i] = std::max(0, std::min(mouseY - half + i - g_pickerDdaOriginY, g_pickerFrameH - 1));
+    }
+    int bx0 = fx[0];
+    int by0 = fy[0];
+    for (int i = 1; i < COLOR_PICKER_GRID; i++) {
+        bx0 = std::min(bx0, fx[i]);
+        by0 = std::min(by0, fy[i]);
+    }
+    bx0 = std::min(bx0, g_pickerFrameW - COLOR_PICKER_GRID);
+    by0 = std::min(by0, g_pickerFrameH - COLOR_PICKER_GRID);
+
+    D3D11_BOX box;
+    box.left = bx0;
+    box.top = by0;
+    box.right = bx0 + COLOR_PICKER_GRID;
+    box.bottom = by0 + COLOR_PICKER_GRID;
+    box.front = 0;
+    box.back = 1;
+    g_pickerD3dCtx->CopySubresourceRegion(g_pickerStaging, 0, 0, 0, 0, g_pickerLastFrame, 0, &box);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(g_pickerD3dCtx->Map(g_pickerStaging, 0, D3D11_MAP_READ, 0, &mapped))) return;
+    const BYTE* base = (const BYTE*)mapped.pData;
+    for (int row = 0; row < COLOR_PICKER_GRID; row++) {
+        const BYTE* line = base + (fy[row] - by0) * mapped.RowPitch;
+        for (int col = 0; col < COLOR_PICKER_GRID; col++) {
+            const BYTE* px = line + (fx[col] - bx0) * 4;   // BGRA -> COLORREF
+            colors[row][col] = RGB(px[2], px[1], px[0]);
+        }
+    }
+    g_pickerD3dCtx->Unmap(g_pickerStaging, 0);
+    centerColor = colors[half][half];
 }
 
 // 全局变量存储当前颜色（用于钩子访问）
@@ -4541,60 +4738,63 @@ LRESULT CALLBACK ColorPickerKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam
     return CallNextHookEx(g_colorPickerKeyboardHook, nCode, wParam, lParam);
 }
 
+// 采样当前光标位置并更新放大镜内容与位置（由「屏幕变化 / 光标移动」驱动）
+static void ColorPickerUpdateMagnifier(HWND hwnd, POINT pt) {
+    if (g_colorPickerUseSnapshot) {
+        CapturePixelsFromSnapshot(pt.x, pt.y, g_currentPixelColors, g_currentCenterColor);
+    } else if (g_pickerLastFrame) {
+        SamplePixelsFromDdaFrame(pt.x, pt.y, g_currentPixelColors, g_currentCenterColor);
+    } else {
+        return;   // DDA 尚未拿到任何帧（刚启动/锁屏），放大镜保持现状
+    }
+
+    // 转换为 HEX
+    sprintf_s(g_currentHexColor, "#%02X%02X%02X",
+        GetRValue(g_currentCenterColor),
+        GetGValue(g_currentCenterColor),
+        GetBValue(g_currentCenterColor));
+
+    // 更新窗口位置（跟随鼠标），钳在光标所在的显示器内
+    // （不能用 SM_CXSCREEN + 原点 (0,0)：那只是主屏矩形，鼠标在左侧/上方副屏
+    // 时窗口会被钳到主屏边界上瞬移走）
+    const int offsetX = 20;
+    const int offsetY = 20;
+    const int windowWidth = 144;  // 9 * 16
+    const int windowHeight = 172; // 144 + 28
+
+    HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(monitor, &mi);
+    const int monLeft = mi.rcMonitor.left;
+    const int monTop = mi.rcMonitor.top;
+    const int monRight = mi.rcMonitor.right;
+    const int monBottom = mi.rcMonitor.bottom;
+
+    int newX = pt.x + offsetX;
+    int newY = pt.y + offsetY;
+
+    // 贴右/下边缘放不下时翻到光标另一侧
+    if (newX + windowWidth > monRight) {
+        newX = pt.x - offsetX - windowWidth;
+    }
+    if (newY + windowHeight > monBottom) {
+        newY = pt.y - offsetY - windowHeight;
+    }
+    // 翻转后越出显示器左/上边界（光标贴边）时再钳回界内
+    if (newX < monLeft) newX = monLeft;
+    if (newY < monTop) newY = monTop;
+    if (newX + windowWidth > monRight) newX = monRight - windowWidth;
+    if (newY + windowHeight > monBottom) newY = monBottom - windowHeight;
+
+    SetWindowPos(hwnd, HWND_TOPMOST, newX, newY, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+
+    // 重绘窗口
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 // 取色器窗口过程
 LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_CREATE: {
-            // 设置定时器，30 FPS 更新
-            SetTimer(hwnd, 1, 33, NULL);
-            return 0;
-        }
-
-        case WM_TIMER: {
-            if (wParam == 1 && g_isColorPickerActive) {
-                // 获取鼠标位置
-                POINT pt;
-                GetCursorPos(&pt);
-
-                // 捕获像素
-                CapturePixelsAroundCursor(g_colorPickerMemDC, pt.x, pt.y, g_currentPixelColors, g_currentCenterColor);
-
-                // 转换为 HEX
-                sprintf_s(g_currentHexColor, "#%02X%02X%02X",
-                    GetRValue(g_currentCenterColor),
-                    GetGValue(g_currentCenterColor),
-                    GetBValue(g_currentCenterColor));
-
-                // 更新窗口位置（跟随鼠标）
-                const int offsetX = 20;
-                const int offsetY = 20;
-                const int windowWidth = 144;  // 9 * 16
-                const int windowHeight = 172; // 144 + 28
-
-                int newX = pt.x + offsetX;
-                int newY = pt.y + offsetY;
-
-                // 屏幕边界检测
-                int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-                int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-
-                if (newX + windowWidth > screenWidth) {
-                    newX = pt.x - offsetX - windowWidth;
-                }
-                if (newY + windowHeight > screenHeight) {
-                    newY = pt.y - offsetY - windowHeight;
-                }
-                if (newX < 0) newX = 0;
-                if (newY < 0) newY = 0;
-
-                SetWindowPos(hwnd, HWND_TOPMOST, newX, newY, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-
-                // 重绘窗口
-                InvalidateRect(hwnd, NULL, FALSE);
-            }
-            return 0;
-        }
-
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -4616,33 +4816,26 @@ LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             FillRect(memDC, &clientRect, bgBrush);
             DeleteObject(bgBrush);
 
-            // 绘制 9x9 像素网格
+            // 绘制 9x9 像素网格（stock DC_BRUSH 换色填充 + 一遍网格线，
+            // 避免每帧创建/销毁 81 组画刷画笔）
             for (int row = 0; row < gridSize; row++) {
                 for (int col = 0; col < gridSize; col++) {
-                    RECT cellRect = {
-                        col * cellSize,
-                        row * cellSize,
-                        (col + 1) * cellSize,
-                        (row + 1) * cellSize
-                    };
-
-                    // 填充颜色
-                    HBRUSH brush = CreateSolidBrush(g_currentPixelColors[row][col]);
-                    FillRect(memDC, &cellRect, brush);
-                    DeleteObject(brush);
-
-                    // 绘制网格线
-                    HPEN pen = CreatePen(PS_SOLID, 1, RGB(191, 191, 191));
-                    HPEN oldPen = (HPEN)SelectObject(memDC, pen);
-                    MoveToEx(memDC, cellRect.left, cellRect.top, NULL);
-                    LineTo(memDC, cellRect.right, cellRect.top);
-                    LineTo(memDC, cellRect.right, cellRect.bottom);
-                    LineTo(memDC, cellRect.left, cellRect.bottom);
-                    LineTo(memDC, cellRect.left, cellRect.top);
-                    SelectObject(memDC, oldPen);
-                    DeleteObject(pen);
+                    RECT cellRect = { col * cellSize, row * cellSize,
+                                      (col + 1) * cellSize, (row + 1) * cellSize };
+                    SetDCBrushColor(memDC, g_currentPixelColors[row][col]);
+                    FillRect(memDC, &cellRect, (HBRUSH)GetStockObject(DC_BRUSH));
                 }
             }
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(191, 191, 191));
+            HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+            for (int i = 0; i <= gridSize; i++) {
+                MoveToEx(memDC, i * cellSize, 0, NULL);
+                LineTo(memDC, i * cellSize, totalGridWidth);
+                MoveToEx(memDC, 0, i * cellSize, NULL);
+                LineTo(memDC, totalGridWidth, i * cellSize);
+            }
+            SelectObject(memDC, oldPen);
+            DeleteObject(pen);
 
             // 绘制中心十字准星
             RECT centerRect = {
@@ -4654,7 +4847,7 @@ LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
             // 外层黑框
             HPEN blackPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 0));
-            HPEN oldPen = (HPEN)SelectObject(memDC, blackPen);
+            oldPen = (HPEN)SelectObject(memDC, blackPen);
             SelectObject(memDC, GetStockObject(NULL_BRUSH));
             Rectangle(memDC, centerRect.left - 1, centerRect.top - 1, centerRect.right + 1, centerRect.bottom + 1);
             SelectObject(memDC, oldPen);
@@ -4699,7 +4892,6 @@ LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
 
         case WM_DESTROY: {
-            KillTimer(hwnd, 1);
             PostQuitMessage(0);
             return 0;
         }
@@ -4708,18 +4900,69 @@ LRESULT CALLBACK ColorPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// 清理取色器的快照资源
+void ReleaseColorPickerSnapshotResources() {
+    // 先删 DC 再删位图：位图选中在 DC 里时先 DeleteObject 会静默失败，泄漏 GDI 对象
+    if (g_colorPickerMemDC) {
+        DeleteDC(g_colorPickerMemDC);
+        g_colorPickerMemDC = NULL;
+    }
+    if (g_colorPickerBitmap) {
+        DeleteObject(g_colorPickerBitmap);
+        g_colorPickerBitmap = NULL;
+    }
+}
+
+// 清理取色器全部采样资源（DDA + 快照回退）
+void ReleaseColorPickerSampler() {
+    ReleaseColorPickerDda();
+    ReleaseColorPickerSnapshotResources();
+}
+
+// 一次性抓取整个虚拟桌面（含所有显示器）的快照（快照回退模式用）
+static bool CaptureDesktopSnapshot() {
+    HDC screenDC = GetDC(NULL);
+    if (screenDC == NULL) {
+        ZLOG_INFO("colorpicker", "snapshot failed: screen DC unavailable");
+        return false;
+    }
+    g_colorPickerSnapshotOrigin = { GetSystemMetrics(SM_XVIRTUALSCREEN),
+                                    GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    g_colorPickerMemDC = CreateCompatibleDC(screenDC);
+    if (g_colorPickerMemDC != NULL) {
+        g_colorPickerBitmap = CreateCompatibleBitmap(screenDC, vw, vh);
+        if (g_colorPickerBitmap != NULL) {
+            SelectObject(g_colorPickerMemDC, g_colorPickerBitmap);
+            BitBlt(g_colorPickerMemDC, 0, 0, vw, vh, screenDC,
+                   g_colorPickerSnapshotOrigin.x, g_colorPickerSnapshotOrigin.y, SRCCOPY);
+        } else {
+            DeleteDC(g_colorPickerMemDC);
+            g_colorPickerMemDC = NULL;
+        }
+    }
+    ReleaseDC(NULL, screenDC);
+    return g_colorPickerMemDC != NULL;
+}
+
 // 取色器线程函数
 void ColorPickerThreadFunc() {
-    // 捕获整个屏幕到内存 DC
-    HDC screenDC = GetDC(NULL);
-    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-
-    g_colorPickerMemDC = CreateCompatibleDC(screenDC);
-    g_colorPickerBitmap = CreateCompatibleBitmap(screenDC, screenWidth, screenHeight);
-    SelectObject(g_colorPickerMemDC, g_colorPickerBitmap);
-    BitBlt(g_colorPickerMemDC, 0, 0, screenWidth, screenHeight, screenDC, 0, 0, SRCCOPY);
-    ReleaseDC(NULL, screenDC);
+    // 优先 DDA 实时采样（Win8+，GPU 路径不闪光标）；不可用（Win7/RDP/安全桌面）退回快照
+    POINT startPt;
+    GetCursorPos(&startPt);
+    if (InitColorPickerDda(MonitorFromPoint(startPt, MONITOR_DEFAULTTONEAREST))) {
+        ZLOG_INFO("colorpicker", "dda live sampling enabled");
+    } else {
+        g_colorPickerUseSnapshot = true;
+        ZLOG_INFO("colorpicker", "dda unavailable, using snapshot fallback");
+        if (!CaptureDesktopSnapshot()) {
+            // 快照也失败宁可不出取色器，也别让放大镜显示垃圾色
+            ZLOG_INFO("colorpicker", "snapshot capture failed, abort start");
+            g_isColorPickerActive = false;
+            return;
+        }
+    }
 
     // 注册窗口类
     WNDCLASSEXW wc = {0};
@@ -4730,10 +4973,7 @@ void ColorPickerThreadFunc() {
     wc.lpszClassName = L"ZToolsColorPicker";
 
     if (!RegisterClassExW(&wc)) {
-        DeleteDC(g_colorPickerMemDC);
-        DeleteObject(g_colorPickerBitmap);
-        g_colorPickerMemDC = NULL;
-        g_colorPickerBitmap = NULL;
+        ReleaseColorPickerSampler();
         g_isColorPickerActive = false;
         return;
     }
@@ -4756,16 +4996,18 @@ void ColorPickerThreadFunc() {
 
     if (g_colorPickerWindow == NULL) {
         UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
-        DeleteDC(g_colorPickerMemDC);
-        DeleteObject(g_colorPickerBitmap);
-        g_colorPickerMemDC = NULL;
-        g_colorPickerBitmap = NULL;
+        ReleaseColorPickerSampler();
         g_isColorPickerActive = false;
         return;
     }
 
-    // 设置窗口透明度和圆角
+    // 设置窗口透明度
     SetLayeredWindowAttributes(g_colorPickerWindow, 0, 255, LWA_ALPHA);
+
+    // 放大镜自身不进任何捕获（DDA 桌面图像包含分层窗口；虽然 9x9 采样点与窗口
+    // 永不重叠，但「自己的 UI 不被自己采到」是无条件正确的语义，PowerToys 同款）。
+    // 窗口销毁时 affinity 随之失效，无需恢复。
+    SetWindowDisplayAffinity(g_colorPickerWindow, WDA_EXCLUDEFROMCAPTURE);
 
     // 显示窗口
     ShowWindow(g_colorPickerWindow, SW_SHOW);
@@ -4787,20 +5029,41 @@ void ColorPickerThreadFunc() {
         }
         DestroyWindow(g_colorPickerWindow);
         UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
-        DeleteDC(g_colorPickerMemDC);
-        DeleteObject(g_colorPickerBitmap);
-        g_colorPickerMemDC = NULL;
-        g_colorPickerBitmap = NULL;
+        ReleaseColorPickerSampler();
         g_colorPickerWindow = NULL;
         g_isColorPickerActive = false;
         return;
     }
 
-    // 消息循环
+    // 消息 + 帧泵循环。DDA 模式下 AcquireNextFrame(帧预算) 兼作节拍器：
+    //   - 桌面静止：阻塞至预算超时（等效旧 33ms 定时器的休眠，不空转）；
+    //   - 桌面变化：立即返回，放大镜更新比定时器轮询更及时；
+    //   - 首帧 / 跨屏 / 失效重建：被同一阻塞语义自然覆盖，无特判。
+    // 快照模式没有帧可等，退化为 Sleep 定时节奏。
+    POINT lastPt = startPt;
+    bool quit = false;
     MSG msg;
-    while (g_isColorPickerActive && GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    while (g_isColorPickerActive && !quit) {
+        // 1. 等新帧（内部顺带处理跨屏重建）
+        const bool frameDirty = g_colorPickerUseSnapshot
+            ? (Sleep(COLOR_PICKER_FRAME_BUDGET_MS), false)
+            : ColorPickerPumpDdaFrame(lastPt);
+
+        // 2. 泵消息（左键确认 / ESC / 重绘）
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { quit = true; break; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (quit) break;
+
+        // 3. 光标或屏幕有变化才采样重绘
+        POINT now;
+        GetCursorPos(&now);
+        if (now.x != lastPt.x || now.y != lastPt.y || frameDirty) {
+            ColorPickerUpdateMagnifier(g_colorPickerWindow, now);
+            lastPt = now;
+        }
     }
 
     // 卸载钩子
@@ -4814,14 +5077,7 @@ void ColorPickerThreadFunc() {
     }
 
     // 清理
-    if (g_colorPickerMemDC) {
-        DeleteDC(g_colorPickerMemDC);
-        g_colorPickerMemDC = NULL;
-    }
-    if (g_colorPickerBitmap) {
-        DeleteObject(g_colorPickerBitmap);
-        g_colorPickerBitmap = NULL;
-    }
+    ReleaseColorPickerSampler();
     UnregisterClassW(L"ZToolsColorPicker", GetModuleHandle(NULL));
     g_colorPickerWindow = NULL;
     g_isColorPickerActive = false;
