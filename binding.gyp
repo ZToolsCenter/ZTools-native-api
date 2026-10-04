@@ -63,6 +63,8 @@
               "dwmapi.lib",
               "gdi32.lib",
               "imm32.lib",
+              "d3d11.lib",
+              "dxgi.lib",
               "windowsapp.lib"
             ],
             "msvs_settings": {
